@@ -1,0 +1,4 @@
+websockets>=15.0
+langchain-openai>=0.3
+langchain-core>=0.3
+langgraph>=1.0
