@@ -13,6 +13,8 @@ from NapCatAPI import NapCatAPIInterface as nc
 _IMGS_DIR = Path(__file__).resolve().parent.parent / "imgs"
 
 
+DEBUG = True
+
 class MessageProcessor:
     def __init__(self, config: NapCatBotConfig):
         self.config = config
@@ -22,6 +24,7 @@ class MessageProcessor:
         self.sllm = None  # 后台线程惰性初始化
         self._agent_ready = threading.Event()
         self._connect_lock = asyncio.Lock()  # 防止并发重复建连
+        self._heartbeat_task: asyncio.Task = None
         # 后台线程预加载 AI Agent + SLLM，不阻塞主线程
         self._agent_thread = threading.Thread(
             target=self._init_agent_bg, daemon=True
@@ -37,6 +40,25 @@ class MessageProcessor:
         self.sllm = SLLM()
         self._agent_ready.set()
         print("AI Agent 后台加载完成")
+
+    async def _heartbeat_loop(self):
+        """后台心跳协程：每 10~20 分钟（均匀分布）调用 get_login_info 保活"""
+        while True:
+            interval = random.uniform(10 * 60, 20 * 60)  # 10~20 分钟
+            await asyncio.sleep(interval)
+            try:
+                await self._ensure_connected()
+                result = await self.nc.get_login_info()
+                if DEBUG:
+                    print(f"[心跳] get_login_info 成功: {result.get('data', {}).get('nickname', 'unknown')}")
+            except Exception as e:
+                print(f"[心跳] 异常: {e}")
+
+    def start_heartbeat(self):
+        """启动心跳后台任务（需在事件循环中调用）"""
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            print("心跳任务已启动（间隔 10~20 分钟）")
 
     @property
     def agent(self):
@@ -130,6 +152,8 @@ class MessageProcessor:
         if self.user_id is None:
             await self._ensure_connected()
             self.user_id = await self.nc.get_user_id()
+        # 启动心跳保活任务
+        self.start_heartbeat()
         return
     
     async def Check_Campus_NetWoerk(self,event):
@@ -145,22 +169,46 @@ class MessageProcessor:
             await self.send_img(event, str(_IMGS_DIR / "img02.jpg"))
         return
     
+    async def auto_forward(self,event,groupid_list,target_groupid) -> bool:
+        DEBUG = False
+        if event["message_type"] != "group" :
+            return False
+        if event["group_id"] not in groupid_list:
+            if DEBUG:
+                print("GROUP_ID NOT CORRECT")
+            return False
+        raw_msg = event['raw_message']
+        match = re.search(r'\[CQ:forward,id=(\d+)\]',raw_msg)
+        if not match:
+            if DEBUG:
+                print("Match Failed!")
+            return False
+        # node_id = match.group(1)
+        for group_id in target_groupid:
+            if group_id == event['group_id']:
+                continue
+            await self._ensure_connected()
+            await self.nc.forward_group_single_msg(group_id=group_id,message_id=event['message_id'])
+        if DEBUG:
+            print("Succeed Forward!")
+        return True
+
+        
+
 
     async def process_message(self, event):
         message_id = event["message_id"]
         user_id = event["user_id"]
         raw_msg = event["raw_message"]
 
+        if await self.auto_forward(event=event,groupid_list=[1054955587,1079845768],target_groupid=[1079845768,1054955587]):
+            return
         # 关键词快速匹配（不走 AI，省 token）— 匹配到任意一个就跳过后续处理
         if (await self.pattern_match(event, r"男娘", self.send_message, {"message": "哪有男娘"})
             or await self.pattern_match(event, r"女装", self.send_message,{"message": ["看看女装","羡慕女装"]})
             or await self.pattern_match(event, r"药娘", self.send_img,{"img_addr": str(_IMGS_DIR / "img01.jpg")})
             or await self.pattern_match(event, r"校园网", self.Check_Campus_NetWoerk)):
             return
-
-
-
-        await self._ensure_connected()
 
         # 被 @ 时 → 交给 AI Agent 处理
         if await self.is_AT(raw_msg, self.user_id) or event["message_type"] != "group":

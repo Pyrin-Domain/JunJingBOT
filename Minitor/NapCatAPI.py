@@ -109,3 +109,26 @@ class NapCatAPIInterface:
         return await self._call_api(
             action="send_private_msg", params={"user_id": user_id, "message": [{"type":"image","data":{"file":img_addr}}]}
         )
+    async def send_group_forward_msg(self,group_id:int,node_id):
+        """转发群聊消息"""
+        return await self._call_api(
+            action="send_group_forward_msg", params={"group_id": group_id, "message": [{"type":"node","data":{"id":node_id}}]}
+        )
+    
+    async def forward_group_single_msg(self,group_id:int,message_id:int):
+        """转发单条消息"""
+        return await self._call_api(
+            action = 'forward_group_single_msg' , params={'group_id':group_id,'message_id':message_id}
+        )
+
+    async def get_forward_msg(self,message_id):
+        """获取转发消息"""
+        return await self._call_api(
+            action="get_forward_msg", params={"message_id": message_id}
+        )
+    
+    async def get_login_info(self):
+        """获取登录信息防止被踢下线"""
+        return await self._call_api(
+            action="get_login_info",params={}
+        )
