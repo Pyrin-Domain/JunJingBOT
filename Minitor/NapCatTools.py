@@ -9,6 +9,8 @@ from Websockets import NapCatBotConfig
 import re
 from NapCatAPI import NapCatAPIInterface as nc
 
+import jieba
+
 # 跨平台图片目录：NapCattools.py 在 Minitor/ 下，imgs 在项目根目录
 _IMGS_DIR = Path(__file__).resolve().parent.parent / "imgs"
 
@@ -17,6 +19,10 @@ DEBUG = True
 
 class MessageProcessor:
     def __init__(self, config: NapCatBotConfig):
+        self.extraconfig = {
+            "tokenizer":False,
+            'recent':True
+        }
         self.config = config
         self.nc = nc(config)
         self.user_id: str = None
@@ -66,6 +72,16 @@ class MessageProcessor:
         self._agent_ready.wait()
         return self._agent
 
+    @staticmethod
+    def tokenizer(text: str) -> str:
+        """中文分词：基于 jieba 分词库，返回空格分隔的字符串。
+
+        示例:
+            tokenizer("我是独角兽。")
+            → '我 是 独角兽 。'
+        """
+        return " ".join(jieba.cut(text))
+
     async def is_AT(self, raw_message: str, user_id: str) -> bool:
         """检查消息是否包含@指定用户"""
         match = re.search(r"\[CQ:at,qq=(\d+)\]", raw_message)
@@ -91,9 +107,20 @@ class MessageProcessor:
             return {"context": "1" + raw_msg, "index": 1}
 
     async def _ensure_connected(self):
-        """确保 API WebSocket 已连接（带锁，防止并发重复建连）"""
+        """确保 API WebSocket 已连接且 reader 存活（带锁，自动重连）"""
         async with self._connect_lock:
-            if self.nc._ws_conn is None:
+            # 检查 reader 是否还活着（连接可能已异常断开）
+            reader_dead = (
+                self.nc._reader_task is not None and self.nc._reader_task.done()
+            )
+            if reader_dead:
+                # 等待 reader 的 finally 清理完成
+                try:
+                    await self.nc._reader_task
+                except Exception:
+                    pass
+                self.nc._reader_task = None
+            if self.nc._ws_conn is None or self.nc._reader_task is None:
                 await self.nc.connect()
 
     async def send_message(self, event, message):
@@ -102,6 +129,9 @@ class MessageProcessor:
             n = len(message)
             index = random.randint(0,n-1)
             message = message[index]
+
+        if self.extraconfig['tokenizer']:
+            message = self.tokenizer(message)
 
         await self._ensure_connected()
         if event["message_type"] == "group":
@@ -143,7 +173,7 @@ class MessageProcessor:
             args = param
 
         if re.search(pattern, raw_msg):
-            await solution(event, **args)
+            await solution(event=event, **args)
             return True
         return False
 
@@ -156,6 +186,23 @@ class MessageProcessor:
         self.start_heartbeat()
         return
     
+
+
+
+    
+    async def set_tokenizer(self,event):
+        raw_message = event['raw_message']
+        match = re.search(r'True',raw_message)
+        if match:
+            self.extraconfig['tokenizer'] = True
+            return True
+        match = re.search(r'False',raw_message)
+        if match:    
+            self.extraconfig['tokenizer'] = False
+            return True
+        return False
+        
+
     async def Check_Campus_NetWoerk(self,event):
         if self.sllm == None:
             print("SLLM for Check hasn't benn deployed")
@@ -192,8 +239,78 @@ class MessageProcessor:
         if DEBUG:
             print("Succeed Forward!")
         return True
+    
 
-        
+    async def get_long_history(self,group_id,message_id,remaining:int):
+        if remaining <= 0:
+            return []
+
+        part = []
+        DEBUG = True
+
+        last_msg_id = message_id
+
+        while remaining > 0:
+            print('reamaining = ',remaining)
+            await self._ensure_connected()
+            icl_history = await self.nc.get_group_msg_history(
+            group_id=group_id, message_seq=last_msg_id
+            )
+            last_msg_id = icl_history['data']['messages'][0]["message_seq"]
+            print(icl_history['data']['messages'])
+            print('last_msg_id',last_msg_id)
+            icl_history['data']['messages'].pop()
+            part = icl_history['data']['messages'] + part
+            remaining-=1
+
+        return part
+
+
+    async def get_history_msg(self, event) -> str:
+        await self._ensure_connected()
+        icl_history = await self.nc.get_group_msg_history(
+            group_id=event['group_id']
+        )
+        parts = []
+        for ctx in icl_history['data']['messages']:
+            sender = ctx.get('sender', {})
+            card = sender.get('card', '') or sender.get('nickname', '')
+            parts.append(
+                f"[sender:{card} sender_id:{sender.get('user_id', '')} "
+                f"messages: {ctx.get('raw_message', '')}]"
+            )
+        return "\n".join(parts)
+
+    async def get_long_history_test(self,event):
+        print('enter History Debug')
+        res = await self.get_long_history(group_id=event['group_id'],message_id=event['message_id'],remaining=10)
+        print(res)
+        print('end')
+
+    async def get_history_msg_test(self,event):
+        await self._ensure_connected()
+        #获取最近20条
+        icl_history = await self.nc.get_group_msg_history(
+            group_id=event['group_id']
+        )
+
+        count = 0
+
+        for ctx in icl_history['data']['messages']:
+            count +=1
+            if count <= 10:
+                continue
+            msg_seq = ctx['message_seq']
+            print('###\n'*3)
+            await self._ensure_connected()
+            temp = await self.nc.get_group_msg_history(
+            group_id=event['group_id'],message_seq=msg_seq
+            )
+            print(str(temp['data']['messages']))
+            print('###\n'*3)
+            
+
+
 
 
     async def process_message(self, event):
@@ -209,12 +326,21 @@ class MessageProcessor:
             or await self.pattern_match(event, r"药娘", self.send_img,{"img_addr": str(_IMGS_DIR / "img01.jpg")})
             or await self.pattern_match(event, r"校园网", self.Check_Campus_NetWoerk)):
             return
+        
+        if await self.pattern_match(event,r'/historydebug',self.get_long_history_test,{}):
+            return
+        
+
+        if await self.pattern_match(event,r'/set_tokenizer',self.set_tokenizer,{}):
+            return
+        if await self.pattern_match(event,r'/get_history_msg_test',self.get_history_msg_test,{}):
+            return
+        
 
         # 被 @ 时 → 交给 AI Agent 处理
-        if await self.is_AT(raw_msg, self.user_id) or event["message_type"] != "group":
+        if await self.is_AT(raw_msg, self.user_id):
             # 去除 CQ 码，提取纯文本
             clean_text = re.sub(r"\[CQ:[^\]]+\]", "", raw_msg).strip()
-            
             match = re.match(r'^历史',clean_text)
             if match :
                 print('SkipLLM:Clean_text:',clean_text)
@@ -227,11 +353,18 @@ class MessageProcessor:
                 if event["message_type"] == "group"
                 else f"private_{user_id}"
             )
+            iclhistory = None
+            if self.extraconfig['recent']:
+                await self._ensure_connected()
+                iclhistory = await self.get_history_msg(event)
+                print(iclhistory)
             context = (
                 f"当前是群聊，群号 {event['group_id']}，"
                 f"发消息的用户 QQ 号是 {user_id}，消息 ID 是 {message_id}"
                 if event["message_type"] == "group"
-                else f"当前是私聊，用户 QQ 号是 {user_id}"
+                else f"当前是私聊，用户 QQ 号是 {user_id}",
+                f'历史消息{str(iclhistory)}' if iclhistory else ''
+
             )
             isDom = '{isDom:true}' if user_id==1013098110 else '{isDom:false}'
             print(str(user_id)+isDom)

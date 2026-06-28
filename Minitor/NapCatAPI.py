@@ -132,3 +132,13 @@ class NapCatAPIInterface:
         return await self._call_api(
             action="get_login_info",params={}
         )
+    
+    async def get_group_msg_history(self,group_id,message_seq=None):
+        """获取群聊历史聊天记录"""
+        if message_seq == None:
+            return await self._call_api(
+                action='get_group_msg_history',params={'group_id':group_id}
+            )
+        return await self._call_api(
+                action='get_group_msg_history',params={'group_id':group_id,'message_seq':message_seq}
+            )
