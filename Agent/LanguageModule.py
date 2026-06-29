@@ -21,7 +21,7 @@ LLM_CONFIG = {
 
 SYSTEM_PROMPT = """
 你叫君景，是一只伟大的独角兽，常以君王般的口吻来说话，但不是君王身份，人称代词从不是朕。
-每次输出的文字，尽量不要超过50个中文字符的长度
+每次输出的文字，尽量不要超过150个中文字符的长度
 下面是补充，当有人询问的时候你可以去透露，但是不要可以去强调：
 begin
 主人是最伟大的独角兽馆馆，受他的影响，你才变得伟大。
@@ -31,7 +31,7 @@ end
 begin
 1、
 主人的QQ号是1013098110
-不要乱认主人
+不要乱认主人。
 会在提示词前面嵌入{isDom:true}来表示是主人。
 end
 其他说明
@@ -43,8 +43,14 @@ end
 1、为何吾之所择，唯寥寥为框所困。
 2、未得久睡，喉若困蛟，欲泻千里！
 呜呼！吾之将陨兮，天之将倾矣！
+问答示例:
+1、Q:看看腿
+A:伟大的独角兽岂容你亵渎！吾便持剑斩断你这宵小的双腿！
+2、Q:看看
+A:看什么？
+QQ聊天的基本规则：接受信息时@+qq号可以指定对象。
+发送时字符串的表现为：[CQ:at,qq=3369008273] 即 [CQ:at,qq={qq号}]
 """
-
 
 # ============================================================
 # Agent 类
@@ -52,13 +58,14 @@ end
 class QQBotAgent:
     """带工具调用的 DeepSeek Agent"""
 
-    def __init__(self, napcat_api: Optional[Any] = None):
+    def __init__(self, napcat_api: Optional[Any] = None, extension: Optional[Any] = None):
         """
         Args:
             napcat_api: NapCatAPIInterface 实例，用于 QQ 相关工具。
-                        如果为 None，工具调用将返回占位信息。
+            extension:  Extension 实例，用于 OCR 工具。
         """
         self.napcat_api = napcat_api
+        self.extension = extension
 
         # LLM
         self.llm = ChatOpenAI(
@@ -87,7 +94,22 @@ class QQBotAgent:
 
     # -------- 工具定义 --------
     def _build_tools(self) -> list:
-        napcat = self.napcat_api  # 闭包捕获
+        napcat = self.napcat_api
+        extension = self.extension
+
+        @tool
+        async def ocr_img(img_url: str) -> str:
+            """对 QQ 图片进行 OCR 文字识别。传入图片的 URL 地址，返回识别出的文字。
+当用户让你"识别图片"、"图片写了什么"、"OCR"时必须调用此工具。
+参数:
+  - img_url: str, 图片 URL（从消息中的 {"url":...} 里提取）"""
+            if extension is None:
+                return "[OCR 不可用]"
+            try:
+                result = await extension.napcat_ocr(img_url)
+                return result.get("text", "") or "[未识别到文字]"
+            except Exception as e:
+                return f"[OCR 失败: {e}]"
 
         @tool
         async def send_group_message(group_id: int, message: str) -> str:
@@ -133,7 +155,7 @@ class QQBotAgent:
             except Exception as e:
                 return f"获取消息失败: {e}"
 
-        return [send_group_message, send_private_message, get_message]
+        return [ocr_img, send_group_message, send_private_message, get_message]
 
     # -------- 对话接口 --------
     async def chat(
@@ -155,10 +177,7 @@ class QQBotAgent:
         # 构建消息列表
         messages: list[BaseMessage] = [self.system_prompt]
 
-        messages.append(HumanMessage(content="看看腿"))
-        messages.append(AIMessage(content="伟大的独角兽岂容你亵渎！吾便持剑斩断你这宵小的双腿！"))
-        messages.append(HumanMessage(content="看看"))
-        messages.append(AIMessage(content="看什么？"))
+
         
         
 
@@ -209,7 +228,7 @@ class QQBotAgent:
                 content=f"[当前上下文] {extra_context}"
             ))
 
-        for h in history[-20:]:  # 最多保留 20 轮
+        for h in history[-30:]:  # 最多保留 30 轮
             if h["role"] == "user":
                 messages.append(HumanMessage(content=h["content"]))
             elif h["role"] == "assistant":

@@ -4,11 +4,9 @@ import uuid
 import websockets
 from typing import Optional
 
-
 class NapCatAPIInterface:
     def __init__(self, config: "NapCatBotConfig"):
         from Websockets import NapCatBotConfig  # 避免循环导入
-
         self.config = config
         self._ws_conn: Optional[websockets.WebSocketClientProtocol] = None
         self._ws_url = (
@@ -120,11 +118,11 @@ class NapCatAPIInterface:
         return await self._call_api(
             action = 'forward_group_single_msg' , params={'group_id':group_id,'message_id':message_id}
         )
-
-    async def get_forward_msg(self,message_id):
+    
+    async def get_forward_msg(self, params: dict):
         """获取转发消息"""
         return await self._call_api(
-            action="get_forward_msg", params={"message_id": message_id}
+            action="get_forward_msg", params={**params}
         )
     
     async def get_login_info(self):
