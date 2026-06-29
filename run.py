@@ -14,6 +14,5 @@ async def main():
     await mp.setuserid()
     await listen_msg(config, mp.process_message)
 
-
 if __name__ == "__main__":
     asyncio.run(main())

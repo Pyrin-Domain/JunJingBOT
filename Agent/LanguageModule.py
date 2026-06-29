@@ -8,7 +8,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
 from langchain_core.callbacks import BaseCallbackHandler
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from langgraph.checkpoint.memory import MemorySaver
 from .chat_logger import append_log, build_log_entry
 
@@ -50,13 +50,6 @@ class LLMCallbackHandler(BaseCallbackHandler):
     def on_tool_end(self, output, **kwargs):
         logger.debug(f"[LLM] 工具返回: {str(output)[:80]}{'...' if len(str(output))>80 else ''}")
 
-###1、历史知识库：从思考中获得经验
-
-
-
-
-
-
 
 
 # ============================================================
@@ -65,7 +58,7 @@ class LLMCallbackHandler(BaseCallbackHandler):
 LLM_CONFIG = {
     "base_url": "https://api.deepseek.com/v1",
     "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
-    "model": "deepseek-v4-flash",  # DeepSeek-V3
+    "model": "deepseek-v4-flash",  # DeepSeek-V4-flash
 }
 
 SYSTEM_PROMPT = """
@@ -107,7 +100,7 @@ end
 A:伟大的独角兽岂容你亵渎！吾便持剑斩断你这宵小的双腿！
 2、Q:看看
 A:看什么？
-QQ聊天的基本规则：接受信息时@+qq号可以指定对象。
+QQ聊天的基本规则：接受信息时通过[CQ:at,qq=qq号]可以@别人。
 发送时字符串的表现为：[CQ:at,qq=3369008273] 即 [CQ:at,qq={qq号}]
 """
 
@@ -149,15 +142,16 @@ class QQBotAgent:
         # 记忆（按 thread_id 隔离会话）
         self.memory = MemorySaver()
 
-        # LangGraph ReAct Agent
-        self.agent = create_react_agent(
-            model=self.llm,
-            tools=self.tools,
-            checkpointer=self.memory,
-        )
-
         # 系统提示
         self.system_prompt = SystemMessage(content=SYSTEM_PROMPT)
+
+        # LangGraph Agent（create_agent 会自动注入 system_prompt）
+        self.agent = create_agent(
+            model=self.llm,
+            tools=self.tools,
+            system_prompt=self.system_prompt,
+            checkpointer=self.memory,
+        )
         logger.info("QQBotAgent 初始化完成")
 
 
@@ -338,8 +332,8 @@ class QQBotAgent:
         # 重置本轮工具调用记录
         self._current_tool_calls = []
 
-        # 构建消息列表
-        messages: list[BaseMessage] = [self.system_prompt]
+        # 构建消息列表（system_prompt 由 create_agent 自动注入，无需手动添加）
+        messages: list[BaseMessage] = []
 
         if extra_context:
             messages.append(SystemMessage(

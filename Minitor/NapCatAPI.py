@@ -120,6 +120,12 @@ class NapCatAPIInterface:
             action = 'forward_group_single_msg' , params={'group_id':group_id,'message_id':message_id}
         )
     
+    async def forward_friend_single_msg(self,user_id:int,message_id:int):
+        """转发单条消息"""
+        return await self._call_api(
+            action = 'forward_friend_single_msg' , params={'user_id':user_id,'message_id':message_id}
+        )
+    
     async def get_forward_msg(self, params: dict):
         """获取转发消息"""
         return await self._call_api(
@@ -141,3 +147,4 @@ class NapCatAPIInterface:
         return await self._call_api(
                 action='get_group_msg_history',params={'group_id':group_id,'message_seq':message_seq}
             )
+    
