@@ -1,9 +1,11 @@
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import random
 import asyncio
 import threading
+import inspect
 from pathlib import Path
 from Websockets import NapCatBotConfig
 import re
@@ -39,12 +41,11 @@ _IMGS_DIR = _load_imgs_dir()
 
 DEBUG = True
 
+
 class MessageProcessor:
     def __init__(self, config: NapCatBotConfig):
-        self.extraconfig = {
-            "tokenizer":False,
-            'recent':True
-        }
+        self.extraconfig = {"tokenizer": False, "recent": True}
+        self.ifs = image_forward_service(self)
         self.config = config
         self.nc = nc(config)
         self.extension = Extension()
@@ -55,80 +56,70 @@ class MessageProcessor:
         self._connect_lock = asyncio.Lock()  # 防止并发重复建连
         self._heartbeat_task: asyncio.Task = None
         # 后台线程预加载 AI Agent + SLLM，不阻塞主线程
-        self._agent_thread = threading.Thread(
-            target=self._init_agent_bg, daemon=True
-        )
+        self._agent_thread = threading.Thread(target=self._init_agent_bg, daemon=True)
         self._agent_thread.start()
 
-    async def ocr_and_send(self,group_id,url):
-        ocr_answer = await self.extension.napcat_ocr(url)
-        await self._ensure_connected()
-        await self.nc.send_group_message(group_id=group_id, message=ocr_answer["text"])
 
-    def get_url(self,msg_event)->list[str]:
-        res = []
-        for item in msg_event.get('message', []):
-            item_type = item.get('type','')
-            if item_type != 'image':
-                continue
-            url = (item.get('data') or {}).get('url')
-            if not url:
-                continue
-            res.append(url)
-        return res
-
-    async def ocr(self,event):
-        reply_id = self.is_reply(event)
-        if not reply_id:
-            return
-        await self._ensure_connected()
-        res = await self.nc.get_message(message_id=reply_id)
-        msg_event = res.get('data', {})
-
-        url_list = self.get_url(msg_event)
-
-        for url in url_list:
-            asyncio.create_task(self.ocr_and_send(group_id=event['group_id'],url=url))
         
-        return
 
     async def process_message(self, event):
         message_id = event["message_id"]
         user_id = event["user_id"]
         raw_msg = event["raw_message"]
 
-        if await self.auto_forward(event=event,groupid_list=[1054955587,1079845768,320955551],target_groupid=[1079845768,1054955587,320955551]):
+        if await self.auto_forward(
+            event=event,
+            groupid_list=[
+                1054955587,
+                1079845768,
+                320955551,
+                569117421,
+                662802665,
+                973208344,
+            ],
+            target_groupid=[1079845768, 1054955587, 320955551, 973208344],
+        ):
             return
-        # 关键词快速匹配（不走 AI，省 token）— 匹配到任意一个就跳过后续处理
+        # 关键词快速匹配（不走 AI，省 token）
         pattern_config = [
-            {'regex':r"男娘",'solution':self.send_message,'params':{"message": "哪有男娘"}},
-            {'regex':r"女装",'solution':self.send_message,'params':{"message": ["看看女装","羡慕女装"]}},
-            {'regex':r"药娘",'solution':self.send_img,'params':{"img_addr": f"{_IMGS_DIR}/img01.jpg"}},
-            {'regex':r"校园网",'solution':self.Check_Campus_NetWoerk},
-            {'regex':r"/historydebug",'solution':self.get_long_history_test},
-            {'regex':r"/export",'solution':self.export},
-            {'regex':r"/set_tokenizer",'solution':self.set_tokenizer},
-            {'regex':r"/get_history_msg_test",'solution':self.get_history_msg_test},
-            {'regex':r"ocr",'solution':self.ocr},
+            {
+                "regex": r"(男娘|南梁|nn)",
+                "solution": self.send_message,
+                "params": {"message": "哪有男娘"},
+            },
+            {
+                "regex": r"女装",
+                "solution": self.send_message,
+                "params": {"message": ["看看女装", "羡慕女装"]},
+            },
+            {
+                "regex": r"药娘",
+                "solution": self.send_img,
+                "params": {"img_addr": f"{_IMGS_DIR}/img01.jpg"},
+            },
+            {"regex": r"校园网", "solution": self.Check_Campus_NetWoerk},
+            {"regex": r"/historydebug", "solution": self.get_long_history_test},
+            {"regex": r"/export", "solution": self.export},
+            {"regex": r"/set_tokenizer", "solution": self.set_tokenizer},
+            {"regex": r"ocr", "solution": self.ocr},
+            {"regex": r"/img_fd ", "solution": self.img_forward_create_task},
         ]
 
-        await self.pattern_match(event=event,pattern_config=pattern_config)
-            
-        
+        await self.pattern_match(event=event, pattern_config=pattern_config)
+
         # await self.ocr(event=event)
-        
+
         # 被 @ 时 → 交给 AI Agent 处理
 
-        ated_user = await self.is_AT(event = event, user_id = [self.user_id,'1013098110'])
+        ated_user = await self.is_AT(event=event, user_id=[self.user_id, "1013098110"])
         if ated_user:
             # 去除 CQ 码，提取纯文本
-            clean_text = re.sub(r"\[CQ:[^\]]+\]", "", raw_msg).strip()
-            match = re.match(r'^历史',clean_text)
-            if match :
-                DEBUG and print('SkipLLM:Clean_text:',clean_text)
+            clean_text = self.get_clean_context(event,True)
+            match = re.match(r"^历史", clean_text)
+            if match:
+                DEBUG and print("SkipLLM:Clean_text:", clean_text)
                 await self.history_solution(event)
                 return
-
             # 构建上下文
             thread_id = (
                 f"group_{event['group_id']}"
@@ -136,24 +127,27 @@ class MessageProcessor:
                 else f"private_{user_id}"
             )
             iclhistory = None
-            if self.extraconfig['recent']:
+            if self.extraconfig["recent"]:
                 await self._ensure_connected()
                 iclhistory = await self.get_history_msg(event)
                 print(iclhistory)
             context = (
-                f"当前是群聊，群号 {event['group_id']}，"
-                f"发消息的用户 QQ 号是 {user_id}，消息 ID 是 {message_id},AT的对象的QQ号是{ated_user},你的QQ号是{self.user_id},主人的QQ号是{'1013098110'}"
-                if event["message_type"] == "group"
-                else f"当前是私聊，用户 QQ 号是 {user_id}",
-                f'历史消息如下:{str(iclhistory)}' if iclhistory else ''
-
+                (
+                    f"当前是群聊，群号 {event['group_id']}，"
+                    f"发消息的用户 QQ 号是 {user_id}，消息 ID 是 {message_id},AT的对象的QQ号是{ated_user},你的QQ号是{self.user_id},主人的QQ号是{'1013098110'}"
+                    if event["message_type"] == "group"
+                    else f"当前是私聊，用户 QQ 号是 {user_id}"
+                ),
+                f"历史消息如下:{str(iclhistory)}" if iclhistory else "",
             )
-            isDom = '{isDom:true}' if user_id==1013098110 else '{isDom:false}'
-            DEBUG and print(str(user_id)+isDom)
+            isDom = "{isDom:true}" if user_id == 1013098110 else "{isDom:false}"
+            DEBUG and print(str(user_id) + isDom)
             DEBUG and print(f"[AI] 用户 {user_id} 提问: {clean_text}")
-            totoal_msg = await self.generate_structed_message_to_creat_context(event=event)
+            totoal_msg = await self.generate_structed_message_to_creat_context(
+                event=event
+            )
             reply = await self.agent.chat(
-                user_message=isDom+totoal_msg,
+                user_message=isDom + totoal_msg,
                 thread_id=thread_id,
                 extra_context=context,
             )
@@ -163,57 +157,80 @@ class MessageProcessor:
             # 如果 Agent 只是返回文本，我们需要手动发送。
             # 判断：如果 reply 不为空且不是工具返回的"已成功发送"类消息
             if reply and "已成功发送" not in reply:
-                await self.send_message(event, reply)        
+                await self.send_message(event, reply)
 
+    async def ocr_and_send(self, group_id, url):
+        ocr_answer = await self.extension.napcat_ocr(url)
+        await self._ensure_connected()
+        await self.nc.send_group_message(group_id=group_id, message=ocr_answer["text"])
 
+    def get_url(self, msg_event) -> list[str]:
+        res = []
+        for item in msg_event.get("message", []):
+            item_type = item.get("type", "")
+            if item_type != "image":
+                continue
+            url = (item.get("data") or {}).get("url")
+            if not url:
+                continue
+            res.append(url)
+        return res
 
-    # def pattern_match(self,event):
+    def is_contain_image(self, msg_event) -> bool:
+        for item in msg_event.get("message", []):
+            item_type = item.get("type", "")
+            if item_type == "image" and not item.get('data',{}).get('summary'):
+                return True
+        return False
 
+    async def image_forward_processor(self, event, target_id):
+        if not self.is_contain_image(event):
+            return
+        await self._ensure_connected()
+        await self.nc.forward_group_single_msg(
+            group_id=target_id, message_id=event["message_id"]
+        )
 
-    def _init_agent_bg(self):
-        """在后台线程中导入并初始化 QQBotAgent 和 SimpleLLM"""
-        DEBUG and print("后台预加载 AI Agent …")
-        from Agent import QQBotAgent
-        self._agent = QQBotAgent(napcat_api=self.nc, extension=self.extension)
-        from Agent.SimpleLLM import SimpleChatModule as SLLM
-        self.sllm = SLLM()
-        self._agent_ready.set()
-        DEBUG and print("AI Agent 后台加载完成")
+    async def image_forward(self, group_id, target_id, begin_id, end_id):
+        await self.get_long_history_only_processor(
+            group_id=group_id,
+            start_id=begin_id,
+            end_id=end_id,
+            processor=self.image_forward_processor,
+            params={"target_id": target_id},
+        )
 
-    async def _heartbeat_loop(self):
-        """后台心跳协程：每 10~20 分钟（均匀分布）调用 get_login_info 保活"""
-        while True:
-            interval = random.uniform(10 * 60, 20 * 60)  # 10~20 分钟
-            await asyncio.sleep(interval)
-            try:
-                await self._ensure_connected()
-                result = await self.nc.get_login_info()
-                if DEBUG:
-                    DEBUG and print(f"[心跳] get_login_info 成功: {result.get('data', {}).get('nickname', 'unknown')}")
-            except Exception as e:
-                print(f"[心跳] 异常: {e}")
+    async def ocr(self, event):
+        reply_id = self.is_reply(event)
+        if not reply_id:
+            return
+        await self._ensure_connected()
+        res = await self.nc.get_message(message_id=reply_id)
+        msg_event = res.get("data", {})
 
-    def start_heartbeat(self):
-        """启动心跳后台任务（需在事件循环中调用）"""
-        if self._heartbeat_task is None or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            print("心跳任务已启动（间隔 10~20 分钟）")
+        url_list = self.get_url(msg_event)
 
-    @property
-    def agent(self):
-        """返回 QQBotAgent，如果后台加载尚未完成则等待"""
-        self._agent_ready.wait()
-        return self._agent
+        for url in url_list:
+            asyncio.create_task(self.ocr_and_send(group_id=event["group_id"], url=url))
+        return
 
-    @staticmethod
-    def tokenizer(text: str) -> str:
-        """中文分词：基于 jieba 分词库，返回空格分隔的字符串。
+    async def img_forward_create_task(self, event):
+        clean_msg = self.get_clean_context(event=event)
+        rpy = self.is_reply(event)
+        match = re.search(r"(-t|-target) (\d+)", clean_msg)
+        if match:            
+            target_id = int(match.group(2))
+            await self.ifs.create_task(group_id=event["group_id"], target_id=target_id)
+        match_1 = re.search(r'(-begin|-b)',clean_msg)
+        if match_1:
+            await self.ifs.set_begin_id(group_id=event["group_id"],begin_id = rpy or event['message_id'])
+        match_2 = re.search(r'(-end|-e)',clean_msg)
+        if match_2 and match_1:
+            await self.ifs.set_end_id(group_id=event["group_id"],end_id = event['message_id'])
+        elif match_2:
+            await self.ifs.set_end_id(group_id=event["group_id"],end_id = rpy or event['message_id'])
+        return
 
-        示例:
-            tokenizer("我是独角兽。")
-            → '我 是 独角兽 。'
-        """
-        return " ".join(jieba.cut(text))
     
     async def is_AT(self, event: dict, user_id: list[str]) -> list | None:
         """检查消息是否包含@指定用户"""
@@ -268,10 +285,10 @@ class MessageProcessor:
         """根据事件类型发送消息"""
         if isinstance(message, list):
             n = len(message)
-            index = random.randint(0,n-1)
+            index = random.randint(0, n - 1)
             message = message[index]
 
-        if self.extraconfig['tokenizer']:
+        if self.extraconfig["tokenizer"]:
             message = self.tokenizer(message)
 
         await self._ensure_connected()
@@ -280,145 +297,171 @@ class MessageProcessor:
                 group_id=event["group_id"], message=message
             )
         elif event["message_type"] == "private":
-            await self.nc.send_private_message(user_id=event["user_id"], message=message)
+            await self.nc.send_private_message(
+                user_id=event["user_id"], message=message
+            )
 
-    async def send_img(self,event,img_addr):
+    async def send_img(self, event, img_addr):
         """根据事件类型发送消息"""
         if isinstance(img_addr, list):
             n = len(img_addr)
-            index = random.randint(0,n-1)
+            index = random.randint(0, n - 1)
             img_addr = img_addr[index]
 
         await self._ensure_connected()
         if event["message_type"] == "group":
-            await self.nc.send_group_img(
-                group_id=event["group_id"], img_addr=img_addr
-            )
+            await self.nc.send_group_img(group_id=event["group_id"], img_addr=img_addr)
         elif event["message_type"] == "private":
             await self.nc.send_private_img(user_id=event["user_id"], img_addr=img_addr)
 
-    async def history_solution(self,event):
-        message_id = event['message_id']
+    async def history_solution(self, event):
+        message_id = event["message_id"]
         history = await self.get_message_history(message_id)
         print(history)
-        await self.send_message(event,history['context'])
+        await self.send_message(event, history["context"])
 
-    def get_clean_context(self,event)->str:
+    def get_clean_context(self, event ,keepAt = False) -> str:
         DEBUG = True
         context = ""
-        for item in event.get('message',[]):
-            msg_type = item.get('type',"")
-            if msg_type == 'text':
-                context += (item.get("data") or {}).get('text', '')
+        for item in event.get("message", []):
+            msg_type = item.get("type", "")
+            if msg_type == "text":
+                context += (item.get("data") or {}).get("text", "")
                 continue
-            if msg_type == 'image':
+            if msg_type == "image":
                 context += "图片"
                 context += (item.get("data") or {}).get("summary", "")
                 continue
+            if keepAt and msg_type == 'at':
+                qq_id = (item.get("data") or {}).get("qq", "all")
+                context += f'[CQ:at,qq={qq_id}]'
         DEBUG and print(context)
         return context
 
-    async def pattern_match(self, event, pattern_config : list[dict[str,any]]):
+    async def pattern_match(self, event, pattern_config: list[dict[str, any]]):
         clean_msg = self.get_clean_context(event)
-        ret : bool = False
+        ret: bool = False
         for pattern in pattern_config:
-            solution = pattern.get('solution')
-            regex = pattern.get('regex')
+            solution = pattern.get("solution")
+            regex = pattern.get("regex")
             if not solution or not regex:
                 continue
-            params = pattern.get('params',{})
+            params = pattern.get("params", {})
             if re.search(regex, clean_msg):
-                await solution(event=event, **params)
+                # 自动检测 solution 是否需要 event 参数
+                sig = inspect.signature(solution)
+                if "event" in sig.parameters:
+                    await solution(event=event, **params)
+                else:
+                    await solution(**params)
                 ret = True
                 continue
                 # return True
         return ret
 
-    # async def pattern_match(self, event, pattern,solution,param=None):
-    #     clean_msg = self.get_clean_context(event)
-    #     if param == None:
-    #         args = {}
-    #     else :
-    #         args = param
-
-    #     if re.search(pattern, clean_msg):
-    #         await solution(event=event, **args)
-    #         return True
-    #     return False
-
     async def setuserid(self):
-                # 确保已获取自己的 QQ 号
+        # 确保已获取自己的 QQ 号
         if self.user_id is None:
             await self._ensure_connected()
             self.user_id = await self.nc.get_user_id()
         # 启动心跳保活任务
         self.start_heartbeat()
         return
-    
-    async def get_long_history_backward(self,group_id,start_id,end_id):
+
+    async def get_long_history_backward(self, group_id, start_id, end_id):
         DEBUG = False
-        remaining = 20 #最大搜索20次
+        remaining = 20  # 最大搜索20次
         part = []
         DEBUG = True
         last_msg_id = start_id
         while remaining > 0:
-            DEBUG and print('reamaining = ',remaining)
+            DEBUG and print("reamaining = ", remaining)
             await self._ensure_connected()
             icl_history = await self.nc.get_group_msg_history(
-            group_id=group_id, message_seq=last_msg_id
+                group_id=group_id, message_seq=last_msg_id
             )
-            last_msg_id = icl_history['data']['messages'][-1]["message_seq"]
-            icl_history['data']['messages'].pop()
-            part = icl_history['data']['messages'] + part
-            remaining-=1
-            for item in icl_history['data']['messages']:
+            last_msg_id = icl_history["data"]["messages"][-1]["message_seq"]
+            icl_history["data"]["messages"].pop()
+            part = icl_history["data"]["messages"] + part
+            remaining -= 1
+            for item in icl_history["data"]["messages"]:
                 if item["message_seq"] == end_id:
                     return part
             if item["message_seq"] == end_id:
-                return part     
+                return part
         DEBUG and print("NotFind")
         return part
-        
-    async def get_long_history_only_processor(self,group_id,start_id,end_id,processor,params) -> None:
-        remaining = 200 #最大搜索200次
+
+    async def get_long_history_only_processor(
+        self, group_id, start_id, end_id, processor, params
+    ) -> None:
+        remaining = 200  # 最大搜索200次
         DEBUG = True
 
         last_msg_id = start_id
 
         while remaining > 0:
-            print('reamaining = ',remaining)
+            print("reamaining = ", remaining)
             await self._ensure_connected()
             icl_history = await self.nc.get_group_msg_history(
-            group_id=group_id, message_seq=last_msg_id
+                group_id=group_id, message_seq=last_msg_id
             )
-            last_msg_id = icl_history['data']['messages'][-1]["message_seq"]
-            icl_history['data']['messages'].pop()
-            remaining-=1
-            for item in icl_history['data']['messages']:
+            last_msg_id = icl_history["data"]["messages"][-1]["message_seq"]
+            last_msg = icl_history["data"]["messages"].pop()
+            remaining -= 1
+            for item in icl_history["data"]["messages"]:
                 await processor(event=item, **params)
-                if item["message_seq"] == end_id:
-                    return   
+                if item["message_seq"] == int(end_id):
+                    DEBUG and print("FIND")
+                    return
             if last_msg_id == end_id:
-                return   
-        return 
+                await processor(event=last_msg, **params)
+                DEBUG and print("FIND")
+                return
+        return
 
-
-    async def export(self,event):
+    async def export(self, event):
         DEBUG = False
         message_id = self.is_reply(event)
         if not message_id:
             return False
-        raw_msg = event['raw_message']
-        match = re.search(r'target (\d+)',raw_msg)
+        raw_msg = event["raw_message"]
+        match = re.search(r"(-target|-t) (\d+)", raw_msg)
         if not match:
             DEBUG and print("Find no Target")
             return False
         target_group = int(match.group(1))
-        end_id = event['message_id']
-        await self.get_long_history_only_processor(group_id=event['group_id'],start_id=message_id,end_id=end_id,processor=self.auto_forward,params={"groupid_list":[event['group_id']],"target_groupid":[target_group]})
+        end_id = event["message_id"]
+        await self.get_long_history_only_processor(
+            group_id=event["group_id"],
+            start_id=message_id,
+            end_id=end_id,
+            processor=self.auto_forward,
+            params={
+                "groupid_list": [event["group_id"]],
+                "target_groupid": [target_group],
+            },
+        )
         return True
+    
+    def check_is_miniapp(self, msg_event: dict) -> str | None:
+        for seg in msg_event.get("message", []):
+            if seg["type"] == "json":
+                try:
+                    json_data = json.loads(seg["data"]["data"])
+                    
+                    if json_data.get("app") == "com.tencent.miniapp_01":
+                        detail = json_data["meta"]["detail_1"]
+                        title = detail['title']
+                        desc = detail["desc"]
+                        link = detail["qqdocurl"]
+                        return f"[title:{title}][desc:{desc}]"
+                except Exception:
+                    continue
+        return None
 
-       
+
+
     def check_is_multimsg_forward(self, msg_event: dict) -> str | None:
         """
         检测是否为新版合并转发JSON卡片
@@ -434,43 +477,52 @@ class MessageProcessor:
                     continue
         return None
 
-    def check_is_old_forward(self,msg_event:dict)-> bool:
-        '''确定是不是旧版forward'''
+    def check_is_old_forward(self, msg_event: dict) -> bool:
+        """确定是不是旧版forward"""
         for seg in msg_event.get("message", []):
             if seg["type"] == "forward":
                 return True
         return False
-    
-    def is_reply(self,msg_event:dict) -> int|None:
+
+    def is_reply(self, msg_event: dict) -> int | None:
         for seg in msg_event.get("message", []):
             if seg["type"] == "reply":
                 return seg["data"]["id"]
-        return None
+        return 
 
-    async def generate_structed_message_to_creat_context(self,event,isOCR=False)->str:
+    async def generate_structed_message_to_creat_context(
+        self, event, isOCR=False
+    ) -> str:
+    ###感觉可以做一个池来达到Cache命中的效果，因为需要持续去寻找转发消息，尤其是回复比较多的情况
+    ###恰好有future可以达到，但是不适合该场景，因为访存和发包的时间肯定天差地别，发包还有网络压力 命中 or get_reply
+    ###但是压力不大，效果不显著
         DEBUG = False
-        temp = ''
+        temp = ""
         DEBUG and print("获取sender")
-        sender = event.get('sender') or {}
-        user_id = event.get('user_id') or sender.get('user_id', '未知')
-        name = sender.get('card') or sender.get('nickname', '未知')
+        sender = event.get("sender") or {}
+        user_id = event.get("user_id") or sender.get("user_id", "未知")
+        name = sender.get("card") or sender.get("nickname", "未知")
         temp += f"消息发送者{name}，其QQ号为{user_id},\t发送消息:"
         DEBUG and print(temp)
-
+        mini_app_info = self.check_is_miniapp(event)
+        if mini_app_info:
+            return f'[这是一条小程序消息{mini_app_info}]'
         if self.check_is_old_forward(event):
             DEBUG and print("转发模块tradition Begin")
 
-            message_id = event['message_id']
+            message_id = event["message_id"]
             res = await self.nc.get_forward_msg({"message_id": message_id})
 
-            if res['status'] == "failed":
-                return ''
-            
+            if res["status"] == "failed":
+                return ""
+
             messages = res["data"]["messages"]
-            ret = ''
+            ret = ""
             for message_event in messages:
-                ret += await self.generate_structed_message_to_creat_context(message_event)
-            temp+=f'这是一条转发消息,内容如下[{ret}]\n'
+                ret += await self.generate_structed_message_to_creat_context(
+                    message_event
+                )
+            temp += f"这是一条转发消息,内容如下[{ret}]\n"
             DEBUG and print("转发模块tradition End")
             return temp
         rid = self.check_is_multimsg_forward(event)
@@ -478,27 +530,32 @@ class MessageProcessor:
             DEBUG and print("转发模块Json Begin")
             await self._ensure_connected()
             res = await self.nc.get_forward_msg({"message_id": rid})
-            if res['status'] == "failed":
-                return ''
+            if res["status"] == "failed":
+                return ""
             messages = res["data"]["messages"]
-            ret = ''
+            ret = ""
             for message_event in messages:
-                if not message_event.get("message") or len(message_event["message"]) == 0:
+                if (
+                    not message_event.get("message")
+                    or len(message_event["message"]) == 0
+                ):
                     ret += "[这可能是嵌套的聊天记录，解析失败]"
-                ret += await self.generate_structed_message_to_creat_context(message_event)
-            temp+=f'这是一条转发消息,内容如下[{ret}]\n'
+                ret += await self.generate_structed_message_to_creat_context(
+                    message_event
+                )
+            temp += f"这是一条转发消息,内容如下[{ret}]\n"
             DEBUG and print("转发模块json End")
             return temp
         reply_id = self.is_reply(event)
         if reply_id:
             await self._ensure_connected()
             res = await self.nc.get_message(message_id=reply_id)
-            if res['status'] == "failed":
-                return ''
+            if res["status"] == "failed":
+                return ""
             message = res["data"]
-            ret = ''
+            ret = ""
             ret += await self.generate_structed_message_to_creat_context(message)
-            temp+=f'这是一条回复消息,被回复的内容如下[{ret}]\n'
+            temp += f"这是一条回复消息,被回复的内容如下[\n\t{ret}\n\t]\n"
 
         for seg in event.get("message", []):
             seg_type = seg.get("type", "")
@@ -509,70 +566,72 @@ class MessageProcessor:
             if seg_type == "image":
                 temp += "图片"
                 temp += seg_data.get("summary", "[]")
-                url = seg_data.get('url')
+                url = seg_data.get("url")
                 if not url:
                     continue
                 if not isOCR:
-                    temp += f'{{"url":{url}}}'
+                    temp += f'\n\t{{"url":{url}}}\n'
                     continue
-                ocr_res = (await self.extension.napcat_ocr(url))['text']
-                temp += f'ocr结果{ocr_res}'
+                ocr_res = (await self.extension.napcat_ocr(url))["text"]
+                temp += f"ocr结果{ocr_res}"
                 continue
             if seg_type == "at":
-                temp += f'[CQ:at,qq={seg_data.get('qq')}]'
+                temp += f"[CQ:at,qq={seg_data.get('qq')}]"
         return temp
-    
-    async def set_tokenizer(self,event):
-        raw_message = event['raw_message']
-        match = re.search(r'True',raw_message)
+
+    async def set_tokenizer(self, event):
+        raw_message = event["raw_message"]
+        match = re.search(r"True", raw_message)
         if match:
-            self.extraconfig['tokenizer'] = True
-            await self.send_message(event=event,message="set tokenizer True")
+            self.extraconfig["tokenizer"] = True
+            await self.send_message(event=event, message="set tokenizer True")
             return True
-        match = re.search(r'False',raw_message)
-        if match:    
-            await self.send_message(event=event,message="set tokenizer True")
-            self.extraconfig['tokenizer'] = False
+        match = re.search(r"False", raw_message)
+        if match:
+            await self.send_message(event=event, message="set tokenizer True")
+            self.extraconfig["tokenizer"] = False
             return True
         return False
-        
 
-    async def Check_Campus_NetWoerk(self,event):
+    async def Check_Campus_NetWoerk(self, event):
         if self.sllm == None:
             DEBUG and print("SLLM for Check hasn't benn deployed")
             return
-        raw_msg =event['raw_message']
+        raw_msg = event["raw_message"]
         message = re.sub(r"\[CQ:[^\]]+\]", "", raw_msg).strip()
         DEBUG and print(f"sendMessage:{raw_msg}")
         isVailde = await self.sllm.ask(message)
         if isVailde:
-            DEBUG and print('Now Peppare to send img')
+            DEBUG and print("Now Peppare to send img")
             await self.send_img(event, f"{_IMGS_DIR}/img02.jpg")
         return
-    
-    async def auto_forward(self,event,groupid_list,target_groupid) -> bool:
+
+    async def auto_forward(self, event, groupid_list, target_groupid) -> bool:
         DEBUG = False
-        if event["message_type"] != "group" :
+        if event["message_type"] != "group":
             return False
         if event["group_id"] not in groupid_list:
             if DEBUG:
                 DEBUG and print("GROUP_ID NOT CORRECT")
             return False
-        raw_msg = event['raw_message']
-        match = self.check_is_old_forward(event) or self.check_is_multimsg_forward(event)
+        raw_msg = event["raw_message"]
+        match = self.check_is_old_forward(event) or self.check_is_multimsg_forward(
+            event
+        )
         if not match:
             DEBUG and print("Match Failed!")
             return False
         for group_id in target_groupid:
-            if group_id == event['group_id']:
+            if group_id == event["group_id"]:
                 continue
             await self._ensure_connected()
-            await self.nc.forward_group_single_msg(group_id=group_id,message_id=event['message_id'])
+            await self.nc.forward_group_single_msg(
+                group_id=group_id, message_id=event["message_id"]
+            )
             DEBUG and print("Succeed Forward!")
         return True
-    
 
-    async def get_long_history(self,group_id,message_id,remaining:int):
+    async def get_long_history(self, group_id, message_id, remaining: int):
         if remaining <= 0:
             return []
 
@@ -582,62 +641,147 @@ class MessageProcessor:
         last_msg_id = message_id
 
         while remaining > 0:
-            DEBUG and print('reamaining = ',remaining)
+            DEBUG and print("reamaining = ", remaining)
             await self._ensure_connected()
             icl_history = await self.nc.get_group_msg_history(
-            group_id=group_id, message_seq=last_msg_id
+                group_id=group_id, message_seq=last_msg_id
             )
-            last_msg_id = icl_history['data']['messages'][0]["message_seq"]
-            DEBUG and print(icl_history['data']['messages'])
-            DEBUG and print('last_msg_id',last_msg_id)
-            icl_history['data']['messages'].pop()
-            part = icl_history['data']['messages'] + part
-            remaining-=1
+            last_msg_id = icl_history["data"]["messages"][0]["message_seq"]
+            DEBUG and print(icl_history["data"]["messages"])
+            DEBUG and print("last_msg_id", last_msg_id)
+            icl_history["data"]["messages"].pop()
+            part = icl_history["data"]["messages"] + part
+            remaining -= 1
 
         return part
 
-
     async def get_history_msg(self, event) -> str:
         await self._ensure_connected()
-        icl_history = await self.nc.get_group_msg_history(
-            group_id=event['group_id']
-        )
+        icl_history = await self.nc.get_group_msg_history(group_id=event["group_id"])
         parts = []
-        for ctx in icl_history['data']['messages']:
+        for ctx in icl_history["data"]["messages"]:
             parts.append(await self.generate_structed_message_to_creat_context(ctx))
         return "\n".join(parts)
 
-    async def get_long_history_test(self,event):
-        DEBUG and print('enter History Debug')
-        res = await self.get_long_history(group_id=event['group_id'],message_id=event['message_id'],remaining=10)
-        DEBUG and print(res)
-        DEBUG and print('end')
-
-    async def get_history_msg_test(self,event):
-        await self._ensure_connected()
-        #获取最近20条
-        icl_history = await self.nc.get_group_msg_history(
-            group_id=event['group_id']
+    async def get_long_history_test(self, event):
+        DEBUG and print("enter History Debug")
+        res = await self.get_long_history(
+            group_id=event["group_id"], message_id=event["message_id"], remaining=10
         )
+        DEBUG and print(res)
+        DEBUG and print("end")
 
-        count = 0
+    def _init_agent_bg(self):
+        """在后台线程中导入并初始化 QQBotAgent 和 SimpleLLM"""
+        DEBUG and print("后台预加载 AI Agent …")
+        from Agent import QQBotAgent
 
-        for ctx in icl_history['data']['messages']:
-            count +=1
-            if count <= 10:
-                continue
-            msg_seq = ctx['message_seq']
-            DEBUG and print('###\n'*3)
-            await self._ensure_connected()
-            temp = await self.nc.get_group_msg_history(
-            group_id=event['group_id'],message_seq=msg_seq
-            )
-            DEBUG and print(str(temp['data']['messages']))
-            DEBUG and print('###\n'*3)
-            
+        self._agent = QQBotAgent(napcat_api=self.nc, extension=self.extension)
+        from Agent.SimpleLLM import SimpleChatModule as SLLM
+
+        self.sllm = SLLM()
+        self._agent_ready.set()
+        DEBUG and print("AI Agent 后台加载完成")
+
+    async def _heartbeat_loop(self):
+        """后台心跳协程：每 10~20 分钟（均匀分布）调用 get_login_info 保活"""
+        while True:
+            interval = random.uniform(10 * 60, 20 * 60)  # 10~20 分钟
+            await asyncio.sleep(interval)
+            try:
+                await self._ensure_connected()
+                result = await self.nc.get_login_info()
+                if DEBUG:
+                    DEBUG and print(
+                        f"[心跳] get_login_info 成功: {result.get('data', {}).get('nickname', 'unknown')}"
+                    )
+            except Exception as e:
+                print(f"[心跳] 异常: {e}")
+
+    def start_heartbeat(self):
+        """启动心跳后台任务（需在事件循环中调用）"""
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            print("心跳任务已启动（间隔 10~20 分钟）")
+
+    @property
+    def agent(self):
+        """返回 QQBotAgent，如果后台加载尚未完成则等待"""
+        self._agent_ready.wait()
+        return self._agent
+
+    @staticmethod
+    def tokenizer(text: str) -> str:
+        """中文分词：基于 jieba 分词库，返回空格分隔的字符串。
+
+        示例:
+            tokenizer("我是独角兽。")
+            → '我 是 独角兽 。'
+        """
+        return " ".join(jieba.cut(text))
 
 
 
 
- 
-        
+class image_forward_service:
+    def __init__(self, message_processor: MessageProcessor):
+        self.ms = message_processor
+        self.task_dict = {}
+        self.lock = asyncio.Lock()
+
+    async def create_task(self, group_id, target_id):
+        # 加锁，确定不会创建多个任务
+        group_id = str(group_id)
+        async with self.lock:
+            if self.task_dict.get(group_id):
+                print("Tasl has been created")
+                return False
+            self.task_dict[group_id] = {
+                "begin_id": None,
+                "end_id": None,
+                "begin_event": asyncio.Event(),
+                "end_event": asyncio.Event(),
+            }
+        asyncio.create_task(self._task_init(group_id, target_id))
+        return True
+
+    async def _task_init(self, group_id, target_id):
+        group_id = str(group_id)
+        data = self.task_dict.get(group_id)
+        if not data:
+            print("理论上不存在该问题")
+            return
+        await data["begin_event"].wait()
+        await data["end_event"].wait()
+        await self.ms.image_forward(
+            group_id, target_id, data["begin_id"], data["end_id"]
+        )
+        async with self.lock:
+            self.task_dict.pop(group_id)
+        return
+
+    async def set_begin_id(self, group_id, begin_id):
+        if not begin_id:
+            return
+        async with self.lock:
+            group_id = str(group_id)
+            data = self.task_dict.get(group_id)
+            if not data:
+                print("任务未创建！")
+                return
+            data["begin_id"] = begin_id
+            data["begin_event"].set()
+        return
+
+    async def set_end_id(self, group_id, end_id):
+        if not end_id:
+            return
+        async with self.lock:
+            group_id = str(group_id)
+            data = self.task_dict.get(group_id)
+            if not data:
+                print("任务未创建！")
+                return
+            data["end_id"] = end_id
+            data["end_event"].set()
+        return

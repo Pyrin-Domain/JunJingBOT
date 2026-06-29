@@ -1,0 +1,6 @@
+{
+    "extraPaths": [
+        "Minitor"
+    ],
+    "typeCheckingMode": "off"
+}

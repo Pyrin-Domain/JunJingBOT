@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-import threading
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -13,11 +12,6 @@ method = {'data':[
 
 class rw_tools:
     def __init__(self):
-        self.method = None
-        self._init_thread = threading.Thread(taget=self._init_bg,deamon = True)
-        self._init_thread.start()
-
-    def _init_bg(self):
         self.method = self.read_method()
 
 
@@ -56,8 +50,9 @@ class rw_tools:
     def apeend_method(self,context:str):
         index = len(self.method.get('data'))
         self.method['data'].append({'index':index,'context':context})
+        self.write_method(self.method)
     
-    def alter_methof(self,index,context):
+    def alter_method(self,index,context):
         self.method['data'][index] = {'index':index,'context':context}
         self.write_method(self.method)
     

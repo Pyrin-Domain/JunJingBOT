@@ -1,15 +1,12 @@
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import asyncio
 import websockets
 import json
 import re
 from collections.abc import Callable
-from NapCatTools import MessageProcessor
 from Websockets import NapCatBotConfig
-
 
 
 async def listen_msg(config:NapCatBotConfig,process_message: Callable):
@@ -37,8 +34,3 @@ async def listen_msg(config:NapCatBotConfig,process_message: Callable):
                     lambda t: print(f"消息处理异常: {t.exception()}") if t.exception() else None
                 )
 
-if __name__ == "__main__":
-    config = NapCatBotConfig()
-    sender = NapCatBotConfig("sender_config.json")
-    Messageprocessor = MessageProcessor(sender)
-    asyncio.run(listen_msg(config, Messageprocessor.process_message))

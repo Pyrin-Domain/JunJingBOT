@@ -1,7 +1,4 @@
-import asyncio
-import websockets
 import json
-import re
 from collections.abc import Callable
 
 
@@ -10,9 +7,10 @@ def gettoken(file_path):
         config = json.load(f)
     token = config.get("access_token")
     port = config.get("ws_port", 3001)
+    host = config.get("ws_host",'127.0.0.1')
     if not token:
         raise ValueError("配置文件中未找到 access_token")
-    return {'token': token, 'port': port}
+    return {'token': token, 'port': port,'host':host}
 
 
 
@@ -21,4 +19,5 @@ class NapCatBotConfig:
         self.info = gettoken(config_file)
         self.token = self.info['token']
         self.port = self.info['port']
-        self.WS_URL = f"ws://127.0.0.1:{self.info['port']}?access_token={self.info['token']}"
+        self.host = self.info['host']
+        self.WS_URL = f"ws://{self.host}:{self.port}?access_token={self.token}"

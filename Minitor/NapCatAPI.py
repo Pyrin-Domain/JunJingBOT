@@ -2,16 +2,17 @@ import json
 import asyncio
 import uuid
 import websockets
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from Websockets import NapCatBotConfig
 
 class NapCatAPIInterface:
     def __init__(self, config: "NapCatBotConfig"):
-        from Websockets import NapCatBotConfig  # 避免循环导入
+        from Websockets import NapCatBotConfig
         self.config = config
         self._ws_conn: Optional[websockets.WebSocketClientProtocol] = None
-        self._ws_url = (
-            f"ws://127.0.0.1:{self.config.port}?access_token={self.config.token}"
-        )
+        self._ws_url = self.config.WS_URL
         # 并发安全：后台reader + 分发机制
         self._reader_task: Optional[asyncio.Task] = None
         self._send_lock = asyncio.Lock()
