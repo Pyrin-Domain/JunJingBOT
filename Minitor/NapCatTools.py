@@ -51,11 +51,16 @@ class MessageProcessor:
         self._agent_ready = threading.Event()
         self._connect_lock = asyncio.Lock()  # 防止并发重复建连
         self._heartbeat_task: asyncio.Task = None
+        self._checkpoint_save_task: asyncio.Task = None
+        self.check_point: dict = {}
         # 后台线程预加载 AI Agent + SLLM，不阻塞主线程
         self._agent_thread = threading.Thread(target=self._init_agent_bg, daemon=True)
         self._agent_thread.start()
 
     async def process_message(self, event):
+        # 每条消息进来立即记录断点（崩了也知道处理到哪条了）
+        self.check_point[str(event.get("group_id", event["user_id"]))] = event
+
         message_id = event["message_id"]
         user_id = event["user_id"]
         raw_msg = event["raw_message"]
@@ -386,41 +391,74 @@ class MessageProcessor:
             print("error")
         return {}
         
-    async def write_thread(self):
-        file_name = str(Path(__file__).resolve().parent.parent / "check_point"/f'{self.user_id}.json')
-        while True:
-            with open(file_name,mode='w',encoding='utf-8') as f:
-                return json.dump(self.check_point,f, ensure_ascii=False, indent=4)
-            sys.wait(10000)
+    async def _save_check_point(self):
+        """将当前断点写入磁盘"""
+        try:
+            file_name = str(Path(__file__).resolve().parent.parent / "check_point" / f'{self.user_id}.json')
+            os.makedirs(os.path.dirname(file_name), exist_ok=True)
+            with open(file_name, 'w', encoding='utf-8') as f:
+                json.dump(self.check_point, f, ensure_ascii=False, indent=4)
+            if self.check_point:
+                print(f"[断点保存] 已写入 {len(self.check_point)} 条断点到 {file_name}")
+        except Exception as e:
+            print(f"[断点保存] 异常: {e}")
 
-    async def recover_process(self,event):
+    async def recover_process(self, event):
+        """回放断点消息：从最新消息往前翻，直到找到断点消息为止"""
         group_id = event['group_id']
         rid = event.get('real_id')
         if not rid:
             return
-        remaing = 20
-        message_seq = None
-        while remaing > 0:
-            remaing-=1
+        remaining = 20  # 最多翻 20 页
+        message_seq = None  # None = 从最新开始
+        while remaining > 0:
+            remaining -= 1
             await self._ensure_connected()
-            history_list = self.nc.get_group_msg_history(group_id=group_id,reverse_order=True,count = 20,message_seq=message_seq)
-            last_event = history_list['data'].pop()
-            message_seq = last_event['message_seq']
-            for msg_event in reversed(history_list['data']):
-                if msg_event.get('real_id')==rid:
-                    print('Find')
-                    break
-                await self.process_message(msg_event)
-        return
+            history_list = await self.nc.get_group_msg_history(
+                group_id=group_id, reverse_order=True, count=20, message_seq=message_seq
+            )
+            messages = history_list['data']['messages']
+            if not messages:
+                break
 
+            # 记录本次传入的锚点，后面会覆盖 message_seq
+            seq_for_this_page = message_seq
+
+            # 翻页锚点 = 本批最旧的消息的 seq（下一次拉更旧的）
+            message_seq = messages[0]['message_seq']
+
+            # 非首次调用：API 返回会包含锚点消息（上一批已处理），pop 掉避免重复
+            if seq_for_this_page is not None:
+                messages.pop()
+            if not messages:
+                break
+
+            # 从最新→最旧遍历（reverse_order 返回升序 旧→新）
+            for msg_event in reversed(messages):
+                if msg_event.get('real_id') == rid:
+                    print(f'[断点恢复] 找到断点消息 {rid}')
+                    return
+                # 被踢期间的消息确实没处理过，走完整 process_message
+                await self.process_message(msg_event)
+        print(f'[断点恢复] 未找到断点 {rid}，可能已被清理')
 
     async def recover_from_check_point(self):
-        #深拷贝防止被覆盖
-        check_point=deepcopy(self.check_point)
-        for key,value in check_point.items():
-            asyncio.create_task(self.recover_process(event = value)
-)
-        
+        """深拷贝断点，创建协程回放（不阻塞主流程）"""
+        check_point = deepcopy(self.check_point)
+        for key, value in check_point.items():
+            print(f'[断点恢复] 创建恢复任务: {key}')
+            asyncio.create_task(self.recover_process(event=value))
+        if check_point:
+            await self._save_check_point()
+
+    async def _checkpoint_save_loop(self):
+        """后台每 10 秒将内存中的断点刷入磁盘"""
+        while True:
+            await asyncio.sleep(10)
+            try:
+                await self._save_check_point()
+            except Exception as e:
+                print(f"[断点保存] 写入失败: {e}")
 
     async def setuserid(self):
         # 确保已获取自己的 QQ 号
@@ -428,6 +466,9 @@ class MessageProcessor:
             await self._ensure_connected()
             self.user_id = await self.nc.get_user_id()
             self.check_point = await self.read_check_point(self.user_id)
+            print(f'[启动] user_id={self.user_id}, 加载断点 {len(self.check_point)} 个')
+            # 启动断点定时保存任务
+            self._checkpoint_save_task = asyncio.create_task(self._checkpoint_save_loop())
         # 启动心跳保活任务
         self.start_heartbeat()
         return
@@ -485,7 +526,7 @@ class MessageProcessor:
         return
 
     async def export(self, event):
-        DEBUG = False
+        DEBUG = True
         message_id = self.is_reply(event)
         if not message_id:
             return False
@@ -512,6 +553,7 @@ class MessageProcessor:
                 },
             )
         if match2:
+            print("Prepare to start export user")
             await self.get_long_history_only_processor(
                 group_id=event["group_id"],
                 start_id=message_id,
@@ -685,7 +727,7 @@ class MessageProcessor:
         return
 
     async def auto_forward(self, event, groupid_list=None, userid_list=None, target_groupid=None, task_userid=None) -> bool:
-        DEBUG = False
+        DEBUG = True
         if groupid_list is None:
             groupid_list = []
         if userid_list is None:

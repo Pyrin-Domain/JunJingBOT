@@ -143,7 +143,7 @@ class NapCatAPIInterface:
         params = {'group_id':group_id,'reverse_order':reverse_order,'count':count}
         if message_seq :
             params['message_seq'] = message_seq
-            return await self._call_api(
-                action='get_group_msg_history',params=params
-            )
+        return await self._call_api(
+            action='get_group_msg_history',params=params
+        )
     

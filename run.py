@@ -12,6 +12,8 @@ async def main():
     sender = NapCatBotConfig("sender_config.json")
     mp = MessageProcessor(sender)
     await mp.setuserid()
+    # 从断点恢复（不阻塞，后台回放）
+    await mp.recover_from_check_point()
     await listen_msg(config, mp.process_message)
 
 if __name__ == "__main__":

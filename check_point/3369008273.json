@@ -1,0 +1,359 @@
+{
+    "1079845768": {
+        "self_id": 3369008273,
+        "user_id": 1013098110,
+        "time": 1782832277,
+        "message_id": 1957182526,
+        "message_seq": 1957182526,
+        "real_id": 1957182526,
+        "real_seq": "13687",
+        "message_type": "group",
+        "sender": {
+            "user_id": 1013098110,
+            "nickname": "PyrinDomain🦄",
+            "card": "咬住嘴，扶住墙，疼点总比上班强",
+            "role": "admin"
+        },
+        "raw_message": "但是 我 也 想 学 干男娘😋",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "text",
+                "data": {
+                    "text": "但是 我 也 想 学 干男娘😋"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 1079845768,
+        "group_name": "独角兽的板石群（二代目）（打赢复活赛）"
+    },
+    "569117421": {
+        "self_id": 3369008273,
+        "user_id": 1971776360,
+        "time": 1782832380,
+        "message_id": 758625747,
+        "message_seq": 758625747,
+        "real_id": 758625747,
+        "real_seq": "38380",
+        "message_type": "group",
+        "sender": {
+            "user_id": 1971776360,
+            "nickname": "天轮幻月",
+            "card": "",
+            "role": "member"
+        },
+        "raw_message": "[CQ:image,file=1D8BA2516800158C29E3B7A7C5489A09.jpg,sub_type=0,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhTjHJQTTnWnRw4OOppGw_g3GkA-PhjP4Agg_woos766laCvlQMyBHByb2RQgL2jAVoQgROwhquv6q5VYcPdF-mVCXoCN9mCAQJneg&amp;rkey=CAISMGeVQJCJsRkl_SCxyzOXQ4Qfr5L0DpL17gpZ6MxxFCtTW8Vo2r-FH6esGB3YozX8Ww,file_size=143439]",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "image",
+                "data": {
+                    "summary": "",
+                    "file": "1D8BA2516800158C29E3B7A7C5489A09.jpg",
+                    "sub_type": 0,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhTjHJQTTnWnRw4OOppGw_g3GkA-PhjP4Agg_woos766laCvlQMyBHByb2RQgL2jAVoQgROwhquv6q5VYcPdF-mVCXoCN9mCAQJneg&rkey=CAISMGeVQJCJsRkl_SCxyzOXQ4Qfr5L0DpL17gpZ6MxxFCtTW8Vo2r-FH6esGB3YozX8Ww",
+                    "file_size": "143439"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 569117421,
+        "group_name": "想和彩彩信教"
+    },
+    "618648682": {
+        "self_id": 3369008273,
+        "user_id": 2768377257,
+        "time": 1782830547,
+        "message_id": 1109852343,
+        "message_seq": 1109852343,
+        "real_id": 1109852343,
+        "real_seq": "345546",
+        "message_type": "group",
+        "sender": {
+            "user_id": 2768377257,
+            "nickname": "",
+            "card": "ℒ_𝒮𝒽𝓎_𝒫 喵",
+            "role": "owner"
+        },
+        "raw_message": "[CQ:reply,id=1925518109][CQ:at,qq=2777506007] 我也能打",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "reply",
+                "data": {
+                    "id": "1925518109"
+                }
+            },
+            {
+                "type": "at",
+                "data": {
+                    "qq": "2777506007"
+                }
+            },
+            {
+                "type": "text",
+                "data": {
+                    "text": " 我也能打"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 618648682,
+        "group_name": "<$ǿĀD\u000e>TankTrouble交流群<$ǿĀD\u000e>"
+    },
+    "1007233417": {
+        "self_id": 3369008273,
+        "user_id": 3646659295,
+        "time": 1782832641,
+        "message_id": 2035043937,
+        "message_seq": 2035043937,
+        "real_id": 2035043937,
+        "real_seq": "168735",
+        "message_type": "group",
+        "sender": {
+            "user_id": 3646659295,
+            "nickname": "世界需要七休日",
+            "card": "超喜欢猫猫的七休日",
+            "role": "member"
+        },
+        "raw_message": "[CQ:image,summary=&#91;动画表情&#93;,file=8F9A7A62F83525C43BB27B452191E1C0.jpg,sub_type=1,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhQrKC1qLcwbRJlNzD7Aa-1Lwqa4BRikmQQg_woo1LzRkaGvlQMyBHByb2RQgL2jAVoQKL0nC1_SWt_amHs4jiffwnoCYlOCAQJuag&amp;rkey=CAISMGeVQJCJsRkl_SCxyzOXQ4Qfr5L0DpL17gpZ6MxxFCtTW8Vo2r-FH6esGB3YozX8Ww,file_size=68772]",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "image",
+                "data": {
+                    "summary": "[动画表情]",
+                    "file": "8F9A7A62F83525C43BB27B452191E1C0.jpg",
+                    "sub_type": 1,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhQrKC1qLcwbRJlNzD7Aa-1Lwqa4BRikmQQg_woo1LzRkaGvlQMyBHByb2RQgL2jAVoQKL0nC1_SWt_amHs4jiffwnoCYlOCAQJuag&rkey=CAISMGeVQJCJsRkl_SCxyzOXQ4Qfr5L0DpL17gpZ6MxxFCtTW8Vo2r-FH6esGB3YozX8Ww",
+                    "file_size": "68772"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 1007233417,
+        "group_name": "橘域网"
+    },
+    "1054955587": {
+        "self_id": 3369008273,
+        "user_id": 3282647559,
+        "time": 1782831151,
+        "message_id": 715054414,
+        "message_seq": 715054414,
+        "real_id": 715054414,
+        "real_seq": "136241",
+        "message_type": "group",
+        "sender": {
+            "user_id": 3282647559,
+            "nickname": "我旳电脑",
+            "card": "搬史bot-发送“牛牛菜单”玩小游戏-已复活",
+            "role": "admin"
+        },
+        "raw_message": "[CQ:image,file=5B2FD27E3D398D6DD45C97A8363762E9.png,sub_type=0,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhQtEPXBaJQGYVsC5bCB_2x5J6hXWhip3AMg_woozdSxy5uvlQMyBHByb2RQgL2jAVoQk8cMo5pZ4lH4kTV5tHLoLnoC8DOCAQJuag&amp;rkey=CAESMLkIVf-0V3YLNGFVAjzsM1sEMByw7e2s1E8BanCFsDKRvI34yp_5hv4DqE5Z4PJiPg,file_size=60969]",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "image",
+                "data": {
+                    "summary": "",
+                    "file": "5B2FD27E3D398D6DD45C97A8363762E9.png",
+                    "sub_type": 0,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhQtEPXBaJQGYVsC5bCB_2x5J6hXWhip3AMg_woozdSxy5uvlQMyBHByb2RQgL2jAVoQk8cMo5pZ4lH4kTV5tHLoLnoC8DOCAQJuag&rkey=CAESMLkIVf-0V3YLNGFVAjzsM1sEMByw7e2s1E8BanCFsDKRvI34yp_5hv4DqE5Z4PJiPg",
+                    "file_size": "60969"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 1054955587,
+        "group_name": "八角楼史群"
+    },
+    "978126234": {
+        "self_id": 3369008273,
+        "user_id": 403591554,
+        "time": 1782831565,
+        "message_id": 1417120748,
+        "message_seq": 1417120748,
+        "real_id": 1417120748,
+        "real_seq": "47041",
+        "message_type": "group",
+        "sender": {
+            "user_id": 403591554,
+            "nickname": "Fατε ΖεдØ",
+            "card": "",
+            "role": "member"
+        },
+        "raw_message": "[CQ:image,file=E0957F04A6EAA08B5F56C7EFE31F944F.jpg,sub_type=0,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhSIbkJkzVEfv7XsKKOwH-F8-ktdvRj0kRsg_woo5YuZkZ2vlQMyBHByb2RQgL2jAVoQGZ6Qnhc3XZXwRU27_4nsXnoC-_KCAQJneg&amp;rkey=CAMSMFIrc3s-hs3qnLKForExz2QBTIs2CYrxRTKOGkQYfGuMJGUhVGUo8I1mpOko7IMCUA,file_size=444660]",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "image",
+                "data": {
+                    "summary": "",
+                    "file": "E0957F04A6EAA08B5F56C7EFE31F944F.jpg",
+                    "sub_type": 0,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhSIbkJkzVEfv7XsKKOwH-F8-ktdvRj0kRsg_woo5YuZkZ2vlQMyBHByb2RQgL2jAVoQGZ6Qnhc3XZXwRU27_4nsXnoC-_KCAQJneg&rkey=CAMSMFIrc3s-hs3qnLKForExz2QBTIs2CYrxRTKOGkQYfGuMJGUhVGUo8I1mpOko7IMCUA",
+                    "file_size": "444660"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 978126234,
+        "group_name": "优雅得体的粉丝群"
+    },
+    "365953299": {
+        "self_id": 3369008273,
+        "user_id": 1308723788,
+        "time": 1782832798,
+        "message_id": 538009723,
+        "message_seq": 538009723,
+        "real_id": 538009723,
+        "real_seq": "1269691",
+        "message_type": "group",
+        "sender": {
+            "user_id": 1308723788,
+            "nickname": "'紫紫的颜色",
+            "card": "l-机网-张梓函",
+            "role": "member"
+        },
+        "raw_message": "那不会是原则上不能吧😰",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "text",
+                "data": {
+                    "text": "那不会是原则上不能吧"
+                }
+            },
+            {
+                "type": "text",
+                "data": {
+                    "text": "😰"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 365953299,
+        "group_name": "软院学长学姐帮帮忙"
+    },
+    "1032125562": {
+        "self_id": 3369008273,
+        "user_id": 3369008273,
+        "time": 1782828610,
+        "message_id": 599465166,
+        "message_seq": 599465166,
+        "real_id": 599465166,
+        "real_seq": "408",
+        "message_type": "group",
+        "sender": {
+            "user_id": 3369008273,
+            "nickname": "君景",
+            "card": "",
+            "role": "member"
+        },
+        "raw_message": "[CQ:json,data={\"app\":\"com.tencent.multimsg\"&#44;\"config\":{\"autosize\":1&#44;\"forward\":1&#44;\"round\":1&#44;\"type\":\"normal\"&#44;\"width\":300}&#44;\"desc\":\"&#91;聊天记录&#93;\"&#44;\"extra\":\"{\\\"filename\\\":\\\"67f720b5-71b0-4a4a-ac22-a7f7572ca096\\\"&#44;\\\"tsum\\\":10}\\n\"&#44;\"meta\":{\"detail\":{\"news\":&#91;{\"text\":\"QQ用户: &#91;聊天记录&#93;\"}&#44;{\"text\":\"QQ用户: 小曹在群里吗\"}&#44;{\"text\":\"QQ用户: 小曹在群里吗\"}&#44;{\"text\":\"QQ用户: 小曹在群里吗\"}&#93;&#44;\"resid\":\"05J2yOzWjI326TDrYvkgIDMuMKq/XU1OM/9klKKkmdkpoMVYyHLVAdZAWCxtHi4N\"&#44;\"source\":\"群聊的聊天记录\"&#44;\"summary\":\"查看7条转发消息\"&#44;\"uniseq\":\"67f720b5-71b0-4a4a-ac22-a7f7572ca096\"}}&#44;\"prompt\":\"&#91;聊天记录&#93;\"&#44;\"ver\":\"0.0.0.5\"&#44;\"view\":\"contact\"}\n]",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "json",
+                "data": {
+                    "data": "{\"app\":\"com.tencent.multimsg\",\"config\":{\"autosize\":1,\"forward\":1,\"round\":1,\"type\":\"normal\",\"width\":300},\"desc\":\"[聊天记录]\",\"extra\":\"{\\\"filename\\\":\\\"67f720b5-71b0-4a4a-ac22-a7f7572ca096\\\",\\\"tsum\\\":10}\\n\",\"meta\":{\"detail\":{\"news\":[{\"text\":\"QQ用户: [聊天记录]\"},{\"text\":\"QQ用户: 小曹在群里吗\"},{\"text\":\"QQ用户: 小曹在群里吗\"},{\"text\":\"QQ用户: 小曹在群里吗\"}],\"resid\":\"05J2yOzWjI326TDrYvkgIDMuMKq/XU1OM/9klKKkmdkpoMVYyHLVAdZAWCxtHi4N\",\"source\":\"群聊的聊天记录\",\"summary\":\"查看7条转发消息\",\"uniseq\":\"67f720b5-71b0-4a4a-ac22-a7f7572ca096\"}},\"prompt\":\"[聊天记录]\",\"ver\":\"0.0.0.5\",\"view\":\"contact\"}\n"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message_sent",
+        "message_sent_type": "self",
+        "group_id": 1032125562,
+        "group_name": "主人、馆馆、君景"
+    },
+    "915738825": {
+        "self_id": 3369008273,
+        "user_id": 1013098110,
+        "time": 1782832805,
+        "message_id": 1832773325,
+        "message_seq": 1832773325,
+        "real_id": 1832773325,
+        "real_seq": "94951",
+        "message_type": "group",
+        "sender": {
+            "user_id": 1013098110,
+            "nickname": "PyrinDomain🦄",
+            "card": "过硫酸铵男闺蜜",
+            "role": "member"
+        },
+        "raw_message": "[CQ:reply,id=1950405605][CQ:at,qq=3671563911] 我 只 写 了 系统 提示词，",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "reply",
+                "data": {
+                    "id": "1950405605"
+                }
+            },
+            {
+                "type": "at",
+                "data": {
+                    "qq": "3671563911"
+                }
+            },
+            {
+                "type": "text",
+                "data": {
+                    "text": " 我 只 写 了 系统 提示词，"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 915738825,
+        "group_name": "大连理工大学2026级新生1群"
+    },
+    "576555083": {
+        "self_id": 3369008273,
+        "user_id": 1013655066,
+        "time": 1782832416,
+        "message_id": 1210476249,
+        "message_seq": 1210476249,
+        "real_id": 1210476249,
+        "real_seq": "13835",
+        "message_type": "group",
+        "sender": {
+            "user_id": 1013655066,
+            "nickname": "动力大王",
+            "card": "",
+            "role": "member"
+        },
+        "raw_message": "[CQ:json,data={\"ver\":\"1.0.0.19\"&#44;\"prompt\":\"&#91;QQ小程序&#93;《精品的大果》趁早吃，晚了就塞不进嘴里了\"&#44;\"config\":{\"type\":\"normal\"&#44;\"width\":0&#44;\"height\":0&#44;\"forward\":1&#44;\"autoSize\":0&#44;\"ctime\":1782832412&#44;\"token\":\"4558e07ff589559e1308218a45fb9c07\"}&#44;\"needShareCallBack\":false&#44;\"app\":\"com.tencent.miniapp_01\"&#44;\"view\":\"view_8C8E89B49BE609866298ADDFF2DBABA4\"&#44;\"meta\":{\"detail_1\":{\"appid\":\"1109937557\"&#44;\"appType\":0&#44;\"title\":\"哔哩哔哩\"&#44;\"desc\":\"《精品的大果》趁早吃，晚了就塞不进嘴里了\"&#44;\"icon\":\"http:\\/\\/miniapp.gtimg.cn\\/public\\/appicon\\/432b76be3a548fc128acaa6c1ec90131_200.jpg\"&#44;\"preview\":\"https:\\/\\/qq.ugcimg.cn\\/v1\\/odu6is84rije659prqcbgoornc5drakoo5dl8tcc1892vl0ck63cllbm19i4sjv9as9ntg0ru9adsus1q7kluava2ok1rmi017eo8ek8st0oqiboevcemj9burdrf1b49hv4a8vt44r61n6ocdg99t78is\\/e9vf2tsqr6j29hl2kodb3vahlc\"&#44;\"url\":\"m.q.qq.com\\/a\\/s\\/d8d00b83ceb79ad17627e8b4853483da\"&#44;\"scene\":1036&#44;\"host\":{\"uin\":1013655066&#44;\"nick\":\"动力大王\"}&#44;\"shareTemplateId\":\"8C8E89B49BE609866298ADDFF2DBABA4\"&#44;\"shareTemplateData\":{}&#44;\"qqdocurl\":\"https:\\/\\/b23.tv\\/4XpxyfK?share_medium=android&amp;share_source=qq&amp;bbid=XX5F82D5BC0A02482F5E8D713FF891AC29145&amp;ts=1782832411282\"&#44;\"showLittleTail\":\"\"&#44;\"gamePoints\":\"\"&#44;\"gamePointsUrl\":\"\"&#44;\"shareOrigin\":0}}}]",
+        "font": 14,
+        "sub_type": "normal",
+        "message": [
+            {
+                "type": "json",
+                "data": {
+                    "data": "{\"ver\":\"1.0.0.19\",\"prompt\":\"[QQ小程序]《精品的大果》趁早吃，晚了就塞不进嘴里了\",\"config\":{\"type\":\"normal\",\"width\":0,\"height\":0,\"forward\":1,\"autoSize\":0,\"ctime\":1782832412,\"token\":\"4558e07ff589559e1308218a45fb9c07\"},\"needShareCallBack\":false,\"app\":\"com.tencent.miniapp_01\",\"view\":\"view_8C8E89B49BE609866298ADDFF2DBABA4\",\"meta\":{\"detail_1\":{\"appid\":\"1109937557\",\"appType\":0,\"title\":\"哔哩哔哩\",\"desc\":\"《精品的大果》趁早吃，晚了就塞不进嘴里了\",\"icon\":\"http:\\/\\/miniapp.gtimg.cn\\/public\\/appicon\\/432b76be3a548fc128acaa6c1ec90131_200.jpg\",\"preview\":\"https:\\/\\/qq.ugcimg.cn\\/v1\\/odu6is84rije659prqcbgoornc5drakoo5dl8tcc1892vl0ck63cllbm19i4sjv9as9ntg0ru9adsus1q7kluava2ok1rmi017eo8ek8st0oqiboevcemj9burdrf1b49hv4a8vt44r61n6ocdg99t78is\\/e9vf2tsqr6j29hl2kodb3vahlc\",\"url\":\"m.q.qq.com\\/a\\/s\\/d8d00b83ceb79ad17627e8b4853483da\",\"scene\":1036,\"host\":{\"uin\":1013655066,\"nick\":\"动力大王\"},\"shareTemplateId\":\"8C8E89B49BE609866298ADDFF2DBABA4\",\"shareTemplateData\":{},\"qqdocurl\":\"https:\\/\\/b23.tv\\/4XpxyfK?share_medium=android&share_source=qq&bbid=XX5F82D5BC0A02482F5E8D713FF891AC29145&ts=1782832411282\",\"showLittleTail\":\"\",\"gamePoints\":\"\",\"gamePointsUrl\":\"\",\"shareOrigin\":0}}}"
+                }
+            }
+        ],
+        "message_format": "array",
+        "post_type": "message",
+        "group_id": 576555083,
+        "group_name": "开发区就是方尖碑"
+    }
+}
