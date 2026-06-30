@@ -13,7 +13,7 @@ from NapCatAPI import NapCatAPIInterface as nc
 from extension import Extension
 import jieba
 import json
-
+from copy import deepcopy
 
 # ---- 从 paths_config.json 读取图片目录（适配 WSL / 跨平台） ----
 def _load_imgs_dir() -> str:
@@ -370,11 +370,64 @@ class MessageProcessor:
                 # return True
         return ret
 
+    async def read_check_point(self,user_id):
+        file_name = str(Path(__file__).resolve().parent.parent / "check_point"/f'{user_id}.json')
+        try:
+            with open(file_name,mode='r',encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            print("FileNotFoundError")
+            dir_path = os.path.dirname(file_name)
+            os.makedirs(dir_path, exist_ok=True)
+            with open(file_name,mode='w',encoding='utf-8') as f:
+                json.dump({},f, ensure_ascii=False, indent=4)
+                return {}
+        except:
+            print("error")
+        return {}
+        
+    async def write_thread(self):
+        file_name = str(Path(__file__).resolve().parent.parent / "check_point"/f'{self.user_id}.json')
+        while True:
+            with open(file_name,mode='w',encoding='utf-8') as f:
+                return json.dump(self.check_point,f, ensure_ascii=False, indent=4)
+            sys.wait(10000)
+
+    async def recover_process(self,event):
+        group_id = event['group_id']
+        rid = event.get('real_id')
+        if not rid:
+            return
+        remaing = 20
+        message_seq = None
+        while remaing > 0:
+            remaing-=1
+            await self._ensure_connected()
+            history_list = self.nc.get_group_msg_history(group_id=group_id,reverse_order=True,count = 20,message_seq=message_seq)
+            last_event = history_list['data'].pop()
+            message_seq = last_event['message_seq']
+            for msg_event in reversed(history_list['data']):
+                if msg_event.get('real_id')==rid:
+                    print('Find')
+                    break
+                await self.process_message(msg_event)
+        return
+
+
+    async def recover_from_check_point(self):
+        #深拷贝防止被覆盖
+        check_point=deepcopy(self.check_point)
+        for key,value in check_point.items():
+            asyncio.create_task(self.recover_process(event = value)
+)
+        
+
     async def setuserid(self):
         # 确保已获取自己的 QQ 号
         if self.user_id is None:
             await self._ensure_connected()
             self.user_id = await self.nc.get_user_id()
+            self.check_point = await self.read_check_point(self.user_id)
         # 启动心跳保活任务
         self.start_heartbeat()
         return
