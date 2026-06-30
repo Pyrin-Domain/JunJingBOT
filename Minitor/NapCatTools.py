@@ -148,6 +148,7 @@ class MessageProcessor:
             # Agent 如果调用了 send_xxx 工具，消息已发出；
             # 如果 Agent 只是返回文本，我们需要手动发送。
             # 判断：如果 reply 不为空且不是工具返回的"已成功发送"类消息
+            # 注意: chat() 在异常/空回复时返回 None，天然被 if reply 过滤
             if reply and "已成功发送" not in reply:
                 await self.send_message(event, reply)
 
