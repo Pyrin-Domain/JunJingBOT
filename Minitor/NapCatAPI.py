@@ -98,15 +98,15 @@ class NapCatAPIInterface:
         user_id = temp["data"]["user_id"]
         return str(user_id)
 
-    async def send_group_img(self, group_id: int, img_addr: str) -> dict:
+    async def send_group_img(self, group_id: int, img_addr: str, summary: str = "") -> dict:
         """发送群消息"""
         return await self._call_api(
-            action="send_group_msg", params={"group_id": group_id, "message": [{"type":"image","data":{"file":img_addr}}]}
+            action="send_group_msg", params={"group_id": group_id, "message": [{"type":"image","data":{"file":img_addr,"summary":summary}}]}
         )
-    async def send_private_img(self, user_id: int, img_addr: str) -> dict:
+    async def send_private_img(self, user_id: int, img_addr: str, summary: str = "") -> dict:
         """发送私聊消息"""
         return await self._call_api(
-            action="send_private_msg", params={"user_id": user_id, "message": [{"type":"image","data":{"file":img_addr}}]}
+            action="send_private_msg", params={"user_id": user_id, "message": [{"type":"image","data":{"file":img_addr,"summary":summary}}]}
         )
     async def send_group_forward_msg(self,group_id:int,node_id):
         """转发群聊消息"""
@@ -139,7 +139,7 @@ class NapCatAPIInterface:
         )
     
     async def get_group_msg_history(self,group_id,message_seq=None,reverse_order=False,count=20):
-        """获取群聊历史聊天记录"""
+        """获取群聊历史聊天记录,reverse_order=True 向前拉取，reverse_order=False 向后拉取"""
         params = {'group_id':group_id,'reverse_order':reverse_order,'count':count}
         if message_seq :
             params['message_seq'] = message_seq

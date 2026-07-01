@@ -11,6 +11,13 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Base
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain.agents import create_agent
 from .chat_logger import append_log, build_log_entry
+from pathlib import Path
+from Minitor.NapCatTools import _IMGS_DIR,MessageProcessor
+
+# files = [f for f in _IMGS_DIR/.iterdir() if f.is_file()]
+
+
+
 
 # 按 async Task 隔离的工具调用记录，防止并发 chat() 互相污染
 _current_tool_calls_var: contextvars.ContextVar[list[dict]] = contextvars.ContextVar('current_tool_calls', default=[])
@@ -96,6 +103,10 @@ end
 4. 不要在回复中使用 Markdown 格式（QQ 不支持），用纯文本即可。
 5. 如果你觉得当前消息不需要回复（例如话题无聊、对方自言自语、问题你已经回答过、或者你想沉默观察），
    请调用 silent_observe 工具，而不要用自然语言表达"沉默"——工具调用能准确表达你的意图，避免误解。
+6. Agent之外集成了一些功能，比如校园网咨询助手，这个时候不是在呼唤你，但是他们可能错误地@你，要辨别清楚，是否是呼唤你。[校园网咨询助手和你一个账号]
+如果是呼唤校园网咨询助手，你就可以先调用工具回复“凤兮雨兮，景其匿兮”，再调用 network_observe 工具 返回'__NETWORK__'并作为reply。
+尤其是历史上下文包含了其他校园网的业务的时候。
+7、主人的女装照不能随便发！除非主人要求！
 语言示例：
 1、为何吾之所择，唯寥寥为框所困。
 2、未得久睡，喉若困蛟，欲泻千里！
@@ -115,15 +126,17 @@ QQ聊天的基本规则：接受信息时通过[CQ:at,qq=qq号]可以@别人。
 class QQBotAgent:
     """带工具调用的 DeepSeek Agent"""
 
-    def __init__(self, napcat_api: Optional[Any] = None, extension: Optional[Any] = None):
+    def __init__(self, napcat_api: Optional[Any] = None, extension: Optional[Any] = None,mp:MessageProcessor=None):
         """
         Args:
             napcat_api: NapCatAPIInterface 实例，用于 QQ 相关工具。
             extension:  Extension 实例，用于 OCR 工具。
+            mp: MessageProcessor 实例，用于处理消息。
         """
         self.napcat_api = napcat_api
         self.extension = extension
         self.rw_tool = rw_tools()
+        self.mp = mp
         # _current_tool_calls 改用 contextvars 隔离，详见 chat() 中的初始化
 
         logger.info("正在初始化 QQBotAgent ...")
@@ -268,6 +281,30 @@ class QQBotAgent:
                 logger.error(f"[工具异常] 获取消息失败: {e}")
                 self._record_tool_call("get_message", {"message_id": message_id}, error=str(e))
                 return f"获取消息失败: {e}"
+            
+        @tool 
+        async def send_dress(group_id=None,message_type='group',user_id=None) -> str:    
+            """发送主人的女装照(大部分都是腿照)
+            参数:
+              - group_id: int, 目标群号//如果要发送私聊则传入user_id
+              - message_type: str, 消息类型 'group' 或 'private'
+              - user_id: int, 如果私聊,要发送的用户ID
+              """
+            dress_dir = Path(__file__).resolve().parent.parent / 'imgs' / 'dress'
+            files = [f for f in dress_dir.iterdir() if f.is_file()]
+            if files:
+                import random
+                chosen = random.choice(files)
+                # 用 Path 构建 WSL 兼容路径：_IMGS_DIR/dress/filename
+                img_addr = f"{_IMGS_DIR}/dress/{chosen.name}"
+                await self.mp.send_img(event={"group_id": group_id, "message_type": message_type, "user_id": user_id}, img_addr=img_addr, summary=f"主人女装照")
+                return f"已发送主人女装照"
+            else:
+                return f"未找到主人女装照"
+            
+
+            
+
         @tool
         async def add_Method(context)->dict:
             """向Method.json中添加内容
@@ -325,10 +362,18 @@ class QQBotAgent:
             logger.info(f"[工具调用] silent_observe(reason='{reason[:60]}')")
             self._record_tool_call("silent_observe", {"reason": reason}, result="已静默")
             return "__SILENT__"
+        @tool
+        async def network_observe(reason: str) -> str:
+            """当你觉得当前消息是呼唤校园网咨询助手时，调用此工具来返回'__NETWORK__'。
+            参数:
+              - reason: str, 呼唤的原因（仅用于记录日志）。"""
+            logger.info(f"[工具调用] network_observe(reason='{reason[:60]}')")
+            self._record_tool_call("network_observe", {"reason": reason}, result="已回复校园网助手")
+            return "__NETWORK__"
+        return [ocr_img, send_group_message, send_private_message, get_message, add_Method, delete_Method, alter_Method, silent_observe, network_observe,send_dress]
 
-        return [ocr_img, send_group_message, send_private_message, get_message, add_Method, delete_Method, alter_Method, silent_observe]
 
-        
+
 
     # -------- 对话接口 --------
     async def chat(
@@ -396,6 +441,18 @@ class QQBotAgent:
                     error="静默观察",
                 ))
                 return None
+            # 检测是否调用了 network_observe（校园网问题，转交校园网助手）
+            if any(call.get("tool") == "network_observe" for call in calls):
+                logger.info(f"[会话 {thread_id}] Agent 判定为校园网问题，返回 __NETWORK__ 信号")
+                append_log(build_log_entry(
+                    thread_id=thread_id,
+                    user_message=user_message,
+                    ai_response="__NETWORK__",
+                    extra_context=extra_context,
+                    method_context=method_context,
+                    tool_calls=calls or None,
+                ))
+                return "__NETWORK__"
         except Exception as e:
             logger.error(f"[会话 {thread_id}] LLM 调用异常: {e}")
             error = str(e)

@@ -25,3 +25,6 @@ sender_config.json
 # Logs
 logs/
 *.log
+
+# Personal photos
+imgs/dress/
