@@ -40,11 +40,13 @@ _IMGS_DIR = _load_imgs_dir()
 
 
 class MessageProcessor:
-    def __init__(self, config: NapCatBotConfig):
+    def __init__(self, config: NapCatBotConfig, rws=None):
         self.extraconfig = {"tokenizer": False, "recent": True}
         self.ifs = image_forward_service(self)
         self.config = config
-        self.nc = nc(config)
+        # 反向 WS 模式：传入 NapCatReverseWS 共享连接；否则用 config 自建正向连接
+        self.nc = nc(rws if rws is not None else config)
+        self._rws = rws
         self.extension = Extension()
         self.user_id: str = None
         self._agent = None

@@ -21,3 +21,16 @@ class NapCatBotConfig:
         self.port = self.info['port']
         self.host = self.info['host']
         self.WS_URL = f"ws://{self.host}:{self.port}?access_token={self.token}"
+
+        # ── 反向 WebSocket 配置（NapCat 主动连接 Bot） ──
+        self._raw_config = self._load_raw_config(config_file)
+        self.ws_reverse_host = self._raw_config.get("ws_reverse_host", "127.0.0.1")
+        self.ws_reverse_port = self._raw_config.get("ws_reverse_port", 8080)
+
+    @staticmethod
+    def _load_raw_config(config_file: str) -> dict:
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}

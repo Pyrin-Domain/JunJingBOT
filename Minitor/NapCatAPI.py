@@ -2,24 +2,50 @@ import json
 import asyncio
 import uuid
 import websockets
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from Websockets import NapCatBotConfig
+    from reverse_ws import NapCatReverseWS
 
 class NapCatAPIInterface:
-    def __init__(self, config: "NapCatBotConfig"):
-        from Websockets import NapCatBotConfig
-        self.config = config
-        self._ws_conn: Optional[websockets.WebSocketClientProtocol] = None
-        self._ws_url = self.config.WS_URL
-        # 并发安全：后台reader + 分发机制
-        self._reader_task: Optional[asyncio.Task] = None
-        self._send_lock = asyncio.Lock()
-        self._pending: dict[str, asyncio.Future] = {}  # echo -> Future
+    """NapCat API 接口
+
+    支持两种模式：
+    - **正向 WS**（旧）：传入 ``NapCatBotConfig``，自建连接
+    - **反向 WS**（新）：传入 ``NapCatReverseWS``，复用共享连接
+    """
+
+    def __init__(self, connection: Union["NapCatBotConfig", "NapCatReverseWS"]):
+        if hasattr(connection, "_pending"):
+            # ── 反向 WS 模式 ──
+            from reverse_ws import NapCatReverseWS
+            self._rws: NapCatReverseWS = connection
+            self._ws_conn = None
+            self._reader_task = None
+            self._send_lock = None
+            self._pending = None
+        else:
+            # ── 正向 WS 模式（向后兼容） ──
+            from Websockets import NapCatBotConfig
+            self._rws = None
+            self.config: NapCatBotConfig = connection
+            self._ws_conn: Optional[websockets.WebSocketClientProtocol] = None
+            self._ws_url = self.config.WS_URL
+            self._reader_task: Optional[asyncio.Task] = None
+            self._send_lock = asyncio.Lock()
+            self._pending: dict[str, asyncio.Future] = {}
 
     async def connect(self):
-        """建立API专属WebSocket长连接，并启动后台reader"""
+        """建立连接
+
+        反向 WS 模式：等待 NapCat 连接上来；
+        正向 WS 模式：主动连接 NapCat（旧行为）。
+        """
+        if self._rws is not None:
+            await self._rws.wait_for_connect()
+            return
+        # 正向 WS 逻辑（旧）
         if self._ws_conn is not None:
             return
         self._ws_conn = await websockets.connect(self._ws_url)
@@ -27,7 +53,11 @@ class NapCatAPIInterface:
         print("API专用WebSocket连接成功")
 
     async def close(self):
-        """关闭API WS连接"""
+        """关闭连接"""
+        if self._rws is not None:
+            # 反向 WS：不关闭共享连接，由主控方管理
+            return
+        # 正向 WS 清理
         if self._reader_task is not None:
             self._reader_task.cancel()
             try:
@@ -40,7 +70,7 @@ class NapCatAPIInterface:
             self._ws_conn = None
 
     async def _reader(self):
-        """后台协程：持续读取WS消息，按 echo 分发给等待的 _call_api"""
+        """正向 WS 后台 reader（旧，仅正向模式使用）"""
         try:
             while True:
                 resp_raw = await self._ws_conn.recv()
@@ -50,21 +80,27 @@ class NapCatAPIInterface:
                     future = self._pending.pop(echo)
                     if not future.done():
                         future.set_result(resp)
-                # 没有 echo 的消息（如心跳）直接丢弃
         except asyncio.CancelledError:
             raise
         except Exception as e:
             print(f"API Reader 异常: {e}")
 
     async def _call_api(self, action: str, params: dict) -> dict:
-        """通用API调用底层方法（并发安全）"""
+        """通用 API 调用
+
+        反向 WS 模式 -> 委托给 ``NapCatReverseWS.call_api()``；
+        正向 WS 模式 -> 旧逻辑（自建连接的 echo 机制）。
+        """
+        if self._rws is not None:
+            return await self._rws.call_api(action, params)
+
+        # ── 正向 WS 逻辑（旧） ──
         if self._ws_conn is None:
             raise RuntimeError("请先调用 connect() 建立WS连接")
 
         echo_id = str(uuid.uuid4())
         payload = {"action": action, "params": params, "echo": echo_id}
 
-        # 创建 Future 并注册到 _pending，再用锁保护 send 避免消息交错
         future = asyncio.get_running_loop().create_future()
         self._pending[echo_id] = future
 
@@ -74,7 +110,6 @@ class NapCatAPIInterface:
         try:
             return await future
         finally:
-            # 清理（超时等情况）
             self._pending.pop(echo_id, None)
 
     async def send_group_message(self, group_id: int, message: str) -> dict:

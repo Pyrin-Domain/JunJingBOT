@@ -1,27 +1,31 @@
 {
     "1007233417": {
         "self_id": 3369008273,
-        "user_id": 1064760333,
-        "time": 1782984276,
-        "message_id": 2023332205,
-        "message_seq": 2023332205,
-        "real_id": 2023332205,
-        "real_seq": "170934",
+        "user_id": 3061382632,
+        "time": 1782985328,
+        "message_id": 1662965333,
+        "message_seq": 1662965333,
+        "real_id": 1662965333,
+        "real_seq": "170956",
         "message_type": "group",
         "sender": {
-            "user_id": 1064760333,
-            "nickname": "不完全的九叉树",
+            "user_id": 3061382632,
+            "nickname": "Mudrock",
             "card": "",
             "role": "member"
         },
-        "raw_message": "稍等",
+        "raw_message": "[CQ:image,summary=&#91;动画表情&#93;,file=4A758BC1381565C01AC36326783CCD7A.jpg,sub_type=1,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhRsFK-xD-YpB2K6_wSsuALbWq4ujxi0yHQg_woo2L7b-NmzlQMyBHByb2RQgL2jAVoQaGBJZmQU5XFRjGqWeLHaKnoC9sqCAQJuag&amp;rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA,file_size=1909812]",
         "font": 14,
         "sub_type": "normal",
         "message": [
             {
-                "type": "text",
+                "type": "image",
                 "data": {
-                    "text": "稍等"
+                    "summary": "[动画表情]",
+                    "file": "4A758BC1381565C01AC36326783CCD7A.jpg",
+                    "sub_type": 1,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhRsFK-xD-YpB2K6_wSsuALbWq4ujxi0yHQg_woo2L7b-NmzlQMyBHByb2RQgL2jAVoQaGBJZmQU5XFRjGqWeLHaKnoC9sqCAQJuag&rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA",
+                    "file_size": "1909812"
                 }
             }
         ],
@@ -32,27 +36,60 @@
     },
     "365953299": {
         "self_id": 3369008273,
-        "user_id": 2565294104,
-        "time": 1782984271,
-        "message_id": 1362051979,
-        "message_seq": 1362051979,
-        "real_id": 1362051979,
-        "real_seq": "1270828",
+        "user_id": 508719506,
+        "time": 1782984882,
+        "message_id": 1956579192,
+        "message_seq": 1956579192,
+        "real_id": 1956579192,
+        "real_seq": "1270829",
         "message_type": "group",
         "sender": {
-            "user_id": 2565294104,
-            "nickname": "弘",
-            "card": "m-张睿弘",
+            "user_id": 508719506,
+            "nickname": "wzh",
+            "card": "",
             "role": "member"
         },
-        "raw_message": "那还挺好的",
+        "raw_message": "想租个博士男生宿舍，请问有出国或其他原因宿舍闲置然后想要出租的吗，价格可以商量。能中间联系到出租人也行，租成了给你发红包[CQ:face,id=297,raw=&#91;object Object&#93;]",
         "font": 14,
         "sub_type": "normal",
         "message": [
             {
                 "type": "text",
                 "data": {
-                    "text": "那还挺好的"
+                    "text": "想租个博士男生宿舍，请问有出国或其他原因宿舍闲置然后想要出租的吗，价格可以商量。能中间联系到出租人也行，租成了给你发红包"
+                }
+            },
+            {
+                "type": "face",
+                "data": {
+                    "id": "297",
+                    "raw": {
+                        "faceIndex": 297,
+                        "faceText": "/拜谢",
+                        "faceType": 2,
+                        "packId": null,
+                        "stickerId": null,
+                        "sourceType": null,
+                        "stickerType": null,
+                        "resultId": null,
+                        "surpriseId": null,
+                        "randomType": null,
+                        "imageType": null,
+                        "pokeType": null,
+                        "spokeSummary": null,
+                        "doubleHit": null,
+                        "vaspokeId": null,
+                        "vaspokeName": null,
+                        "vaspokeMinver": null,
+                        "pokeStrength": null,
+                        "msgType": null,
+                        "faceBubbleCount": null,
+                        "oldVersionStr": null,
+                        "pokeFlag": null,
+                        "chainCount": null
+                    },
+                    "resultId": null,
+                    "chainCount": null
                 }
             }
         ],
@@ -161,31 +198,27 @@
     },
     "569117421": {
         "self_id": 3369008273,
-        "user_id": 1301714055,
-        "time": 1782973972,
-        "message_id": 547128088,
-        "message_seq": 547128088,
-        "real_id": 547128088,
-        "real_seq": "38731",
+        "user_id": 1971776360,
+        "time": 1782984610,
+        "message_id": 243705112,
+        "message_seq": 243705112,
+        "real_id": 243705112,
+        "real_seq": "38732",
         "message_type": "group",
         "sender": {
-            "user_id": 1301714055,
-            "nickname": "打工人",
+            "user_id": 1971776360,
+            "nickname": "天轮幻月",
             "card": "",
             "role": "member"
         },
-        "raw_message": "[CQ:image,summary=&#91;动画表情&#93;,file=C910E7C9D99FDEAA2C45053F5DE7C544.jpg,sub_type=1,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhS6xpt53VizHHZ4CtF4-uucbgOvHhimggUg_woo5pSU0q-zlQMyBHByb2RQgL2jAVoQhPGL5flf_ehZ6V0DGe1g23oCkNeCAQJneg&amp;rkey=CAQSMAd3BeAC0maJAZU3BjETUIl0xV7dhmJz9YRg3nAhSafhP1Qi17sfaAwDT0-9IzHSSQ,file_size=82214]",
+        "raw_message": "核电站……不要……从地图最左边游到……最右边的丢包……有……六条鲨鱼咬你……",
         "font": 14,
         "sub_type": "normal",
         "message": [
             {
-                "type": "image",
+                "type": "text",
                 "data": {
-                    "summary": "[动画表情]",
-                    "file": "C910E7C9D99FDEAA2C45053F5DE7C544.jpg",
-                    "sub_type": 1,
-                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhS6xpt53VizHHZ4CtF4-uucbgOvHhimggUg_woo5pSU0q-zlQMyBHByb2RQgL2jAVoQhPGL5flf_ehZ6V0DGe1g23oCkNeCAQJneg&rkey=CAQSMAd3BeAC0maJAZU3BjETUIl0xV7dhmJz9YRg3nAhSafhP1Qi17sfaAwDT0-9IzHSSQ",
-                    "file_size": "82214"
+                    "text": "核电站……不要……从地图最左边游到……最右边的丢包……有……六条鲨鱼咬你……"
                 }
             }
         ],
@@ -293,56 +326,47 @@
     },
     "1079845768": {
         "self_id": 3369008273,
-        "user_id": 3369008273,
-        "time": 1782981015,
-        "message_id": 580620887,
-        "message_seq": 580620887,
-        "real_id": 580620887,
-        "real_seq": "13968",
+        "user_id": 852745258,
+        "time": 1782985147,
+        "message_id": 130535596,
+        "message_seq": 130535596,
+        "real_id": 130535596,
+        "real_seq": "13969",
         "message_type": "group",
         "sender": {
-            "user_id": 3369008273,
-            "nickname": "君景",
+            "user_id": 852745258,
+            "nickname": "哇咔哇咔",
             "card": "",
             "role": "member"
         },
-        "raw_message": "哼，吾观此图所言极是——玩家内斗，何以成事？\"一致对外\"四字，正是破局之法。洛克王国与恋与深空，皆被内斗所累，终致北伐败北，可悲可叹！\n\n[CQ:at,qq=2078262423] 吾辈当引以为戒，莫让内耗坏了大事！",
+        "raw_message": "[CQ:image,file=EB3835EC4E291410C59BA4937CEB9556.jpg,sub_type=0,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhQi7TjyWgNc2tLKO3tC97Dmi0RiKhjD2gYg_wooksbbotmzlQMyBHByb2RQgL2jAVoQa7SG49mmRMmye4LNoJ-XpXoCJmaCAQJuag&amp;rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA,file_size=109891]",
         "font": 14,
         "sub_type": "normal",
         "message": [
             {
-                "type": "text",
+                "type": "image",
                 "data": {
-                    "text": "哼，吾观此图所言极是——玩家内斗，何以成事？\"一致对外\"四字，正是破局之法。洛克王国与恋与深空，皆被内斗所累，终致北伐败北，可悲可叹！\n\n"
-                }
-            },
-            {
-                "type": "at",
-                "data": {
-                    "qq": "2078262423"
-                }
-            },
-            {
-                "type": "text",
-                "data": {
-                    "text": " 吾辈当引以为戒，莫让内耗坏了大事！"
+                    "summary": "",
+                    "file": "EB3835EC4E291410C59BA4937CEB9556.jpg",
+                    "sub_type": 0,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhQi7TjyWgNc2tLKO3tC97Dmi0RiKhjD2gYg_wooksbbotmzlQMyBHByb2RQgL2jAVoQa7SG49mmRMmye4LNoJ-XpXoCJmaCAQJuag&rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA",
+                    "file_size": "109891"
                 }
             }
         ],
         "message_format": "array",
-        "post_type": "message_sent",
-        "message_sent_type": "self",
+        "post_type": "message",
         "group_id": 1079845768,
         "group_name": "独角兽的板石群（二代目）（打赢复活赛）"
     },
     "320955551": {
         "self_id": 3369008273,
         "user_id": 3369008273,
-        "time": 1782980257,
-        "message_id": 225568902,
-        "message_seq": 225568902,
-        "real_id": 225568902,
-        "real_seq": "15746",
+        "time": 1782980870,
+        "message_id": 303669134,
+        "message_seq": 303669134,
+        "real_id": 303669134,
+        "real_seq": "15749",
         "message_type": "group",
         "sender": {
             "user_id": 3369008273,
@@ -350,14 +374,18 @@
             "card": "",
             "role": "member"
         },
-        "raw_message": "[CQ:json,data={\"app\":\"com.tencent.multimsg\"&#44;\"config\":{\"autosize\":1&#44;\"forward\":1&#44;\"round\":1&#44;\"type\":\"normal\"&#44;\"width\":300}&#44;\"desc\":\"&#91;聊天记录&#93;\"&#44;\"extra\":\"{\\\"filename\\\":\\\"\\\"&#44;\\\"tsum\\\":9}\\n\"&#44;\"meta\":{\"detail\":{\"news\":&#91;{\"text\":\"QQ用户: &#91;聊天记录&#93;\"}&#44;{\"text\":\"QQ用户: 湖北省武汉市洪山区曙光星城C区北1门东70米\"}&#93;&#44;\"resid\":\"\"&#44;\"source\":\"群聊的聊天记录\"&#44;\"summary\":\"查看2条转发消息\"&#44;\"uniseq\":\"\"}}&#44;\"prompt\":\"&#91;聊天记录&#93;\"&#44;\"ver\":\"0.0.0.5\"&#44;\"view\":\"contact\"}\n]",
+        "raw_message": "[CQ:image,file=C770AD510646759880A9295AC3961C58.jpg,sub_type=0,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhRrq44h2iD2i5cFGvJbvYN0zsVk2xi-0wYg_woo1cXoqsmzlQMyBHByb2RQgL2jAVoQJNOF_JUC3rCmhfwztFoRSnoCBjmCAQJuag&amp;rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA,file_size=108990]",
         "font": 14,
         "sub_type": "normal",
         "message": [
             {
-                "type": "json",
+                "type": "image",
                 "data": {
-                    "data": "{\"app\":\"com.tencent.multimsg\",\"config\":{\"autosize\":1,\"forward\":1,\"round\":1,\"type\":\"normal\",\"width\":300},\"desc\":\"[聊天记录]\",\"extra\":\"{\\\"filename\\\":\\\"\\\",\\\"tsum\\\":9}\\n\",\"meta\":{\"detail\":{\"news\":[{\"text\":\"QQ用户: [聊天记录]\"},{\"text\":\"QQ用户: 湖北省武汉市洪山区曙光星城C区北1门东70米\"}],\"resid\":\"\",\"source\":\"群聊的聊天记录\",\"summary\":\"查看2条转发消息\",\"uniseq\":\"\"}},\"prompt\":\"[聊天记录]\",\"ver\":\"0.0.0.5\",\"view\":\"contact\"}\n"
+                    "summary": "",
+                    "file": "C770AD510646759880A9295AC3961C58.jpg",
+                    "sub_type": 0,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhRrq44h2iD2i5cFGvJbvYN0zsVk2xi-0wYg_woo1cXoqsmzlQMyBHByb2RQgL2jAVoQJNOF_JUC3rCmhfwztFoRSnoCBjmCAQJuag&rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA",
+                    "file_size": "108990"
                 }
             }
         ],
@@ -400,54 +428,31 @@
     },
     "895977823": {
         "self_id": 3369008273,
-        "user_id": 2187148461,
-        "time": 1782983862,
-        "message_id": 761516848,
-        "message_seq": 761516848,
-        "real_id": 761516848,
-        "real_seq": "706571",
+        "user_id": 3085322907,
+        "time": 1782984749,
+        "message_id": 1684358121,
+        "message_seq": 1684358121,
+        "real_id": 1684358121,
+        "real_seq": "706587",
         "message_type": "group",
         "sender": {
-            "user_id": 2187148461,
-            "nickname": "W",
-            "card": "25-小白",
+            "user_id": 3085322907,
+            "nickname": "渚薰",
+            "card": "25-软国-渚薰",
             "role": "member"
         },
-        "raw_message": "[CQ:face,id=479,raw=&#91;object Object&#93;,chainCount=0]",
+        "raw_message": "[CQ:image,summary=&#91;动画表情&#93;,file=99DE6C01FEB84B5C933278BE2D2A2424.jpg,sub_type=1,url=https://multimedia.nt.qq.com.cn/download?appid=1407&amp;fileid=EhTy6HbXvFQ4m2SnwkLjI1_6lVcH_BihVCD_Cii10fPk17OVAzIEcHJvZFCAvaMBWhDYvW0vsrTMtIWhJtROfFPaegJjvIIBAm5q&amp;rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA,file_size=10785]",
         "font": 14,
         "sub_type": "normal",
         "message": [
             {
-                "type": "face",
+                "type": "image",
                 "data": {
-                    "id": "479",
-                    "raw": {
-                        "faceIndex": 479,
-                        "faceText": "/不对不对",
-                        "faceType": 3,
-                        "packId": "4",
-                        "stickerId": "81",
-                        "sourceType": 1,
-                        "stickerType": 1,
-                        "resultId": "",
-                        "surpriseId": "",
-                        "randomType": 1,
-                        "imageType": null,
-                        "pokeType": null,
-                        "spokeSummary": null,
-                        "doubleHit": null,
-                        "vaspokeId": null,
-                        "vaspokeName": null,
-                        "vaspokeMinver": null,
-                        "pokeStrength": null,
-                        "msgType": null,
-                        "faceBubbleCount": null,
-                        "oldVersionStr": null,
-                        "pokeFlag": null,
-                        "chainCount": 0
-                    },
-                    "resultId": "",
-                    "chainCount": 0
+                    "summary": "[动画表情]",
+                    "file": "99DE6C01FEB84B5C933278BE2D2A2424.jpg",
+                    "sub_type": 1,
+                    "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=EhTy6HbXvFQ4m2SnwkLjI1_6lVcH_BihVCD_Cii10fPk17OVAzIEcHJvZFCAvaMBWhDYvW0vsrTMtIWhJtROfFPaegJjvIIBAm5q&rkey=CAESMOQumavqZA6XdYKz4C9fZwDyvzj9ES2IYt2XRSZWJGyUt5eLeCu7UmLwietvS8WuoA",
+                    "file_size": "10785"
                 }
             }
         ],
