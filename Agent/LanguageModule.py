@@ -12,15 +12,15 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain.agents import create_agent
 from .chat_logger import append_log, build_log_entry
 from pathlib import Path
-from Minitor.NapCatTools import _IMGS_DIR,MessageProcessor
+from Minitor.NapCatTools import _IMGS_DIR, MessageProcessor
 
 # files = [f for f in _IMGS_DIR/.iterdir() if f.is_file()]
 
 
-
-
 # 按 async Task 隔离的工具调用记录，防止并发 chat() 互相污染
-_current_tool_calls_var: contextvars.ContextVar[list[dict]] = contextvars.ContextVar('current_tool_calls', default=[])
+_current_tool_calls_var: contextvars.ContextVar[list[dict]] = contextvars.ContextVar(
+    "current_tool_calls", default=[]
+)
 
 # ============================================================
 # 日志配置
@@ -49,17 +49,22 @@ class LLMCallbackHandler(BaseCallbackHandler):
 
     def on_llm_end(self, response, **kwargs):
         content = response.generations[0][0].text if response.generations else ""
-        logger.debug(f"[LLM] 收到回复: {content[:100]}{'...' if len(content)>100 else ''}")
+        logger.debug(
+            f"[LLM] 收到回复: {content[:100]}{'...' if len(content)>100 else ''}"
+        )
 
     def on_llm_error(self, error, **kwargs):
         logger.error(f"[LLM] 请求出错: {error}")
 
     def on_tool_start(self, serialized, input_str, **kwargs):
-        logger.debug(f"[LLM] 决定调用工具: {serialized.get('name', 'unknown')}({input_str[:80]})")
+        logger.debug(
+            f"[LLM] 决定调用工具: {serialized.get('name', 'unknown')}({input_str[:80]})"
+        )
 
     def on_tool_end(self, output, **kwargs):
-        logger.debug(f"[LLM] 工具返回: {str(output)[:80]}{'...' if len(str(output))>80 else ''}")
-
+        logger.debug(
+            f"[LLM] 工具返回: {str(output)[:80]}{'...' if len(str(output))>80 else ''}"
+        )
 
 
 # ============================================================
@@ -120,13 +125,19 @@ QQ聊天的基本规则：接受信息时通过[CQ:at,qq=qq号]可以@别人。
 发送时字符串的表现为：[CQ:at,qq=3369008273] 即 [CQ:at,qq={qq号}]
 """
 
+
 # ============================================================
 # Agent 类
 # ============================================================
 class QQBotAgent:
     """带工具调用的 DeepSeek Agent"""
 
-    def __init__(self, napcat_api: Optional[Any] = None, extension: Optional[Any] = None,mp:MessageProcessor=None):
+    def __init__(
+        self,
+        napcat_api: Optional[Any] = None,
+        extension: Optional[Any] = None,
+        mp: MessageProcessor = None,
+    ):
         """
         Args:
             napcat_api: NapCatAPIInterface 实例，用于 QQ 相关工具。
@@ -168,16 +179,14 @@ class QQBotAgent:
         )
         logger.info("QQBotAgent 初始化完成")
 
-
-
     def structed_method(self) -> str:
-        if not self.rw_tool :
-            return ''
-        part = ''
-        for item in self.rw_tool.method.get('data',[]):
-            part += f'[index:{item['index']},{item['context']}]\n'
+        if not self.rw_tool:
+            return ""
+        part = ""
+        for item in self.rw_tool.method.get("data", []):
+            part += f"[index:{item['index']},{item['context']}]\n"
         return part
-    
+
     def _record_tool_call(self, tool_name: str, args: dict, result=None, error=None):
         """将工具调用记录到当前 async Task 的上下文变量中，实现并发隔离"""
         calls = _current_tool_calls_var.get()
@@ -188,28 +197,56 @@ class QQBotAgent:
             entry["error"] = error
         calls.append(entry)
 
-    
-
     # -------- 工具定义 --------
     def _build_tools(self) -> list:
         napcat = self.napcat_api
         extension = self.extension
+        mp = self.mp
+
+        @tool
+        async def get_msg_history(
+            group_id: int, message_id: int, count: int = 20
+        ) -> str:
+            """获取指定群聊里，某条消息的之前count条聊天记录，用于了解对话上下文。
+            参数:
+              - group_id: int, 目标群号
+              - message_id: int, 目标消息的 message_seq/message_id（用于获取该消息之前的聊天记录[包括该消息]）
+              - count: int, 获取多少条历史消息（默认20条），最多51条如果需要更多，可以多次调用"""
+            logger.info(
+                f"[工具调用] get_msg_history(group_id={group_id}, message_id={message_id}, count={count})"
+            )
+            res = await mp.get_history_msg(
+                event={
+                    "group_id": group_id,
+                    "message_type": "group",
+                },
+                    message_seq= message_id,
+                    count= count,
+                    reverse_order=True,
+            )
+            print(res)
+            return "获得历史上下文:" + str(res)
 
         @tool
         async def ocr_img(img_url: str) -> str:
             """对 QQ 图片进行 OCR 文字识别。传入图片的 URL 地址，返回识别出的文字。
-当用户让你"识别图片"、"图片写了什么"、"OCR"时必须调用此工具。
-参数:
-  - img_url: str, 图片 URL（从消息中的 {"url":...} 里提取）"""
+            当用户让你"识别图片"、"图片写了什么"、"OCR"时必须调用此工具。
+            参数:
+              - img_url: str, 图片 URL（从消息中的 {"url":...} 里提取）
+            """
             logger.info(f"[工具调用] ocr_img(img_url={img_url})")
             if extension is None:
                 logger.warning("[工具] OCR 不可用 - extension 为空")
-                self._record_tool_call("ocr_img", {"img_url": img_url}, result="[OCR 不可用]")
+                self._record_tool_call(
+                    "ocr_img", {"img_url": img_url}, result="[OCR 不可用]"
+                )
                 return "[OCR 不可用]"
             try:
                 result = await extension.napcat_ocr(img_url)
                 text = result.get("text", "") or "[未识别到文字]"
-                logger.info(f"[工具结果] ocr_img -> {text[:80]}{'...' if len(text)>80 else ''}")
+                logger.info(
+                    f"[工具结果] ocr_img -> {text[:80]}{'...' if len(text)>80 else ''}"
+                )
                 self._record_tool_call("ocr_img", {"img_url": img_url}, result=text)
                 return text
             except Exception as e:
@@ -218,140 +255,168 @@ class QQBotAgent:
                 return f"[OCR 失败: {e}]"
 
         @tool
-        async def send_group_message(group_id: int, message: str) -> str:
+        async def send_message(message_type: str,group_id: int,user_id: int, message: str) -> str:
             """发送一条消息到指定 QQ 群。
-参数:
-  - group_id: int, 目标群号
-  - message: str, 要发送的消息内容（纯文本）"""
-            logger.info(f"[工具调用] send_group_message(group_id={group_id}, message={message[:60]}{'...' if len(message)>60 else ''})")
-            if napcat is None:
-                logger.warning("[工具] NapCat API 未连接")
-                self._record_tool_call("send_group_message", {"group_id": group_id, "message": message}, error="NapCat API 未连接")
-                return "[工具不可用] NapCat API 未连接"
+            参数:
+              - message_type: str, 消息类型（"group" 或 "private"）
+              - group_id: int, 目标群号
+              - user_id: int, 目标用户 QQ 号（仅在 private 消息时使用）
+              - message: str, 要发送的消息内容（纯文本）"""
+            logger.info(
+                f"[工具调用] send_message(group_id={group_id}, message_type={message_type}, user_id={user_id}, message={message[:60]}{'...' if len(message)>60 else ''})"
+            )
+            if self.mp is None:
+                logger.warning("[工具] MessageProcessor 未连接")
+                self._record_tool_call(
+                    "send_message",
+                    {"message_type": message_type, "group_id": group_id, "user_id": user_id, "message": message},
+                    error="MessageProcessor 未连接",
+                )
+                return "[工具不可用] MessageProcessor 未连接"
             try:
-                await napcat.send_group_message(group_id, message)
+                await self.mp.send_message(event= {message_type: message_type, "group_id": group_id, "user_id": user_id}, message=message)
                 logger.info(f"[工具结果] 群消息已发送到 {group_id}")
-                self._record_tool_call("send_group_message", {"group_id": group_id, "message": message}, result="成功")
+                self._record_tool_call(
+                    "send_message",
+                    {"message_type": message_type, "group_id": group_id, "user_id": user_id, "message": message},
+                    result="成功",
+                )
                 return f"已成功发送群消息到群 {group_id}"
             except Exception as e:
                 logger.error(f"[工具异常] 发送群消息失败: {e}")
-                self._record_tool_call("send_group_message", {"group_id": group_id, "message": message}, error=str(e))
+                self._record_tool_call(
+                    "send_message",
+                    {"message_type": message_type, "group_id": group_id, "user_id": user_id, "message": message},
+                    error=str(e),
+                )
                 return f"发送群消息失败: {e}"
 
-        @tool
-        async def send_private_message(user_id: int, message: str) -> str:
-            """发送一条私聊消息给指定 QQ 用户。
-参数:
-  - user_id: int, 目标用户 QQ 号
-  - message: str, 要发送的消息内容（纯文本）"""
-            logger.info(f"[工具调用] send_private_message(user_id={user_id}, message={message[:60]}{'...' if len(message)>60 else ''})")
-            if napcat is None:
-                logger.warning("[工具] NapCat API 未连接")
-                self._record_tool_call("send_private_message", {"user_id": user_id, "message": message}, error="NapCat API 未连接")
-                return "[工具不可用] NapCat API 未连接"
-            try:
-                await napcat.send_private_message(user_id, message)
-                logger.info(f"[工具结果] 私聊消息已发送给 {user_id}")
-                self._record_tool_call("send_private_message", {"user_id": user_id, "message": message}, result="成功")
-                return f"已成功发送私聊消息给用户 {user_id}"
-            except Exception as e:
-                logger.error(f"[工具异常] 发送私聊消息失败: {e}")
-                self._record_tool_call("send_private_message", {"user_id": user_id, "message": message}, error=str(e))
-                return f"发送私聊消息失败: {e}"
 
         @tool
         async def get_message(message_id: int) -> str:
             """根据消息 ID 获取消息的详细内容（用于查看被回复的那条消息说了什么）。
-参数:
-  - message_id: int, 消息 ID"""
+            参数:
+              - message_id: int, 消息 ID"""
             logger.info(f"[工具调用] get_message(message_id={message_id})")
             if napcat is None:
                 logger.warning("[工具] NapCat API 未连接")
-                self._record_tool_call("get_message", {"message_id": message_id}, error="NapCat API 未连接")
+                self._record_tool_call(
+                    "get_message", {"message_id": message_id}, error="NapCat API 未连接"
+                )
                 return "[工具不可用] NapCat API 未连接"
             try:
                 resp = await napcat.get_message(message_id)
                 data = resp.get("data", {})
                 sender = data.get("sender", {}).get("nickname", "未知")
                 raw = data.get("raw_message", "")
-                logger.info(f"[工具结果] 消息 {message_id} | 发送者: {sender} | 内容: {raw[:60]}{'...' if len(raw)>60 else ''}")
-                self._record_tool_call("get_message", {"message_id": message_id}, result={"sender": sender, "raw": raw})
+                logger.info(
+                    f"[工具结果] 消息 {message_id} | 发送者: {sender} | 内容: {raw[:60]}{'...' if len(raw)>60 else ''}"
+                )
+                self._record_tool_call(
+                    "get_message",
+                    {"message_id": message_id},
+                    result={"sender": sender, "raw": raw},
+                )
                 return f"消息ID {message_id} | 发送者: {sender} | 内容: {raw}"
             except Exception as e:
                 logger.error(f"[工具异常] 获取消息失败: {e}")
-                self._record_tool_call("get_message", {"message_id": message_id}, error=str(e))
+                self._record_tool_call(
+                    "get_message", {"message_id": message_id}, error=str(e)
+                )
                 return f"获取消息失败: {e}"
-            
-        @tool 
-        async def send_dress(group_id=None,message_type='group',user_id=None) -> str:    
+
+        @tool
+        async def send_dress(group_id=None, message_type="group", user_id=None) -> str:
             """发送主人的女装照(大部分都是腿照)
             参数:
               - group_id: int, 目标群号//如果要发送私聊则传入user_id
               - message_type: str, 消息类型 'group' 或 'private'
               - user_id: int, 如果私聊,要发送的用户ID
-              """
-            dress_dir = Path(__file__).resolve().parent.parent / 'imgs' / 'dress'
+            """
+            dress_dir = Path(__file__).resolve().parent.parent / "imgs" / "dress"
             files = [f for f in dress_dir.iterdir() if f.is_file()]
             if files:
                 import random
                 chosen = random.choice(files)
                 # 用 Path 构建 WSL 兼容路径：_IMGS_DIR/dress/filename
                 img_addr = f"{_IMGS_DIR}/dress/{chosen.name}"
-                await self.mp.send_img(event={"group_id": group_id, "message_type": message_type, "user_id": user_id}, img_addr=img_addr, summary=f"主人女装照")
+                await mp.send_img(
+                    event={
+                        "group_id": group_id,
+                        "message_type": message_type,
+                        "user_id": user_id,
+                    },
+                    img_addr=img_addr,
+                    summary=f"主人女装照",
+                )
                 return f"已发送主人女装照"
             else:
                 return f"未找到主人女装照"
-            
-
-            
 
         @tool
-        async def add_Method(context)->dict:
+        async def add_Method(context) -> dict:
             """向Method.json中添加内容
             参数 context:str，需要添加的方法论文本
             返回的是修改后的结果
             """
-            logger.info(f"[工具调用] add_Method(context='{context[:60]}{'...' if len(context)>60 else ''}')")
+            logger.info(
+                f"[工具调用] add_Method(context='{context[:60]}{'...' if len(context)>60 else ''}')"
+            )
             if self.rw_tool == None:
                 logger.warning("[工具] add_Method 失败 - rw_tool 为空")
-                self._record_tool_call("add_Method", {"context": context}, error="rw_tool 为空")
-                return {"info":"添加失败"}
+                self._record_tool_call(
+                    "add_Method", {"context": context}, error="rw_tool 为空"
+                )
+                return {"info": "添加失败"}
             self.rw_tool.apeend_method(context)
-            result = self.rw_tool.method['data'][-1]
+            result = self.rw_tool.method["data"][-1]
             logger.info(f"[工具结果] add_Method -> 已添加 index={result['index']}")
             self._record_tool_call("add_Method", {"context": context}, result=result)
             return result
-        
+
         @tool
         async def delete_Method(index):
             """依照index将Method的某条内容改为已弃用
             参数 index:int要弃用的索引号
-            """     
+            """
             logger.info(f"[工具调用] delete_Method(index={index})")
             if self.rw_tool == None:
                 logger.warning("[工具] delete_Method 失败 - rw_tool 为空")
-                self._record_tool_call("delete_Method", {"index": index}, error="rw_tool 为空")
-                return {"info":"失败"}
+                self._record_tool_call(
+                    "delete_Method", {"index": index}, error="rw_tool 为空"
+                )
+                return {"info": "失败"}
             self.rw_tool.delete_method(index)
-            result = self.rw_tool.method['data'][index]
+            result = self.rw_tool.method["data"][index]
             logger.info(f"[工具结果] delete_Method -> 已弃用 index={index}")
-            self._record_tool_call("delete_Method", {"index": index}, result=f"已弃用 index={index}")
-            return result            
+            self._record_tool_call(
+                "delete_Method", {"index": index}, result=f"已弃用 index={index}"
+            )
+            return result
+
         @tool
-        async def alter_Method(index,context):
+        async def alter_Method(index, context):
             """依照index修改Method的某条内容
             参数 index:int 要修改的索引号，
             context:str 修改后的内容
             """
-            logger.info(f"[工具调用] alter_Method(index={index}, context='{context[:60]}{'...' if len(context)>60 else ''}')")
+            logger.info(
+                f"[工具调用] alter_Method(index={index}, context='{context[:60]}{'...' if len(context)>60 else ''}')"
+            )
             if self.rw_tool == None:
                 logger.warning("[工具] alter_Method 失败 - rw_tool 为空")
-                self._record_tool_call("alter_Method", {"index": index, "context": context}, error="rw_tool 为空")
-                return {"info":"失败"}
-            self.rw_tool.alter_method(index,context)
-            result = self.rw_tool.method['data'][index]
+                self._record_tool_call(
+                    "alter_Method",
+                    {"index": index, "context": context},
+                    error="rw_tool 为空",
+                )
+                return {"info": "失败"}
+            self.rw_tool.alter_method(index, context)
+            result = self.rw_tool.method["data"][index]
             logger.info(f"[工具结果] alter_Method -> 已修改 index={index}")
-            self._record_tool_call("alter_Method", {"index": index, "context": context}, result=result)
+            self._record_tool_call(
+                "alter_Method", {"index": index, "context": context}, result=result
+            )
 
         @tool
         async def silent_observe(reason: str) -> str:
@@ -360,20 +425,34 @@ class QQBotAgent:
             参数:
               - reason: str, 沉默的原因（仅用于记录日志）。"""
             logger.info(f"[工具调用] silent_observe(reason='{reason[:60]}')")
-            self._record_tool_call("silent_observe", {"reason": reason}, result="已静默")
+            self._record_tool_call(
+                "silent_observe", {"reason": reason}, result="已静默"
+            )
             return "__SILENT__"
+
         @tool
         async def network_observe(reason: str) -> str:
             """当你觉得当前消息是呼唤校园网咨询助手时，调用此工具来返回'__NETWORK__'。
             参数:
               - reason: str, 呼唤的原因（仅用于记录日志）。"""
             logger.info(f"[工具调用] network_observe(reason='{reason[:60]}')")
-            self._record_tool_call("network_observe", {"reason": reason}, result="已回复校园网助手")
+            self._record_tool_call(
+                "network_observe", {"reason": reason}, result="已回复校园网助手"
+            )
             return "__NETWORK__"
-        return [ocr_img, send_group_message, send_private_message, get_message, add_Method, delete_Method, alter_Method, silent_observe, network_observe,send_dress]
 
-
-
+        return [
+            ocr_img,
+            send_message,
+            get_message,
+            add_Method,
+            delete_Method,
+            alter_Method,
+            silent_observe,
+            network_observe,
+            send_dress,
+            get_msg_history,
+        ]
 
     # -------- 对话接口 --------
     async def chat(
@@ -393,12 +472,15 @@ class QQBotAgent:
             Agent 的最终文本回复
         """
         logger.info(f"[会话 {thread_id}] ═══ 收到用户消息 ═══")
-        logger.info(f"[会话 {thread_id}] 内容: {user_message[:120]}{'...' if len(user_message)>120 else ''}")
+        logger.info(
+            f"[会话 {thread_id}] 内容: {user_message[:120]}{'...' if len(user_message)>120 else ''}"
+        )
         if extra_context:
             logger.info(f"[会话 {thread_id}] 上下文: {extra_context[:120]}")
 
         # 重置本轮工具调用记录（使用 contextvars 隔离并发调用）
         _current_tool_calls_var.set([])
+
         def _get_calls():
             return _current_tool_calls_var.get()
 
@@ -406,16 +488,12 @@ class QQBotAgent:
         messages: list[BaseMessage] = []
 
         if extra_context:
-            messages.append(SystemMessage(
-                content=f"[当前上下文] {extra_context}"
-            ))
+            messages.append(SystemMessage(content=f"[当前上下文] {extra_context}"))
 
         method_context = None
         if self.rw_tool:
-                method_context = self.structed_method()
-                messages.append(SystemMessage(
-                content=f"[Method] {method_context}"
-            ))
+            method_context = self.structed_method()
+            messages.append(SystemMessage(content=f"[Method] {method_context}"))
 
         messages.append(HumanMessage(content=user_message))
 
@@ -425,76 +503,92 @@ class QQBotAgent:
             result = await self.agent.ainvoke(
                 {"messages": messages},
             )
-            logger.info(f"[会话 {thread_id}] LLM 返回成功，消息数: {len(result['messages'])}")
+            logger.info(
+                f"[会话 {thread_id}] LLM 返回成功，消息数: {len(result['messages'])}"
+            )
 
             calls = _get_calls()
             # 检测是否调用了 silent_observe（静默观察，不发送消息）
             if any(call.get("tool") == "silent_observe" for call in calls):
                 logger.info(f"[会话 {thread_id}] Agent 选择静默观察，不回复")
-                append_log(build_log_entry(
-                    thread_id=thread_id,
-                    user_message=user_message,
-                    ai_response="",
-                    extra_context=extra_context,
-                    method_context=method_context,
-                    tool_calls=calls or None,
-                    error="静默观察",
-                ))
+                append_log(
+                    build_log_entry(
+                        thread_id=thread_id,
+                        user_message=user_message,
+                        ai_response="",
+                        extra_context=extra_context,
+                        method_context=method_context,
+                        tool_calls=calls or None,
+                        error="静默观察",
+                    )
+                )
                 return None
             # 检测是否调用了 network_observe（校园网问题，转交校园网助手）
             if any(call.get("tool") == "network_observe" for call in calls):
-                logger.info(f"[会话 {thread_id}] Agent 判定为校园网问题，返回 __NETWORK__ 信号")
-                append_log(build_log_entry(
-                    thread_id=thread_id,
-                    user_message=user_message,
-                    ai_response="__NETWORK__",
-                    extra_context=extra_context,
-                    method_context=method_context,
-                    tool_calls=calls or None,
-                ))
+                logger.info(
+                    f"[会话 {thread_id}] Agent 判定为校园网问题，返回 __NETWORK__ 信号"
+                )
+                append_log(
+                    build_log_entry(
+                        thread_id=thread_id,
+                        user_message=user_message,
+                        ai_response="__NETWORK__",
+                        extra_context=extra_context,
+                        method_context=method_context,
+                        tool_calls=calls or None,
+                    )
+                )
                 return "__NETWORK__"
         except Exception as e:
             logger.error(f"[会话 {thread_id}] LLM 调用异常: {e}")
             error = str(e)
             # 即使出错也写入 JSON 日志
-            append_log(build_log_entry(
-                thread_id=thread_id,
-                user_message=user_message,
-                ai_response="",
-                extra_context=extra_context,
-                method_context=method_context,
-                tool_calls=_get_calls() or None,
-                error=error,
-            ))
+            append_log(
+                build_log_entry(
+                    thread_id=thread_id,
+                    user_message=user_message,
+                    ai_response="",
+                    extra_context=extra_context,
+                    method_context=method_context,
+                    tool_calls=_get_calls() or None,
+                    error=error,
+                )
+            )
             return None
 
         calls = _get_calls()
         # 提取最后一条 AI 消息
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage) and msg.content:
-                logger.info(f"[会话 {thread_id}] AI 回复: {msg.content[:120]}{'...' if len(msg.content)>120 else ''}")
+                logger.info(
+                    f"[会话 {thread_id}] AI 回复: {msg.content[:120]}{'...' if len(msg.content)>120 else ''}"
+                )
                 logger.info(f"[会话 {thread_id}] ═══ 对话结束 ═══")
                 # 写入 JSON 日志
-                append_log(build_log_entry(
-                    thread_id=thread_id,
-                    user_message=user_message,
-                    ai_response=msg.content,
-                    extra_context=extra_context,
-                    method_context=method_context,
-                    tool_calls=calls or None,
-                ))
+                append_log(
+                    build_log_entry(
+                        thread_id=thread_id,
+                        user_message=user_message,
+                        ai_response=msg.content,
+                        extra_context=extra_context,
+                        method_context=method_context,
+                        tool_calls=calls or None,
+                    )
+                )
                 return msg.content
 
         logger.warning(f"[会话 {thread_id}] LLM 返回空回复")
         logger.info(f"[会话 {thread_id}] ═══ 对话结束 ═══")
         # 空回复也写入日志
-        append_log(build_log_entry(
-            thread_id=thread_id,
-            user_message=user_message,
-            ai_response="",
-            extra_context=extra_context,
-            method_context=method_context,
-            tool_calls=calls or None,
-            error="空回复",
-        ))
+        append_log(
+            build_log_entry(
+                thread_id=thread_id,
+                user_message=user_message,
+                ai_response="",
+                extra_context=extra_context,
+                method_context=method_context,
+                tool_calls=calls or None,
+                error="空回复",
+            )
+        )
         return None  # 调用方通过 if reply: 判断，无需发送

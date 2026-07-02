@@ -147,3 +147,11 @@ class NapCatAPIInterface:
             action='get_group_msg_history',params=params
         )
     
+    async def get_friend_msg_history(self,user_id,message_seq=None,reverse_order=False,count=20):
+        """获取好友历史聊天记录,reverse_order=True 向前拉取，reverse_order=False 向后拉取"""
+        params = {'user_id':user_id,'reverse_order':reverse_order,'count':count}
+        if message_seq :
+            params['message_seq'] = message_seq
+        return await self._call_api(
+            action='get_friend_msg_history',params=params
+        )

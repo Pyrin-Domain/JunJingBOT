@@ -63,7 +63,3 @@ class rw_tools:
 
      
 
-if __name__ == "__main__":
-    tool = rw_tools()
-    tool.write_method(method)
-    print(tool.read_method())

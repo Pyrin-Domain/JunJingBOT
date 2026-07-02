@@ -15,6 +15,7 @@ import jieba
 import json
 from copy import deepcopy
 
+
 # ---- 从 paths_config.json 读取图片目录（适配 WSL / 跨平台） ----
 def _load_imgs_dir() -> str:
     """加载图片目录配置，优先读 paths_config.json，fallback 到本地 imgs/"""
@@ -95,9 +96,8 @@ class MessageProcessor:
             {
                 "regex": r"药娘",
                 "solution": self.send_img,
-                "params": {"img_addr": f"{_IMGS_DIR}/img01.jpg",'summary':"死人妖"},
+                "params": {"img_addr": f"{_IMGS_DIR}/img01.jpg", "summary": "死人妖"},
             },
-            
             {"regex": r"/historydebug", "solution": self.get_long_history_test},
             {"regex": r"/export", "solution": self.export},
             {"regex": r"/set_tokenizer", "solution": self.set_tokenizer},
@@ -105,11 +105,18 @@ class MessageProcessor:
             {"regex": r"/img_fd ", "solution": self.img_forward_create_task},
         ]
 
-        asyncio.create_task(self.pattern_match(event=event, pattern_config=pattern_config))
-        
-        if await self.pattern_match(event=event, pattern_config=[{"regex": r"校园网", "solution": self.Check_Campus_NetWoerk}]):
+        asyncio.create_task(
+            self.pattern_match(event=event, pattern_config=pattern_config)
+        )
+
+        if await self.pattern_match(
+            event=event,
+            pattern_config=[
+                {"regex": r"校园网", "solution": self.Check_Campus_NetWoerk}
+            ],
+        ):
             return
-        
+
         # 被 @ 时 → 交给 AI Agent 处理
 
         ated_user = await self.is_AT(event=event, user_id=[self.user_id, "1013098110"])
@@ -130,7 +137,9 @@ class MessageProcessor:
             iclhistory = None
             if self.extraconfig["recent"]:
                 await self._ensure_connected()
-                iclhistory = await self.get_history_msg(event)
+                iclhistory = await self.get_history_msg(
+                    event, reverse_order=True, message_seq=event["message_seq"]
+                )
                 print(iclhistory)
             context = (
                 (
@@ -160,7 +169,9 @@ class MessageProcessor:
             # 注意: chat() 在异常/空回复时返回 None，天然被 if reply 过滤
             if reply == "__NETWORK__":
                 # 主 Agent 判定为校园网问题，转交校园网助手
-                await self._route_to_campus_assistant(event, clean_text, iclhistory=iclhistory)
+                await self._route_to_campus_assistant(
+                    event, clean_text, iclhistory=iclhistory
+                )
             elif reply == "__SILENT__":
                 # 主 Agent 判定为不需要回复，静默处理
                 return
@@ -191,33 +202,33 @@ class MessageProcessor:
                 return True
         return False
 
-    async def image_forward_processor(self, event, target_id_list, msg_type='group'):
+    async def image_forward_processor(self, event, target_id_list, msg_type="group"):
         if not self.is_contain_image(event):
             return
-        group_id = event["group_id"] if event.get('message_type') == 'group' else None
-        if msg_type == 'group':
+        group_id = event["group_id"] if event.get("message_type") == "group" else None
+        if msg_type == "group":
             for target_id in target_id_list:
                 if target_id == group_id:
                     continue
                 await self._ensure_connected()
                 await self.nc.forward_group_single_msg(
-                group_id=target_id, message_id=event["message_id"]
+                    group_id=target_id, message_id=event["message_id"]
                 )
             return
-        if msg_type == 'private':
+        if msg_type == "private":
             for target_id in target_id_list:
                 await self._ensure_connected()
                 await self.nc.forward_friend_single_msg(
                     user_id=target_id, message_id=event["message_id"]
                 )
 
-    async def image_forward(self, group_id, target_id_list, begin_id, end_id,msg_type):
+    async def image_forward(self, group_id, target_id_list, begin_id, end_id, msg_type):
         await self.get_long_history_only_processor(
             group_id=group_id,
             start_id=begin_id,
             end_id=end_id,
             processor=self.image_forward_processor,
-            params={"target_id_list": target_id_list,'msg_type':msg_type},
+            params={"target_id_list": target_id_list, "msg_type": msg_type},
         )
 
     async def ocr(self, event):
@@ -240,18 +251,32 @@ class MessageProcessor:
         match = re.search(r"(-g|-group) (\d+)", clean_msg)
         if match:
             target_id = int(match.group(2))
-            await self.ifs.create_task(group_id=event["group_id"],target_id_list=[target_id],msg_type='group')
+            await self.ifs.create_task(
+                group_id=event["group_id"], target_id_list=[target_id], msg_type="group"
+            )
         else:
             match = re.search(r"(-u|-user) (\d+)", clean_msg)
             if match:
                 target_id = int(match.group(2))
-                await self.ifs.create_task(group_id=event['group_id'],target_id_list=[target_id],msg_type='private')
+                await self.ifs.create_task(
+                    group_id=event["group_id"],
+                    target_id_list=[target_id],
+                    msg_type="private",
+                )
             else:
                 match = re.search(r"(-a|-auto)", clean_msg)
                 if match:
-                    target_group_id_list = [1079845768, 1054955587, 320955551, 973208344]
-                await self.ifs.create_task(group_id=event['group_id'],target_id_list=target_group_id_list,msg_type='group')
-
+                    target_group_id_list = [
+                        1079845768,
+                        1054955587,
+                        320955551,
+                        973208344,
+                    ]
+                await self.ifs.create_task(
+                    group_id=event["group_id"],
+                    target_id_list=target_group_id_list,
+                    msg_type="group",
+                )
 
         match_1 = re.search(r"(-begin|-b)", clean_msg)
         if match_1:
@@ -282,32 +307,33 @@ class MessageProcessor:
                 temp.append(qq_id)
         return temp
 
-    async def get_message_history(
-        self, message_id: int
-    ) -> dict["context":str, "index":int]:
-        """获取指定消息的历史记录"""
-        await self._ensure_connected()
-        event = await self.nc.get_message(message_id)
-        raw_msg = event["data"]["raw_message"]
-        match = re.match(r"\[CQ:reply,id=(\d+)\]", raw_msg)
-        if match:
-            reply_msg_id = int(match.group(1))
-            clean_msg = re.sub(r"^\[CQ:reply,id=\d+\]", "", raw_msg).strip()
-            temp = await self.get_message_history(reply_msg_id)
-            return {
-                "context": temp["context"] + "\n" + str(temp["index"] + 1) + clean_msg,
-                "index": temp["index"] + 1,
-            }
-        else:
-            return {"context": "1" + raw_msg, "index": 1}
+    # async def get_message_history(
+    #     self, message_id: int
+    # ) -> dict["context":str, "index":int]:
+    #     """获取指定消息的历史记录"""
+    #     await self._ensure_connected()
+    #     event = await self.nc.get_message(message_id)
+    #     raw_msg = event["data"]["raw_message"]
+    #     match = re.match(r"\[CQ:reply,id=(\d+)\]", raw_msg)
+    #     if match:
+    #         reply_msg_id = int(match.group(1))
+    #         clean_msg = re.sub(r"^\[CQ:reply,id=\d+\]", "", raw_msg).strip()
+    #         temp = await self.get_message_history(reply_msg_id)
+    #         return {
+    #             "context": temp["context"] + "\n" + str(temp["index"] + 1) + clean_msg,
+    #             "index": temp["index"] + 1,
+    #         }
+    #     else:
+    #         return {"context": "1" + raw_msg, "index": 1}
 
-    async def get_group_latest_msg(self,group_id):
-
+    async def get_group_latest_msg(self, group_id):
         await self._ensure_connected()
-        event = await self.nc.get_group_msg_history(group_id=group_id,count=1,reverse_order=True)
-        messages = event['data']['messages']
+        event = await self.nc.get_group_msg_history(
+            group_id=group_id, count=1, reverse_order=True
+        )
+        messages = event["data"]["messages"]
         if not messages:
-            print(f'[警告] 群 {group_id} 暂无消息或无法访问')
+            print(f"[警告] 群 {group_id} 暂无消息或无法访问")
             return None
         return messages[0]
 
@@ -343,13 +369,19 @@ class MessageProcessor:
             await self.nc.send_group_message(
                 group_id=event["group_id"], message=message
             )
-            self.check_point[f'{event["group_id"]}'] = await self.get_group_latest_msg(event["group_id"])
+            asyncio.create_task(self.check_point_active_get(event["group_id"]))
         elif event["message_type"] == "private":
             await self.nc.send_private_message(
                 user_id=event["user_id"], message=message
             )
 
-    async def send_img(self, event, img_addr,summary="君景发图"):
+    async def check_point_active_get(self, group_id):
+        await self._ensure_connected()
+        latest_msg = await self.get_group_latest_msg(group_id)
+        if latest_msg:
+            self.check_point[f"{group_id}"] = latest_msg
+
+    async def send_img(self, event, img_addr, summary="君景发图"):
         """根据事件类型发送消息"""
         if isinstance(img_addr, list):
             n = len(img_addr)
@@ -358,9 +390,14 @@ class MessageProcessor:
 
         await self._ensure_connected()
         if event["message_type"] == "group":
-            await self.nc.send_group_img(group_id=event["group_id"], img_addr=img_addr, summary=summary)
+            await self.nc.send_group_img(
+                group_id=event["group_id"], img_addr=img_addr, summary=summary
+            )
+            asyncio.create_task(self.check_point_active_get(event["group_id"]))
         elif event["message_type"] == "private":
-            await self.nc.send_private_img(user_id=event["user_id"], img_addr=img_addr, summary=summary)
+            await self.nc.send_private_img(
+                user_id=event["user_id"], img_addr=img_addr, summary=summary
+            )
 
     async def history_solution(self, event):
         message_id = event["message_id"]
@@ -407,41 +444,49 @@ class MessageProcessor:
                 # return True
         return ret
 
-    async def read_check_point(self,user_id):
-        file_name = str(Path(__file__).resolve().parent.parent / "check_point"/f'{user_id}.json')
+    async def read_check_point(self, user_id):
+        file_name = str(
+            Path(__file__).resolve().parent.parent / "check_point" / f"{user_id}.json"
+        )
         try:
-            with open(file_name,mode='r',encoding='utf-8') as f:
+            with open(file_name, mode="r", encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
             print("FileNotFoundError")
             dir_path = os.path.dirname(file_name)
             os.makedirs(dir_path, exist_ok=True)
-            with open(file_name,mode='w',encoding='utf-8') as f:
-                json.dump({},f, ensure_ascii=False, indent=4)
+            with open(file_name, mode="w", encoding="utf-8") as f:
+                json.dump({}, f, ensure_ascii=False, indent=4)
                 return {}
         except:
             print("error")
         return {}
-        
+
     async def _save_check_point(self):
         """将当前断点写入磁盘"""
         DEBUG = False
         try:
-            file_name = str(Path(__file__).resolve().parent.parent / "check_point" / f'{self.user_id}.json')
+            file_name = str(
+                Path(__file__).resolve().parent.parent
+                / "check_point"
+                / f"{self.user_id}.json"
+            )
             os.makedirs(os.path.dirname(file_name), exist_ok=True)
-            with open(file_name, 'w', encoding='utf-8') as f:
+            with open(file_name, "w", encoding="utf-8") as f:
                 json.dump(self.check_point, f, ensure_ascii=False, indent=4)
             if self.check_point:
-                DEBUG and print(f"[断点保存] 已写入 {len(self.check_point)} 条断点到 {file_name}")
+                DEBUG and print(
+                    f"[断点保存] 已写入 {len(self.check_point)} 条断点到 {file_name}"
+                )
         except Exception as e:
             print(f"[断点保存] 异常: {e}")
 
-    async def recover_process(self, event,latest_msg_id=None):
+    async def recover_process(self, event, latest_msg_id=None):
         """回放断点消息：从最新消息往前翻，直到找到断点消息为止"""
         DEBUG = True
-        group_id = event['group_id']
-        rid = event.get('real_id')
-        real_seq = event.get('real_seq')
+        group_id = event["group_id"]
+        rid = event.get("real_id")
+        real_seq = event.get("real_seq")
         if not rid and not real_seq:
             return
         remaining = 8  # 最多翻 8 页
@@ -452,7 +497,7 @@ class MessageProcessor:
             history_list = await self.nc.get_group_msg_history(
                 group_id=group_id, reverse_order=True, count=20, message_seq=message_seq
             )
-            messages = history_list['data']['messages']
+            messages = history_list["data"]["messages"]
             if not messages:
                 break
 
@@ -460,47 +505,66 @@ class MessageProcessor:
             seq_for_this_page = message_seq
 
             # 翻页锚点 = 本批最旧的消息的 seq（下一次拉更旧的）
-            message_seq = messages[0]['message_seq']
+            message_seq = messages[0]["message_seq"]
 
             # 非首次调用：API 返回会包含锚点消息（上一批已处理），pop 掉避免重复
             if seq_for_this_page is not None:
-                messages.pop()
+                messages.pop(0)
             if not messages:
                 break
 
             # 从最新→最旧遍历（reverse_order 返回升序 旧→新）
             for msg_event in reversed(messages):
-                if msg_event.get('real_id') == rid or msg_event.get('real_seq') == real_seq:
-                    print(f'[断点恢复] 找到断点消息 {rid}')
+                if (
+                    msg_event.get("real_id") == rid
+                    or msg_event.get("real_seq") == real_seq
+                ):
+                    DEBUG and print(f"[断点恢复] {group_id}找到断点消息 {rid}")
                     latest = await self.get_group_latest_msg(group_id)
                     if latest:
-                        self.check_point[f'{group_id}'] = latest
+                        self.check_point[f"{group_id}"] = latest
                     return
-                # 被踢期间的消息确实没处理过，走完整 process_message
-                DEBUG and print(f'[断点恢复] 未找到断点 {rid}，处理消息 {msg_event.get("real_id")}')
-                # await self.process_message(msg_event)
-        print(f'[断点恢复] 未找到断点 {rid}，可能已被清理')
+                if msg_event.get("user_id") == self.user_id:
+                    DEBUG and print(f"[断点恢复] 断点保存出错，检测到君景消息")
+                    return
+                    # 被踢期间的消息确实没处理过，走完整 process_message
+                    # DEBUG and print(f'[断点恢复] 未找到断点 {rid}，处理消息 {msg_event.get("real_id")}')
+                await self.process_message(msg_event)
+        print(f"[断点恢复] 未找到断点 {rid}，可能已被清理")
 
     async def recover_from_check_point(self):
         """深拷贝断点，创建协程回放（不阻塞主流程）"""
+        DEBUG = True
         check_point = deepcopy(self.check_point)
         latest_msg_sqes = {}
         for key, value in check_point.items():
             temp = await self.get_group_latest_msg(group_id=key)
             if temp is None:
-                print(f'[断点恢复] 群 {key} 无最新消息，跳过恢复')
+                DEBUG and print(f"[断点恢复] 群 {key} 无最新消息，跳过恢复")
                 continue
-            latest_msg_sqes[key] = {'message_seq':temp["message_seq"], 'real_id':temp.get('real_id'), 'real_seq':temp.get('real_seq')}
-            
+            latest_msg_sqes[key] = {
+                "message_seq": temp["message_seq"],
+                "real_id": temp.get("real_id"),
+                "real_seq": temp.get("real_seq"),
+            }
+
         for key, value in check_point.items():
             if key not in latest_msg_sqes:
                 continue
-            print(f'[断点恢复] 创建恢复任务: {key}')
-            print(f'[断点恢复] 最新消息 seq: {latest_msg_sqes[key]}')
-            if latest_msg_sqes[key]['real_id'] == value.get('real_id') or latest_msg_sqes[key]['real_seq'] == value.get('real_seq'):
-                print(f'[断点恢复] 最新消息已是断点消息 {latest_msg_sqes[key]}，无需回放')
-                continue    
-            asyncio.create_task(self.recover_process(event=value, latest_msg_id=latest_msg_sqes[key]['message_seq']))
+            print(f"[断点恢复] 创建恢复任务: {key}")
+            print(f"[断点恢复] 最新消息 seq: {latest_msg_sqes[key]}")
+            if latest_msg_sqes[key]["real_id"] == value.get(
+                "real_id"
+            ) or latest_msg_sqes[key]["real_seq"] == value.get("real_seq"):
+                print(
+                    f"[断点恢复] 最新消息已是断点消息 {latest_msg_sqes[key]}，无需回放"
+                )
+                continue
+            asyncio.create_task(
+                self.recover_process(
+                    event=value, latest_msg_id=latest_msg_sqes[key]["message_seq"]
+                )
+            )
         if check_point:
             await self._save_check_point()
 
@@ -519,9 +583,11 @@ class MessageProcessor:
             await self._ensure_connected()
             self.user_id = await self.nc.get_user_id()
             self.check_point = await self.read_check_point(self.user_id)
-            print(f'[启动] user_id={self.user_id}, 加载断点 {len(self.check_point)} 个')
+            print(f"[启动] user_id={self.user_id}, 加载断点 {len(self.check_point)} 个")
             # 启动断点定时保存任务
-            self._checkpoint_save_task = asyncio.create_task(self._checkpoint_save_loop())
+            self._checkpoint_save_task = asyncio.create_task(
+                self._checkpoint_save_loop()
+            )
         # 启动心跳保活任务
         self.start_heartbeat()
         return
@@ -585,7 +651,7 @@ class MessageProcessor:
             return False
         clean_msg = self.get_clean_context(event)
         match1 = re.search(r"(-group|-g) (\d+)", clean_msg)
-        match2 = re.search(r'(-user|-u) (\d+)', clean_msg)
+        match2 = re.search(r"(-user|-u) (\d+)", clean_msg)
         if not match1 and not match2:
             DEBUG and print("Find no Target")
             return False
@@ -676,7 +742,9 @@ class MessageProcessor:
         sender = event.get("sender") or {}
         user_id = event.get("user_id") or sender.get("user_id", "未知")
         name = sender.get("card") or sender.get("nickname", "未知")
-        temp += f"消息发送者{name}，其QQ号为{user_id},\t发送消息[message_id:{message_id}]:"
+        temp += (
+            f"消息发送者{name}，其QQ号为{user_id},\t发送消息[message_id:{message_id}]:"
+        )
         DEBUG and print(temp)
         mini_app_info = self.check_is_miniapp(event)
         if mini_app_info:
@@ -712,6 +780,7 @@ class MessageProcessor:
                     not message_event.get("message")
                     or len(message_event["message"]) == 0
                 ):
+
                     ret += "[这可能是嵌套的聊天记录，解析失败]"
                 ret += await self.generate_structed_message_to_creat_context(
                     message_event
@@ -768,29 +837,10 @@ class MessageProcessor:
 
     async def Check_Campus_NetWoerk(self, event):
         DEBUG = False
-        if self.campus_assistant is None:
-            DEBUG and print("CampusAssistant 尚未加载完成")
-            return
-        raw_msg = event["raw_message"]
-        message = re.sub(r"\[CQ:[^\]]+\]", "", raw_msg).strip()
-        DEBUG and print(f"校园网提问: {message}")
-        reply = await self.campus_assistant.chat(
-            message=message,
-            icl = await self.get_history_msg(event),
-            group_id=event.get("group_id"),
-        )
-        if not reply:
-            return
-        # 如果助手表示不能回答，静默跳过
-        if "[我不能回答]" in reply:
-            DEBUG and print("校园网助手判定无法回答，跳过")
-            return
-        # 去掉 [我能回答] 前缀再发送
-        reply = reply.replace("[我能回答]", "").strip()
-        await self.send_message(event, reply)
-        return
+        clean_text = self.get_clean_context(event=event)
+        await self._route_to_campus_assistant(event=event, clean_text=clean_text)
 
-    async def _route_to_campus_assistant(self, event, clean_text: str,iclhistory=None):
+    async def _route_to_campus_assistant(self, event, clean_text: str, iclhistory=None):
         DEBUG = True
         """当主 Agent 返回 __NETWORK__ 信号时，将对话转交校园网助手处理"""
         if self.campus_assistant is None:
@@ -800,7 +850,11 @@ class MessageProcessor:
         await self._ensure_connected()
         reply = await self.campus_assistant.chat(
             message=clean_text,
-            icl=iclhistory if iclhistory is not None else await self.get_history_msg(event),
+            icl=(
+                iclhistory
+                if iclhistory is not None
+                else await self.get_history_msg(event)
+            ),
             group_id=event.get("group_id"),
         )
         if not reply:
@@ -811,7 +865,33 @@ class MessageProcessor:
         reply = reply.replace("[我能回答]", "").strip()
         await self.send_message(event, reply)
 
-    async def auto_forward(self, event, groupid_list=None, userid_list=None, target_groupid=None, task_userid=None) -> bool:
+    async def forward_single_msg(
+        self, event, message_type=None, group_id=None, user_id=None
+    ) -> bool:
+        DEBUG = False
+        if message_type == "group" and group_id is not None:
+            await self._ensure_connected()
+            await self.nc.forward_group_single_msg(
+                group_id=group_id, message_id=event["message_id"]
+            )
+            await self.check_point_active_get(group_id)
+            return True
+        elif message_type == "private" and user_id is not None:
+            await self._ensure_connected()
+            await self.nc.forward_friend_single_msg(
+                user_id=user_id, message_id=event["message_id"]
+            )
+            return True
+        return False
+
+    async def auto_forward(
+        self,
+        event,
+        groupid_list=None,
+        userid_list=None,
+        target_groupid=None,
+        task_userid=None,
+    ) -> bool:
         DEBUG = False
         if groupid_list is None:
             groupid_list = []
@@ -835,7 +915,9 @@ class MessageProcessor:
                 return False
         else:
             return False
-        match = self.check_is_old_forward(event) or self.check_is_multimsg_forward(event)
+        match = self.check_is_old_forward(event) or self.check_is_multimsg_forward(
+            event
+        )
         if not match:
             DEBUG and print("Match Failed!")
             return False
@@ -843,23 +925,28 @@ class MessageProcessor:
             if group_id == event["group_id"]:
                 continue
             await self._ensure_connected()
-            asyncio.create_task( self.nc.forward_group_single_msg(group_id=group_id, message_id=event["message_id"]))
+            asyncio.create_task(
+                self.forward_single_msg(
+                    event=event, group_id=group_id, message_type="group"
+                )
+            )
             DEBUG and print("Succeed Forward!")
         for user_id in task_userid:
             await self._ensure_connected()
-            asyncio.create_task(self.nc.forward_friend_single_msg(user_id=user_id,message_id=event["message_id"]))
+            asyncio.create_task(
+                self.forward_single_msg(
+                    event=event, user_id=user_id, message_type="private"
+                )
+            )
             DEBUG and print("Succeed Forward!")
         return True
-    
+
     async def get_long_history(self, group_id, message_id, remaining: int):
         if remaining <= 0:
             return []
-
         part = []
         DEBUG = True
-
         last_msg_id = message_id
-
         while remaining > 0:
             DEBUG and print("reamaining = ", remaining)
             await self._ensure_connected()
@@ -875,9 +962,28 @@ class MessageProcessor:
 
         return part
 
-    async def get_history_msg(self, event=None,message_seq=None) -> str:
+    async def get_history_msg(
+        self, event=None, message_seq=None, count=20, reverse_order=False
+    ) -> str:
+        if not event:
+            return ""
         await self._ensure_connected()
-        icl_history = await self.nc.get_group_msg_history(group_id=event["group_id"],reverse_order=True,message_seq=message_seq or event.get("message_seq",None))
+        if event.get("message_type") == "group":
+            icl_history = await self.nc.get_group_msg_history(
+                group_id=event["group_id"],
+                reverse_order=reverse_order,
+                message_seq=message_seq or event.get("message_seq", None),
+                count=count,
+            )
+        elif event.get("message_type") == "private":
+            icl_history = await self.nc.get_friend_msg_history(
+                user_id=event["user_id"],
+                reverse_order=reverse_order,
+                message_seq=message_seq or event.get("message_seq", None),
+                count=count,
+            )
+        else:
+            return ""
         parts = []
         for ctx in icl_history["data"]["messages"]:
             parts.append(await self.generate_structed_message_to_creat_context(ctx))
@@ -898,7 +1004,7 @@ class MessageProcessor:
         DEBUG and print("后台预加载 AI Agent …")
         from Agent import QQBotAgent
 
-        self._agent = QQBotAgent(napcat_api=self.nc, extension=self.extension,mp=self)
+        self._agent = QQBotAgent(napcat_api=self.nc, extension=self.extension, mp=self)
         # from Agent.SimpleLLM import SimpleChatModule as SLLM
 
         # self.sllm = SLLM()
@@ -952,7 +1058,7 @@ class image_forward_service:
         self.task_dict = {}
         self.lock = asyncio.Lock()
 
-    async def create_task(self, group_id, target_id_list,msg_type):
+    async def create_task(self, group_id, target_id_list, msg_type):
         # 加锁，确定不会创建多个任务
         group_id = str(group_id)
         async with self.lock:
@@ -965,10 +1071,10 @@ class image_forward_service:
                 "begin_event": asyncio.Event(),
                 "end_event": asyncio.Event(),
             }
-        asyncio.create_task(self._task_init(group_id, target_id_list,msg_type))
+        asyncio.create_task(self._task_init(group_id, target_id_list, msg_type))
         return True
 
-    async def _task_init(self, group_id, target_id_list,msg_type):
+    async def _task_init(self, group_id, target_id_list, msg_type):
         group_id = str(group_id)
         data = self.task_dict.get(group_id)
         if not data:
@@ -977,7 +1083,7 @@ class image_forward_service:
         await data["begin_event"].wait()
         await data["end_event"].wait()
         await self.ms.image_forward(
-            group_id, target_id_list, data["begin_id"], data["end_id"],msg_type
+            group_id, target_id_list, data["begin_id"], data["end_id"], msg_type
         )
         async with self.lock:
             self.task_dict.pop(group_id)

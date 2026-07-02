@@ -140,22 +140,29 @@ class CampusAssistant:
         mp = self.mp
 
         @tool
-        async def get_group_history(group_id: int) -> str:
-            """获取指定群聊的最近聊天记录，用于了解对话上下文。
-参数:
-  - group_id: int, 目标群号
-返回: 结构化消息历史（含发送者、回复链、转发内容等信息）"""
-            if mp is None:
-                logger.warning("[工具] get_group_history 不可用 - MessageProcessor 未传入")
-                return "[工具不可用]"
-            try:
-                result = await mp.get_history_msg(event={"group_id": group_id, "message_type": "group"})
-                if not result:
-                    return "暂无历史消息"
-                return result
-            except Exception as e:
-                logger.error(f"[工具异常] get_group_history 失败: {e}")
-                return f"[获取历史失败: {e}]"
+        async def get_msg_history(
+            group_id: int, message_id: int, count: int = 20
+        ) -> str:
+            """获取指定群聊里，某条消息的之前count条聊天记录，用于了解对话上下文。
+            参数:
+              - group_id: int, 目标群号
+              - message_id: int, 目标消息的 message_seq/message_id（用于获取该消息之前的聊天记录[包括该消息]）
+              - count: int, 获取多少条历史消息（默认20条），最多51条如果需要更多，可以多次调用"""
+            logger.info(
+                f"[工具调用] get_msg_history(group_id={group_id}, message_id={message_id}, count={count})"
+            )
+            res = await mp.get_history_msg(
+                event={
+                    "group_id": group_id,
+                    "message_type": "group",
+                },
+                    message_seq= message_id,
+                    count= count,
+                    reverse_order=True,
+            )
+            print(res)
+            return "获得历史上下文:" + str(res)
+        
         @tool
         async def send_img_liuchengt(group_id: int) -> str:
             """一旦遇到校园网故障就要发送流程图，如果最近已经发送过，就可以不发送"""
@@ -169,7 +176,7 @@ class CampusAssistant:
                 logger.error(f"[工具异常] send_img_liuchengt 失败: {e}")
                 return f"[发送图片失败: {e}]"
 
-        return [get_group_history, send_img_liuchengt]
+        return [get_msg_history, send_img_liuchengt]
 
     # -------- 对话接口 --------
     async def chat(self, message: str, group_id: Optional[int] = None, icl: Optional[str] = None) -> str:
