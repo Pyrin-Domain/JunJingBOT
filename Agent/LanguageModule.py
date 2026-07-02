@@ -274,7 +274,7 @@ class QQBotAgent:
                 )
                 return "[工具不可用] MessageProcessor 未连接"
             try:
-                await self.mp.send_message(event= {message_type: message_type, "group_id": group_id, "user_id": user_id}, message=message)
+                await self.mp.send_message(event= {'message_type': message_type, "group_id": group_id, "user_id": user_id}, message=message)
                 logger.info(f"[工具结果] 群消息已发送到 {group_id}")
                 self._record_tool_call(
                     "send_message",
