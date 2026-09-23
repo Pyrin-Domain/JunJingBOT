@@ -18,6 +18,7 @@ LLM_CONFIG = {
     "base_url": "https://api.deepseek.com/v1",
     "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
     "model": "deepseek-v4-flash",
+    "max_completion_tokens":5000
 }
 
 # ============================================================
@@ -114,11 +115,8 @@ class CampusAssistant:
         logger.info(f"模型: {LLM_CONFIG['model']}, API Base: {LLM_CONFIG['base_url']}")
 
         self.llm = ChatOpenAI(
-            model=LLM_CONFIG["model"],
-            api_key=LLM_CONFIG["api_key"],
-            base_url=LLM_CONFIG["base_url"],
+            **LLM_CONFIG,
             temperature=0.3,       # 偏低，希望知识库回答稳定
-            max_tokens=1024,
         )
 
         self.tools = self._build_tools()
@@ -193,15 +191,16 @@ class CampusAssistant:
         """
         logger.info(f"[校园网助手] 收到提问: {message[:80]}...")
 
-        messages = []
+        parts: list[str] = []
         if group_id is not None:
-            messages.append(SystemMessage(
-                content=f"[上下文] 当前在群 {group_id} 中，用户问了校园网问题。"
-                         f"如有需要可调用 get_group_history 工具查看群内最近聊天记录。"
-            ))
+            parts.append(
+                f"[上下文] 当前在群 {group_id} 中，用户问了校园网问题。"
+                f"如有需要可调用 get_group_history 工具查看群内最近聊天记录。"
+            )
         if icl is not None:
-            messages.append(SystemMessage(content='群聊历史记录: ' + icl))
-        messages.append(HumanMessage(content=message))
+            parts.append('群聊历史记录: ' + icl)
+        parts.append(message)
+        messages = [HumanMessage(content="\n".join(parts))]
 
         try:
             result = await self.agent.ainvoke({"messages": messages})

@@ -1,6 +1,7 @@
 """QQBot LLM Agent - 基于 LangGraph + DeepSeek，带工具调用"""
 
 import os
+import json
 import logging
 import contextvars
 from typing import Any, Optional
@@ -21,6 +22,10 @@ from Minitor.NapCatTools import _IMGS_DIR, MessageProcessor
 _current_tool_calls_var: contextvars.ContextVar[list[dict]] = contextvars.ContextVar(
     "current_tool_calls", default=[]
 )
+_current_tool_cache_var: contextvars.ContextVar[dict[tuple[str, str], Any]] = contextvars.ContextVar(
+    "current_tool_cache", default={}
+)
+_MISSING = object()
 
 # ============================================================
 # 日志配置
@@ -75,6 +80,23 @@ LLM_CONFIG = {
     "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
     "model": "deepseek-v4-flash",  # DeepSeek-V4-flash
 }
+MODEL_TYPE = "deepseek"
+# LLM_CONFIG = {
+#     "base_url": "http://127.0.0.1:8081/v1",
+#     "api_key": 'sk-local',
+#     "model": "Qwen3.6",  # DeepSeek-V4-flash
+# }
+
+# 模型类型宏参数，开发者可在环境变量 LLM_MODEL_TYPE 中设置：qwen 或 deepseek
+# MODEL_TYPE = os.environ.get("LLM_MODEL_TYPE", "qwen").strip().lower()
+# if not MODEL_TYPE:
+#     if "qwen" in LLM_CONFIG["model"].lower():
+#         MODEL_TYPE = "qwen"
+#     elif "deepseek" in LLM_CONFIG["model"].lower():
+#         MODEL_TYPE = "deepseek"
+#     else:
+#         MODEL_TYPE = "deepseek"
+
 
 SYSTEM_PROMPT = """
 你叫君景，是一只伟大的独角兽，常以君王般的口吻来说话，但不是君王身份，人称代词从不是朕。
@@ -108,10 +130,9 @@ end
 4. 不要在回复中使用 Markdown 格式（QQ 不支持），用纯文本即可。
 5. 如果你觉得当前消息不需要回复（例如话题无聊、对方自言自语、问题你已经回答过、或者你想沉默观察），
    请调用 silent_observe 工具，而不要用自然语言表达"沉默"——工具调用能准确表达你的意图，避免误解。
-6. Agent之外集成了一些功能，比如校园网咨询助手，这个时候不是在呼唤你，但是他们可能错误地@你，要辨别清楚，是否是呼唤你。[校园网咨询助手和你一个账号]
-如果是呼唤校园网咨询助手，你就可以先调用工具回复“凤兮雨兮，景其匿兮”，再调用 network_observe 工具 返回'__NETWORK__'并作为reply。
-尤其是历史上下文包含了其他校园网的业务的时候。
-7、主人的女装照不能随便发！除非主人要求！
+6、主人的女装照不能随便发！除非主人要求！
+7、send_message 工具是一次性终结动作，只有在你已经确定要回复用户时才调用它；不要把它当成可以反复调用的普通工具。你只能通过它来发送消息
+8、如果你已经调用过 send_message，请不要再继续用它发相同内容；优先用自然语言收尾或直接结束。
 语言示例：
 1、为何吾之所择，唯寥寥为框所困。
 2、未得久睡，喉若困蛟，欲泻千里！
@@ -148,10 +169,19 @@ class QQBotAgent:
         self.extension = extension
         self.rw_tool = rw_tools()
         self.mp = mp
+        self.model_type = MODEL_TYPE
         # _current_tool_calls 改用 contextvars 隔离，详见 chat() 中的初始化
 
         logger.info("正在初始化 QQBotAgent ...")
-        logger.info(f"模型: {LLM_CONFIG['model']}, API Base: {LLM_CONFIG['base_url']}")
+        max_tokens = int(
+            os.environ.get(
+                "LLM_MAX_TOKENS",
+                10240 if self.model_type == "qwen" else 10240,
+            )
+        )
+        logger.info(
+            f"模型: {LLM_CONFIG['model']}, API Base: {LLM_CONFIG['base_url']}, model_type: {self.model_type}, max_tokens: {max_tokens}"
+        )
 
         # LLM
         self.callbacks = [LLMCallbackHandler()]
@@ -160,7 +190,7 @@ class QQBotAgent:
             api_key=LLM_CONFIG["api_key"],
             base_url=LLM_CONFIG["base_url"],
             temperature=0.7,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             callbacks=self.callbacks,
         )
 
@@ -186,6 +216,255 @@ class QQBotAgent:
         for item in self.rw_tool.method.get("data", []):
             part += f"[index:{item['index']},{item['context']}]\n"
         return part
+    def _extract_ai_response(self, result: Any) -> Optional[str]:
+        if result is None:
+            return None
+
+        def _coerce_text(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value.strip() or None
+            if isinstance(value, (list, tuple)):
+                parts: list[str] = []
+                for item in value:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        text = item.get("text") or item.get("content") or item.get("type")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+                joined = "\n".join(part for part in parts if part).strip()
+                return joined or None
+            if isinstance(value, dict):
+                for key in ("text", "content", "output", "output_text"):
+                    if key in value:
+                        text = _coerce_text(value[key])
+                        if text:
+                            return text
+                if value.get("type") == "reasoning":
+                    return _coerce_text(value.get("reasoning_content"))
+            return None
+
+        def _is_truncated_result(result: Any) -> bool:
+            def _finish_reason(value: Any) -> bool:
+                if not isinstance(value, str):
+                    return False
+                value = value.lower()
+                return value in ("length", "max_tokens", "token_limit", "tokens_limit")
+
+            if isinstance(result, dict):
+                choices = result.get("choices") or []
+                if isinstance(choices, (list, tuple)) and choices:
+                    first_choice = choices[0]
+                    if isinstance(first_choice, dict):
+                        if _finish_reason(first_choice.get("finish_reason")):
+                            return True
+                        if _finish_reason(first_choice.get("reason")):
+                            return True
+                        message = first_choice.get("message")
+                        if isinstance(message, dict) and _finish_reason(message.get("finish_reason")):
+                            return True
+                messages = result.get("messages") or []
+            elif hasattr(result, "choices"):
+                choices = getattr(result, "choices")
+                if isinstance(choices, (list, tuple)) and choices:
+                    first_choice = choices[0]
+                    if hasattr(first_choice, "finish_reason") and _finish_reason(getattr(first_choice, "finish_reason", None)):
+                        return True
+                    if _finish_reason(getattr(first_choice, "reason", None)):
+                        return True
+                    message = getattr(first_choice, "message", None)
+                    if isinstance(message, dict) and _finish_reason(message.get("finish_reason")):
+                        return True
+                messages = getattr(result, "messages", [])
+            else:
+                messages = None
+
+            if isinstance(messages, (list, tuple)):
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        if _finish_reason(msg.get("finish_reason")):
+                            return True
+                        if _finish_reason(msg.get("reason")):
+                            return True
+                        response_metadata = msg.get("response_metadata") or {}
+                        if _finish_reason(response_metadata.get("finish_reason")):
+                            return True
+                    elif isinstance(msg, AIMessage):
+                        response_metadata = getattr(msg, "response_metadata", None) or {}
+                        if _finish_reason(response_metadata.get("finish_reason")):
+                            return True
+                        if _finish_reason(getattr(msg, "finish_reason", None)):
+                            return True
+                        additional_kwargs = getattr(msg, "additional_kwargs", None)
+                        if isinstance(additional_kwargs, dict) and _finish_reason(additional_kwargs.get("finish_reason")):
+                            return True
+            return False
+
+        if _is_truncated_result(result):
+            return "思考时间过长"
+
+        def _extract_dict_message_text(msg_dict: dict[str, Any]) -> Optional[str]:
+            if not isinstance(msg_dict, dict):
+                return None
+
+            role = msg_dict.get("role")
+            if isinstance(role, str) and role.lower() in ("user", "system"):
+                return None
+
+            if "content" in msg_dict:
+                text = _coerce_text(msg_dict.get("content"))
+                if text:
+                    return text
+
+            if "message" in msg_dict:
+                nested = msg_dict.get("message")
+                if isinstance(nested, dict):
+                    nested_role = nested.get("role")
+                    if isinstance(nested_role, str) and nested_role.lower() in ("assistant", "tool"):
+                        return _coerce_text(nested.get("content")) or _coerce_text(
+                            nested.get("reasoning_content") or nested.get("thoughts")
+                        )
+                    # Only recurse when the nested message itself is not user/system
+                    if nested_role is None or nested_role.lower() not in ("user", "system"):
+                        return _extract_dict_message_text(nested)
+
+            for key in ("output_text", "output"):
+                text = _coerce_text(msg_dict.get(key))
+                if text:
+                    return text
+
+            return _coerce_text(msg_dict.get("reasoning_content") or msg_dict.get("thoughts"))
+
+        def _extract_message_text(msg: Any) -> Optional[str]:
+            if msg is None:
+                return None
+
+            if isinstance(msg, AIMessage):
+                text = _coerce_text(getattr(msg, "content", None))
+                if text:
+                    return text
+                additional_kwargs = getattr(msg, "additional_kwargs", None)
+                if isinstance(additional_kwargs, dict):
+                    return _coerce_text(
+                        additional_kwargs.get("reasoning_content")
+                        or additional_kwargs.get("thoughts")
+                    )
+                return None
+
+            if isinstance(msg, dict):
+                return _extract_dict_message_text(msg)
+
+            text = _coerce_text(
+                getattr(msg, "content", None)
+                or getattr(msg, "text", None)
+                or getattr(msg, "output", None)
+                or getattr(msg, "output_text", None)
+            )
+            if text:
+                return text
+
+            if hasattr(msg, "message"):
+                nested = getattr(msg, "message")
+                if isinstance(nested, dict) or isinstance(nested, AIMessage):
+                    text = _extract_message_text(nested)
+                    if text:
+                        return text
+
+            additional_kwargs = getattr(msg, "additional_kwargs", None)
+            if isinstance(additional_kwargs, dict):
+                return _coerce_text(
+                    additional_kwargs.get("reasoning_content")
+                    or additional_kwargs.get("thoughts")
+                )
+
+            return _coerce_text(getattr(msg, "reasoning_content", None))
+
+        messages = None
+        if isinstance(result, dict):
+            messages = result.get("messages")
+        elif hasattr(result, "messages"):
+            messages = getattr(result, "messages")
+
+        fallback = None
+        if isinstance(messages, (list, tuple)):
+            for msg in reversed(messages):
+                text = _extract_message_text(msg)
+                if text:
+                    return text
+                if fallback is None:
+                    if isinstance(msg, dict):
+                        fallback = _coerce_text(msg.get("reasoning_content") or msg.get("thoughts"))
+                    elif isinstance(msg, AIMessage):
+                        additional_kwargs = getattr(msg, "additional_kwargs", None)
+                        if isinstance(additional_kwargs, dict):
+                            fallback = _coerce_text(
+                                additional_kwargs.get("reasoning_content")
+                                or additional_kwargs.get("thoughts")
+                            )
+                    else:
+                        fallback = _coerce_text(getattr(msg, "reasoning_content", None))
+
+        choices = None
+        if isinstance(result, dict):
+            choices = result.get("choices")
+        elif hasattr(result, "choices"):
+            choices = getattr(result, "choices")
+
+        if isinstance(choices, (list, tuple)) and choices:
+            first_choice = choices[0]
+            if isinstance(first_choice, dict):
+                message = first_choice.get("message") or {}
+                content = None
+                if isinstance(message, dict):
+                    content = message.get("content")
+                if not content:
+                    content = first_choice.get("output_text") or first_choice.get("output")
+                text = _coerce_text(content)
+                if text:
+                    return text
+                if fallback is None:
+                    fallback = _coerce_text(
+                        first_choice.get("reasoning_content") or first_choice.get("thoughts")
+                    )
+            else:
+                message = getattr(first_choice, "message", None)
+                text = _extract_message_text(message) or _extract_message_text(first_choice)
+                if text:
+                    return text
+                if fallback is None:
+                    additional_kwargs = getattr(first_choice, "additional_kwargs", None)
+                    if isinstance(additional_kwargs, dict):
+                        fallback = _coerce_text(
+                            additional_kwargs.get("reasoning_content")
+                            or additional_kwargs.get("thoughts")
+                        )
+
+        if fallback:
+            return fallback
+
+        output = None
+        if isinstance(result, dict):
+            output = result.get("output") or result.get("text")
+        else:
+            output = getattr(result, "output", None) or getattr(result, "text", None)
+        text = _coerce_text(output)
+        if text:
+            return text
+
+        return None
+    def _make_tool_cache_key(self, tool_name: str, args: dict) -> tuple[str, str]:
+        payload = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+        return (tool_name, payload)
+
+    def _get_cached_tool_result(self, tool_name: str, args: dict) -> Any:
+        cache = _current_tool_cache_var.get()
+        return cache.get(self._make_tool_cache_key(tool_name, args), _MISSING)
+
+    def _set_cached_tool_result(self, tool_name: str, args: dict, result: Any) -> None:
+        cache = _current_tool_cache_var.get()
+        cache[self._make_tool_cache_key(tool_name, args)] = result
 
     def _record_tool_call(self, tool_name: str, args: dict, result=None, error=None):
         """将工具调用记录到当前 async Task 的上下文变量中，实现并发隔离"""
@@ -235,6 +514,11 @@ class QQBotAgent:
               - img_url: str, 图片 URL（从消息中的 {"url":...} 里提取）
             """
             logger.info(f"[工具调用] ocr_img(img_url={img_url})")
+            cached = self._get_cached_tool_result("ocr_img", {"img_url": img_url})
+            if cached is not _MISSING:
+                logger.info(f"[工具缓存] 复用 ocr_img 结果: {img_url}")
+                self._record_tool_call("ocr_img", {"img_url": img_url}, result=cached)
+                return cached
             if extension is None:
                 logger.warning("[工具] OCR 不可用 - extension 为空")
                 self._record_tool_call(
@@ -247,6 +531,7 @@ class QQBotAgent:
                 logger.info(
                     f"[工具结果] ocr_img -> {text[:80]}{'...' if len(text)>80 else ''}"
                 )
+                self._set_cached_tool_result("ocr_img", {"img_url": img_url}, text)
                 self._record_tool_call("ocr_img", {"img_url": img_url}, result=text)
                 return text
             except Exception as e:
@@ -254,9 +539,9 @@ class QQBotAgent:
                 self._record_tool_call("ocr_img", {"img_url": img_url}, error=str(e))
                 return f"[OCR 失败: {e}]"
 
-        @tool
+        @tool(return_direct=True)
         async def send_message(message_type: str,group_id: int,user_id: int, message: str) -> str:
-            """发送一条消息到指定 QQ 群。
+            """一次性终结动作：仅在你已经明确决定要回复用户时调用。请不要把它当作普通工具反复调用；发送后应当结束当前回复流程。
             参数:
               - message_type: str, 消息类型（"group" 或 "private"）
               - group_id: int, 目标群号
@@ -265,6 +550,23 @@ class QQBotAgent:
             logger.info(
                 f"[工具调用] send_message(group_id={group_id}, message_type={message_type}, user_id={user_id}, message={message[:60]}{'...' if len(message)>60 else ''})"
             )
+            cached = self._get_cached_tool_result(
+                "send_message",
+                {
+                    "message_type": message_type,
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "message": message,
+                },
+            )
+            if cached is not _MISSING:
+                logger.info(f"[工具缓存] 复用 send_message 结果: {message[:40]}...")
+                self._record_tool_call(
+                    "send_message",
+                    {"message_type": message_type, "group_id": group_id, "user_id": user_id, "message": message},
+                    result=cached,
+                )
+                return cached
             if self.mp is None:
                 logger.warning("[工具] MessageProcessor 未连接")
                 self._record_tool_call(
@@ -276,12 +578,18 @@ class QQBotAgent:
             try:
                 await self.mp.send_message(event= {'message_type': message_type, "group_id": group_id, "user_id": user_id}, message=message)
                 logger.info(f"[工具结果] 群消息已发送到 {group_id}")
+                result_text = f"已成功发送群消息到群 {group_id}"
+                self._set_cached_tool_result(
+                    "send_message",
+                    {"message_type": message_type, "group_id": group_id, "user_id": user_id, "message": message},
+                    result_text,
+                )
                 self._record_tool_call(
                     "send_message",
                     {"message_type": message_type, "group_id": group_id, "user_id": user_id, "message": message},
                     result="成功",
                 )
-                return f"已成功发送群消息到群 {group_id}"
+                return result_text
             except Exception as e:
                 logger.error(f"[工具异常] 发送群消息失败: {e}")
                 self._record_tool_call(
@@ -304,6 +612,11 @@ class QQBotAgent:
                     "get_message", {"message_id": message_id}, error="NapCat API 未连接"
                 )
                 return "[工具不可用] NapCat API 未连接"
+            cached = self._get_cached_tool_result("get_message", {"message_id": message_id})
+            if cached is not _MISSING:
+                logger.info(f"[工具缓存] 复用 get_message 结果: {message_id}")
+                self._record_tool_call("get_message", {"message_id": message_id}, result=cached)
+                return cached
             try:
                 resp = await napcat.get_message(message_id)
                 data = resp.get("data", {})
@@ -312,12 +625,16 @@ class QQBotAgent:
                 logger.info(
                     f"[工具结果] 消息 {message_id} | 发送者: {sender} | 内容: {raw[:60]}{'...' if len(raw)>60 else ''}"
                 )
+                result_text = f"消息ID {message_id} | 发送者: {sender} | 内容: {raw}"
+                self._set_cached_tool_result(
+                    "get_message", {"message_id": message_id}, result_text
+                )
                 self._record_tool_call(
                     "get_message",
                     {"message_id": message_id},
                     result={"sender": sender, "raw": raw},
                 )
-                return f"消息ID {message_id} | 发送者: {sender} | 内容: {raw}"
+                return result_text
             except Exception as e:
                 logger.error(f"[工具异常] 获取消息失败: {e}")
                 self._record_tool_call(
@@ -430,16 +747,16 @@ class QQBotAgent:
             )
             return "__SILENT__"
 
-        @tool
-        async def network_observe(reason: str) -> str:
-            """当你觉得当前消息是呼唤校园网咨询助手时，调用此工具来返回'__NETWORK__'。
-            参数:
-              - reason: str, 呼唤的原因（仅用于记录日志）。"""
-            logger.info(f"[工具调用] network_observe(reason='{reason[:60]}')")
-            self._record_tool_call(
-                "network_observe", {"reason": reason}, result="已回复校园网助手"
-            )
-            return "__NETWORK__"
+        # @tool
+        # async def network_observe(reason: str) -> str:
+        #     """当你觉得当前消息是呼唤校园网咨询助手时，调用此工具来返回'__NETWORK__'。
+        #     参数:
+        #       - reason: str, 呼唤的原因（仅用于记录日志）。"""
+        #     logger.info(f"[工具调用] network_observe(reason='{reason[:60]}')")
+        #     self._record_tool_call(
+        #         "network_observe", {"reason": reason}, result="已回复校园网助手"
+        #     )
+        #     return "__NETWORK__"
 
         return [
             ocr_img,
@@ -449,7 +766,7 @@ class QQBotAgent:
             delete_Method,
             alter_Method,
             silent_observe,
-            network_observe,
+            # network_observe,
             send_dress,
             get_msg_history,
         ]
@@ -460,6 +777,7 @@ class QQBotAgent:
         user_message: str,
         thread_id: str = "default",
         extra_context: Optional[str] = None,
+        event:dict = None,
     ) -> str:
         """与 Agent 对话（无状态，每次调用独立，不自动记忆历史）。
 
@@ -478,24 +796,27 @@ class QQBotAgent:
         if extra_context:
             logger.info(f"[会话 {thread_id}] 上下文: {extra_context[:120]}")
 
-        # 重置本轮工具调用记录（使用 contextvars 隔离并发调用）
+        # 重置本轮工具调用记录和工具缓存（使用 contextvars 隔离并发调用）
         _current_tool_calls_var.set([])
+        _current_tool_cache_var.set({})
 
         def _get_calls():
             return _current_tool_calls_var.get()
 
-        # 构建消息列表（system_prompt 由 create_agent 自动注入，无需手动添加）
-        messages: list[BaseMessage] = []
+        # 不向 agent 额外传入 SystemMessage，避免与 create_agent 的 system_prompt 冲突
+        method_context = None
+        parts: list[str] = []
 
         if extra_context:
-            messages.append(SystemMessage(content=f"[当前上下文] {extra_context}"))
+            parts.append(f"[当前上下文] {extra_context}")
 
-        method_context = None
         if self.rw_tool:
             method_context = self.structed_method()
-            messages.append(SystemMessage(content=f"[Method] {method_context}"))
+            if method_context:
+                parts.append(f"[Method] {method_context}")
 
-        messages.append(HumanMessage(content=user_message))
+        parts.append(user_message)
+        messages: list[BaseMessage] = [HumanMessage(content="\n".join(parts))]
 
         logger.info(f"[会话 {thread_id}] 正在请求 LLM ...")
         error = None
@@ -503,12 +824,8 @@ class QQBotAgent:
             result = await self.agent.ainvoke(
                 {"messages": messages},
             )
-            logger.info(
-                f"[会话 {thread_id}] LLM 返回成功，消息数: {len(result['messages'])}"
-            )
-
+            ai_response = self._extract_ai_response(result)
             calls = _get_calls()
-            # 检测是否调用了 silent_observe（静默观察，不发送消息）
             if any(call.get("tool") == "silent_observe" for call in calls):
                 logger.info(f"[会话 {thread_id}] Agent 选择静默观察，不回复")
                 append_log(
@@ -523,22 +840,43 @@ class QQBotAgent:
                     )
                 )
                 return None
-            # 检测是否调用了 network_observe（校园网问题，转交校园网助手）
-            if any(call.get("tool") == "network_observe" for call in calls):
+
+            if ai_response is not None:
                 logger.info(
-                    f"[会话 {thread_id}] Agent 判定为校园网问题，返回 __NETWORK__ 信号"
+                    f"[会话 {thread_id}] LLM 返回成功，消息数: {len(result.get('messages') or [])}"
                 )
+                logger.info(
+                    f"[会话 {thread_id}] AI 回复: {ai_response[:120]}{'...' if len(ai_response) > 120 else ''}"
+                )
+                logger.info(f"[会话 {thread_id}] ═══ 对话结束 ═══")
                 append_log(
                     build_log_entry(
                         thread_id=thread_id,
                         user_message=user_message,
-                        ai_response="__NETWORK__",
+                        ai_response=ai_response,
                         extra_context=extra_context,
                         method_context=method_context,
                         tool_calls=calls or None,
                     )
                 )
-                return "__NETWORK__"
+                return ai_response
+
+            logger.info(
+                f"[会话 {thread_id}] LLM 返回成功，但未解析到回复，消息数: {len(result.get('messages') or [])}"
+            )
+            logger.debug(f"[会话 {thread_id}] 原始结果: {result}")
+            append_log(
+                build_log_entry(
+                    thread_id=thread_id,
+                    user_message=user_message,
+                    ai_response="",
+                    extra_context=extra_context,
+                    method_context=method_context,
+                    tool_calls=calls or None,
+                    error="空回复",
+                )
+            )
+            return None
         except Exception as e:
             logger.error(f"[会话 {thread_id}] LLM 调用异常: {e}")
             error = str(e)

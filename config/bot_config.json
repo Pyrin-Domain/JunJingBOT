@@ -1,0 +1,189 @@
+{
+  "master_qq": "1013098110",
+  "heartbeat": {
+    "min_minutes": 10,
+    "max_minutes": 20
+  },
+  "agent": {
+    "enable": false
+  },
+  "message": {
+    "extraconfig": {
+      "tokenizer": false,
+      "recent": true
+    }
+  },
+  "auto_forward": {
+    "enable": true,
+    "groupid_list": [
+      1054955587,
+      1079845768,
+      320955551,
+      569117421,
+      662802665,
+      973208344,
+      949950852
+    ],
+    "target_groupid": [
+      1079845768,
+      1054955587,
+      320955551
+    ],
+    "userid_list": [
+      1013098110
+    ],
+    "task_userid": [],
+    "dedup": true,
+    "auto_img_forward_from_bot": {
+      "enable": true,
+      "bot_list": [
+        {
+          "bot_id": 3282647559,
+          "type": "all",
+          "group_id": []
+        },
+        {
+          "bot_id": 2027241761,
+          "type": "all",
+          "group_id": []
+        },
+        {
+          "bot_id": 3181349085,
+          "type": "all",
+          "group_id": []
+        },
+        {
+          "bot_id": 1013098110,
+          "type": "private",
+          "group_id": []
+        }
+      ]
+    }
+  },
+  "image_forward": {
+    "auto_target_group_ids": [
+      1079845768,
+      1054955587,
+      320955551,
+      973208344
+    ]
+  },
+  "prompts": {
+    "group_context": "当前是群聊，群号 {group_id}，发消息的用户 QQ 号是 {user_id}，消息 ID 是 {message_id},AT的对象的QQ号是{ated_user},你的QQ号是{self_id},主人的QQ号是{master_id}",
+    "private_context": "当前是私聊，用户 QQ 号是 {user_id}",
+    "history_context": "历史消息如下:{history}",
+    "history_command_regex": "^历史"
+  },
+  "replies": {
+    "forwarded_already": "[发过了喵]",
+    "network_upgrade": "校园网升级，校园网助手取消"
+  },
+  "web_panel": {
+    "enable": true,
+    "host": "127.0.0.1",
+    "port": 8390,
+    "token": ""
+  },
+  "keyword_actions": [
+    {
+      "regex": "(男娘|南梁|nn)",
+      "action": "send_message",
+      "params": {
+        "message": "哪有男娘",
+        "filter": {
+          "type": "ban",
+          "data": [
+            "895977823",
+            "1032125562"
+          ]
+        }
+      }
+    },
+    {
+      "regex": "女装",
+      "action": "send_message",
+      "params": {
+        "message": [
+          "看看女装",
+          "羡慕女装"
+        ]
+      }
+    },
+    {
+      "regex": "(月抛|约炮|(月|约|🈷️)(吗|么|嘛|🐴|🐎))",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/月抛找我.png",
+        "summary": "月抛找我"
+      }
+    },
+    {
+      "regex": "妈妈(?!])",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/妈妈.gif",
+        "summary": "妈妈"
+      }
+    },
+    {
+      "regex": "老大(?!])",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/老大.gif",
+        "summary": "老大？"
+      }
+    },
+    {
+      "regex": "抱",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/要抱.gif",
+        "summary": "要抱"
+      }
+    },
+    {
+      "regex": "(jjcn|dsn|dkn|顶死你|顶哭你|((jj|唧唧)(草|凿|燥|糙)(你|泥)))",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/速来.jpg",
+        "summary": "速来"
+      }
+    },
+    {
+      "regex": "(看看脚|白丝)",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/脚.gif",
+        "summary": "脚"
+      }
+    },
+    {
+      "regex": "historydebug",
+      "action": "get_long_history_test"
+    },
+    {
+      "regex": "export",
+      "action": "export"
+    },
+    {
+      "regex": "set_tokenizer",
+      "action": "set_tokenizer"
+    },
+    {
+      "regex": "ocr",
+      "action": "ocr"
+    },
+    {
+      "regex": "img_fd ",
+      "action": "img_forward_create_task"
+    },
+    {
+      "regex": "fabric",
+      "action": "fabric"
+    },
+    {
+      "regex": "(我想听|MUSIC_GET|GETMUSIC)",
+      "action": "get_music"
+    }
+  ]
+}

@@ -1,56 +1,66 @@
+"""minitor —— 事件监听入口：收 NapCat 推来的消息，交给 process_message。
+
+正向 / 反向由 config.json 的 ``type`` 决定（实现都在 Websockets.py）。
+这里只做四件事：建连接（或复用调用方给的连接）→ 注册事件回调 →
+等 NapCat 连上 → 挂起不返回。
+"""
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asyncio
-import json
-import re
+import inspect
 from collections.abc import Callable
-from Websockets import NapCatBotConfig
-from reverse_ws import NapCatReverseWS
+
+try:  # 兼容 run.py 的扁平 import 和 `Minitor.minitor` 包内 import
+    from Websockets import NapCatBotConfig, NapCatConnection
+except ImportError:  # pragma: no cover
+    from Minitor.Websockets import NapCatBotConfig, NapCatConnection
 
 
-async def listen_msg(config:NapCatBotConfig, process_message: Callable,
-                     rws: NapCatReverseWS | None = None) -> NapCatReverseWS:
-    """启动反向 WebSocket 服务器，NapCat 连接后开始监听事件。
+async def listen_msg(config: NapCatBotConfig, process_message: Callable,
+                     conn: NapCatConnection | None = None,
+                     rws: NapCatConnection | None = None) -> NapCatConnection:
+    """连接 NapCat 并监听消息事件（正常情况一直挂着，直到被取消）。
 
-    如果外部已经创建了 ``NapCatReverseWS`` 实例（用于共享 API 连接），
-    可通过 ``rws`` 传入；否则内部自动创建。
-    返回 ``NapCatReverseWS`` 实例引用。
+    :param config: NapCatBotConfig；外部已经建好连接时只用来打印模式
+    :param process_message: 收到 ``post_type == "message"`` 时调用的回调
+                            （协程或普通函数都行，并发执行，不阻塞监听）
+    :param conn: 外部建好的连接（run.py 里共享同一个连接时传入）；
+                 不传就按 config 的模式自己建一个
+    :param rws: ``conn`` 的旧参数名（兼容老调用）
+    :return: 实际使用的 NapCatConnection
     """
-    if rws is None:
-        rws = NapCatReverseWS(
-            host=config.ws_reverse_host,
-            port=config.ws_reverse_port,
-            token=config.token,
-        )
-        await rws.start()
+    conn = conn if conn is not None else rws
+    if conn is None:
+        conn = NapCatConnection(config, role="事件")
+        await conn.start()
 
-    # 注册事件处理器
     async def _event_handler(event: dict):
-        if event.get("post_type") != "message":
+        if not isinstance(event, dict) or event.get("post_type") != "message":
             return
-        message_id = event["message_id"]
-        user_id = event["user_id"]
-        raw_msg = event["raw_message"]
+        task = asyncio.create_task(_call_process(event))
 
-        if event["message_type"] == "group":
-            group_id = event["group_id"]
-            print(f"【群{group_id}】用户{user_id} | msgID:{message_id} | 内容：{raw_msg}")
-        else:
-            print(f"【私聊】用户{user_id} | msgID:{message_id} | 内容：{raw_msg}")
-        # 并发处理消息，不阻塞监听；异常会打印而不是静默吞掉
-        task = asyncio.create_task(process_message(event))
-        task.add_done_callback(
-            lambda t: print(f"消息处理异常: {t.exception()}") if t.exception() else None
-        )
+        def _done(t: asyncio.Task):
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                print(f"消息处理异常：{exc!r}")
 
-    rws.set_event_handler(_event_handler)
+        task.add_done_callback(_done)
+
+    async def _call_process(event: dict):
+        result = process_message(event)
+        if inspect.isawaitable(result):
+            await result
+
+    conn.set_event_handler(_event_handler)
 
     # 等待 NapCat 连接
-    await rws.wait_for_connect()
-    print("NapCat 已连接，开始监听消息（反向 WebSocket）...")
+    await conn.wait_for_connect()
+    print(f"NapCat 已连接，开始监听消息（{conn.config.mode_label}）…")
 
-    # 永远挂起（由 reverse_ws 的 reader 驱动）
+    # 永远挂起（事件由连接层的 reader 驱动）
     await asyncio.Event().wait()
-    return rws
-
+    return conn

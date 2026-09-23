@@ -6,20 +6,21 @@ from typing import Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from Websockets import NapCatBotConfig
-    from reverse_ws import NapCatReverseWS
+    from Websockets import NapCatConnection as NapCatReverseWS
 
 class NapCatAPIInterface:
     """NapCat API 接口
 
     支持两种模式：
     - **正向 WS**（旧）：传入 ``NapCatBotConfig``，自建连接
-    - **反向 WS**（新）：传入 ``NapCatReverseWS``，复用共享连接
+    - **统一连接**（新）：传入 ``Websockets.NapCatConnection``（正向 / 反向都行），
+      直接复用它的 call_api（反向时一条连接既收事件又发 API）
     """
 
     def __init__(self, connection: Union["NapCatBotConfig", "NapCatReverseWS"]):
         if hasattr(connection, "_pending"):
-            # ── 反向 WS 模式 ──
-            from reverse_ws import NapCatReverseWS
+            # ── NapCatConnection（反向 ws_re，也可以是正向 ws 连接） ──
+            from Websockets import NapCatConnection as NapCatReverseWS
             self._rws: NapCatReverseWS = connection
             self._ws_conn = None
             self._reader_task = None
@@ -112,13 +113,13 @@ class NapCatAPIInterface:
         finally:
             self._pending.pop(echo_id, None)
 
-    async def send_group_message(self, group_id: int, message: str) -> dict:
+    async def send_group_message(self, group_id: int, message: any) -> dict:
         """发送群消息"""
         return await self._call_api(
             action="send_group_msg", params={"group_id": group_id, "message": message}
         )
 
-    async def send_private_message(self, user_id: int, message: str) -> dict:
+    async def send_private_message(self, user_id: int, message: any) -> dict:
         """发送私聊消息"""
         return await self._call_api(
             action="send_private_msg", params={"user_id": user_id, "message": message}
@@ -143,10 +144,10 @@ class NapCatAPIInterface:
         return await self._call_api(
             action="send_private_msg", params={"user_id": user_id, "message": [{"type":"image","data":{"file":img_addr,"summary":summary}}]}
         )
-    async def send_group_forward_msg(self,group_id:int,node_id):
+    async def send_group_forward_msg(self,group_id:int,messages:list):
         """转发群聊消息"""
         return await self._call_api(
-            action="send_group_forward_msg", params={"group_id": group_id, "message": [{"type":"node","data":{"id":node_id}}]}
+            action="send_group_forward_msg", params={"group_id": group_id, "messages": messages}
         )
     
     async def forward_group_single_msg(self,group_id:int,message_id:int):

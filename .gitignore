@@ -26,5 +26,17 @@ sender_config.json
 logs/
 *.log
 
+# 运行时数据目录（数据库 / 日志 / 断点，本地生成不提交）
+data/
+
+# 转发去重指纹库（本地生成，不提交）
+forward_dedup.db
+forward_dedup.db-wal
+forward_dedup.db-shm
+tmp_forward_dedup_test.db*
+# 转发去重运行日志（默认关闭，LOG_ENABLED=True 时才写）
+forward_dedup_log.jsonl
+tmp_forward_dedup_*.json*
+
 # Personal photos
 imgs/dress/
