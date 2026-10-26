@@ -1,0 +1,714 @@
+from functools import wraps
+from typing import Dict, NamedTuple, Union
+from time import perf_counter
+
+from .jm_option import *
+from .jm_runtime import (
+    JmRuntime,
+    JmSyncRuntime,
+    JmTempRuntime,
+)
+from .jm_task_context import (
+    bind_jm_task_context,
+    JTC,
+    jm_task_context,
+)
+
+
+def record_download_duration(context_key: str, clock=None):
+    def decorator(func):
+        # 装饰时只解析一次参数名，关键字调用无需在每次执行时重复 inspect。
+        entity_param = tuple(inspect.signature(func).parameters)[1]
+
+        def get_time():
+            return perf_counter() if clock is None else clock()
+
+        def get_entity(args, kwargs):
+            # 常规位置参数走快路径；只有关键字调用才按参数名取值。
+            if len(args) > 1:
+                return args[1]
+            return kwargs[entity_param]
+
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                entity = get_entity(args, kwargs)
+                detail_call = isinstance(entity, Downloadable)
+                # 顶层 ID 下载负责完整耗时，内部 detail 调用复用同一个计时上下文。
+                if detail_call and JTC.get_context_value(context_key) is not None:
+                    return await func(*args, **kwargs)
+
+                started_at = get_time()
+                with jm_task_context(**{context_key: started_at}):
+                    result = await func(*args, **kwargs)
+                    # detail 入口直接记录传入实体；ID 入口记录下载后返回的实体。
+                    detail = entity if detail_call else result
+                    detail.duration = get_time() - started_at
+                    return result
+
+            return async_wrapper
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            entity = get_entity(args, kwargs)
+            detail_call = isinstance(entity, Downloadable)
+            # 顶层 ID 下载负责完整耗时，内部 detail 调用复用同一个计时上下文。
+            if detail_call and JTC.get_context_value(context_key) is not None:
+                return func(*args, **kwargs)
+
+            started_at = get_time()
+            with jm_task_context(**{context_key: started_at}):
+                result = func(*args, **kwargs)
+                # detail 入口直接记录传入实体；ID 入口记录下载后返回的实体。
+                detail = entity if detail_call else result
+                detail.duration = get_time() - started_at
+                return result
+
+        return wrapper
+
+    return decorator
+
+
+class DownloadManifest:
+    """一次顶层下载产生的聚合文件清单。"""
+
+    def __init__(self):
+        self.image_filepath_list: List[str] = []
+        self.export_filepath_dict: Dict[str, List[str]] = {}
+        self.duration: Optional[float] = None  # 顶层任务完整耗时（秒）
+
+    def get_export_filepath_list(self, suffix: str) -> List[str]:
+        normalized_suffix = str(suffix).lower().lstrip('.')
+        return self.export_filepath_dict.get(normalized_suffix, [])
+
+
+def catch_exception(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        self: JmDownloader
+        self.raise_if_cancelled()
+        try:
+            return func(self, *args, **kwargs)
+        except Exception as e:
+            if isinstance(e, DownloadCancelledException):
+                raise
+            detail: JmBaseEntity = args[0]
+            if detail.is_image():
+                detail: JmImageDetail
+                jm_log('image.failed', f'图片下载失败: [{detail.download_url}], 异常: [{e}]', e)
+                self.download_failed_image.append((detail, e))
+
+            elif detail.is_photo():
+                detail: JmPhotoDetail
+                jm_log('photo.failed', f'章节下载失败: [{detail.id}], 异常: [{e}]', e)
+                self.download_failed_photo.append((detail, e))
+
+            raise e
+
+    return wrapper
+
+
+# noinspection PyMethodMayBeStatic
+class DownloadCallback:
+
+    def before_album(self, album: JmAlbumDetail):
+        jm_log('album.before',
+               f'本子获取成功: [{album.id}], '
+               f'作者: [{album.author}], '
+               f'章节数: [{len(album)}], '
+               f'总页数: [{album.page_count}], '
+               f'标题: [{album.name}], '
+               f'关键词: {album.tags}'
+               )
+
+    def after_album(self, album: JmAlbumDetail):
+        jm_log('album.after', f'本子下载完成: [{album.id}]')
+
+    def before_photo(self, photo: JmPhotoDetail):
+        jm_log('photo.before',
+               f'开始下载章节: {photo.id} ({photo.album_id}[{photo.index}/{len(photo.from_album)}]), '
+               f'标题: [{photo.name}], '
+               f'图片数为[{len(photo)}]'
+               )
+
+    def after_photo(self, photo: JmPhotoDetail):
+        jm_log('photo.after',
+               f'章节下载完成: [{photo.id}] ({photo.album_id}[{photo.index}/{len(photo.from_album)}])')
+
+    def before_image(self, image: JmImageDetail, img_save_path):
+        if image.exists and image.cache:
+            jm_log('image.before',
+                   f'图片已存在: {image.tag} ← [{img_save_path}]'
+                   )
+            return
+        jm_log('image.before',
+               f'图片准备下载: {image.tag}, [{image.img_url}] → [{img_save_path}]'
+               )
+
+    def after_image(self, image: JmImageDetail, img_save_path):
+        jm_log('image.after',
+               f'图片下载完成: {image.tag}, [{image.img_url}] → [{img_save_path}]')
+
+
+class BaseDownloader(DownloadCallback):
+    """
+    不含 I/O 调度的公共基类，负责回调、钩子、Features 注册等无 I/O 通用逻辑。
+    """
+
+    def __init__(self, option: JmOption):
+        self.option = option
+        self.client = None
+        # 下载成功的记录dict
+        self.download_success_dict: Dict[JmAlbumDetail, Dict[JmPhotoDetail, List[Tuple[str, JmImageDetail]]]] = {}
+        # 下载失败的记录list
+        self.download_failed_image: List[Tuple[JmImageDetail, BaseException]] = []
+        self.download_failed_photo: List[Tuple[JmPhotoDetail, BaseException]] = []
+        # 每次顶层下载对应的聚合清单
+        self.manifest_dict: Dict[DetailEntity, DownloadManifest] = {}
+        # 当前顶层下载注册的 Feature 列表
+        self._feature_list: List = []
+
+    def do_filter(self, detail: DetailEntity):
+        """
+        该方法可用于过滤本子/章节，默认不会做过滤。
+        例如:
+        只想下载 本子的最新一章，返回 [album[-1]]
+        只想下载 章节的前10张图片，返回 [photo[:10]]
+
+        :param detail: 可能是本子或者章节，需要自行使用 isinstance / detail.is_xxx 判断
+        :returns: 只想要下载的 本子的章节 或 章节的图片
+        """
+        return detail
+
+    @property
+    def all_success(self) -> bool:
+        """
+        是否成功下载了全部图片
+
+        该属性需要等到downloader的全部download_xxx方法完成后才有意义。
+
+        注意！如果使用了filter机制，例如通过filter只下载3张图片，那么all_success也会为False
+        """
+        if self.has_download_failures:
+            return False
+
+        for album, photo_dict in self.download_success_dict.items():
+            if len(album) != len(photo_dict):
+                return False
+
+            for photo, image_list in photo_dict.items():
+                if len(photo) != len(image_list):
+                    return False
+
+        return True
+
+    @property
+    def has_download_failures(self):
+        return len(self.download_failed_image) != 0 or len(self.download_failed_photo) != 0
+
+    @property
+    def is_cancelled(self) -> bool:
+        return JTC.is_cancelled()
+
+    @classmethod
+    def raise_if_cancelled(cls) -> None:
+        """在当前下载作用域已取消时抛出异常，子类可重写该检查点。"""
+        JTC.raise_if_cancelled()
+
+    # 下面是回调方法
+
+    def before_album(self, album: JmAlbumDetail):
+        self.raise_if_cancelled()
+        super().before_album(album)
+        self.download_success_dict.setdefault(album, {})
+        self.option.call_all_plugin(
+            'before_album',
+            album=album,
+            downloader=self,
+        )
+        self.raise_if_cancelled()
+
+    def after_album(self, album: JmAlbumDetail):
+        self.raise_if_cancelled()
+        super().after_album(album)
+        self.option.call_all_plugin(
+            'after_album',
+            album=album,
+            downloader=self,
+        )
+        self.raise_if_cancelled()
+        # 触发匹配 after_album 的 Feature
+        self._invoke_features_for('after_album', album=album, downloader=self)
+
+    def before_photo(self, photo: JmPhotoDetail):
+        self.raise_if_cancelled()
+        super().before_photo(photo)
+        self.download_success_dict.setdefault(photo.from_album, {})
+        self.download_success_dict[photo.from_album].setdefault(photo, [])
+        self.option.call_all_plugin(
+            'before_photo',
+            photo=photo,
+            downloader=self,
+        )
+        self.raise_if_cancelled()
+
+    def after_photo(self, photo: JmPhotoDetail):
+        self.raise_if_cancelled()
+        super().after_photo(photo)
+        self.option.call_all_plugin(
+            'after_photo',
+            photo=photo,
+            downloader=self,
+        )
+        self.raise_if_cancelled()
+        # 触发匹配 after_photo 的 Feature
+        self._invoke_features_for('after_photo', photo=photo, downloader=self)
+
+    def before_image(self, image: JmImageDetail, img_save_path):
+        self.raise_if_cancelled()
+        super().before_image(image, img_save_path)
+        self.option.call_all_plugin(
+            'before_image',
+            image=image,
+            downloader=self,
+        )
+        self.raise_if_cancelled()
+
+    def after_image(self, image: JmImageDetail, img_save_path):
+        # 1. 记录下载成功图片
+        photo = image.from_photo
+        album = photo.from_album
+        self.download_success_dict[album][photo].append((image.save_path, image))
+
+        # 2. 日志回调
+        super().after_image(image, img_save_path)
+
+        # 3. 检查取消
+        self.raise_if_cancelled()
+
+        # 4. 插件回调
+        self.option.call_all_plugin(
+            'after_image',
+            image=image,
+            downloader=self,
+        )
+
+    def begin_manifest(self, detail: DetailEntity) -> DownloadManifest:
+        manifest = DownloadManifest()
+        self.manifest_dict[detail] = manifest
+        return manifest
+
+    def resolve_manifest_detail(self, detail: DetailEntity) -> Optional[DetailEntity]:
+        if detail in self.manifest_dict:
+            return detail
+
+        if detail.is_photo() and detail.from_album in self.manifest_dict:
+            return detail.from_album
+
+        return None
+
+    def record_export_filepath(self, detail: DetailEntity, filepath: str) -> None:
+        manifest_detail = self.resolve_manifest_detail(detail)
+        if manifest_detail is None:
+            from .jm_toolkit import ExceptionTool
+            ExceptionTool.raises(f'当前实体没有活动的下载清单: {detail}')
+
+        suffix = os.path.splitext(filepath)[1].lower().lstrip('.')
+        if suffix == '':
+            return
+
+        manifest = self.manifest_dict[manifest_detail]
+        manifest.export_filepath_dict.setdefault(suffix, []).append(filepath)
+
+    def finish_manifest(self, detail: DetailEntity) -> DownloadManifest:
+        manifest = self.manifest_dict[detail]
+        if detail.is_album():
+            success_dict = self.download_success_dict.get(detail, {})
+            success_groups = [
+                success_list
+                for _, success_list in sorted(
+                    success_dict.items(),
+                    key=lambda item: item[0].index,
+                )
+            ]
+        else:
+            success_groups = [
+                self.download_success_dict.get(detail.from_album, {}).get(detail, [])
+            ]
+
+        manifest.image_filepath_list = [
+            image.save_path
+            for success_list in success_groups
+            for _, image in sorted(success_list, key=lambda item: item[1].index)
+        ]
+        return manifest
+
+    @staticmethod
+    def _require_feature_context() -> str:
+        from .jm_toolkit import ExceptionTool
+
+        download_type = JTC.get_context_value('download_type')
+        ExceptionTool.require_true(
+            download_type in ('album', 'photo'),
+            'Feature 注册与执行必须位于下载任务上下文中，请使用 '
+            "jm_task_context(download_type='album') 或 "
+            "jm_task_context(download_type='photo') 进行包裹",
+        )
+        return download_type
+
+    def add_features(self, features):
+        """
+        为当前顶层下载注册 Feature。
+
+        :param features: Feature / FeatureChain / list / None
+        """
+        if features is None:
+            return
+
+        from .jm_feature import FeatureChain, Feature
+        from .jm_toolkit import ExceptionTool
+        self._require_feature_context()
+
+        if isinstance(features, list):
+            for f in features:
+                self.add_features(f)
+        elif isinstance(features, FeatureChain):
+            for f in features.to_list():
+                self._feature_list.append(f)
+        elif isinstance(features, Feature):
+            self._feature_list.append(features)
+        else:
+            ExceptionTool.raises(f'不支持的 extra 类型: {type(features)}，请传入 Feature / FeatureChain / list / None')
+
+    def _invoke_features_for(self, when: str, **kwargs):
+        """
+        在指定钩子(when)中触发匹配的 Feature。
+
+        :param when: 当前钩子名，如 'after_album', 'after_photo'
+        :param kwargs: album, photo, downloader 等上下文
+        """
+        if len(self._feature_list) == 0:
+            return
+
+        download_type = self._require_feature_context()
+        for feature in self._feature_list:
+            self.raise_if_cancelled()
+            if feature.should_invoke(when):
+                try:
+                    feature.invoke(self.option, when=when, **kwargs)
+                except DownloadCancelledException:
+                    raise
+                except Exception as e:
+                    jm_log('downloader.feature.exception',
+                           f'Feature执行失败: [{feature}], 下载类型: [{download_type}], 异常: [{e}]',
+                           e)
+        self.raise_if_cancelled()
+
+    def raise_if_has_exception(self):
+        if not self.has_download_failures:
+            return
+        msg_ls = ['部分下载失败', '', '']
+
+        if len(self.download_failed_photo) != 0:
+            msg_ls[1] = f'共{len(self.download_failed_photo)}个章节下载失败: {self.download_failed_photo}'
+
+        if len(self.download_failed_image) != 0:
+            msg_ls[2] = f'共{len(self.download_failed_image)}个图片下载失败: {self.download_failed_image}'
+
+        ExceptionTool.raises(
+            '\n'.join(msg_ls),
+            {ExceptionTool.CONTEXT_KEY_DOWNLOADER: self},
+            PartialDownloadFailedException,
+        )
+
+
+class DownloadResult(NamedTuple):
+    """单个下载结果。
+
+    支持解包：album, dler = download_album(id)
+    也支持属性访问：result.detail, result.downloader
+    NamedTuple 是 tuple 子类，isinstance(result, tuple) 为 True。
+    """
+    detail: DetailEntity
+    downloader: BaseDownloader
+
+    @property
+    def manifest(self) -> DownloadManifest:
+        return self.downloader.manifest_dict[self.detail]
+
+    @property
+    def duration(self) -> Optional[float]:
+        """顶层下载耗时，单位：秒。"""
+        return self.manifest.duration
+
+    @property
+    def album(self):
+        """下载的本子实体。"""
+        from .jm_entity import JmAlbumDetail
+        if isinstance(self.detail, JmAlbumDetail):
+            return self.detail
+        return getattr(self.detail, 'from_album', None)
+
+    @property
+    def photo(self):
+        """下载的章节实体（若为章节下载）。"""
+        from .jm_entity import JmPhotoDetail
+        if isinstance(self.detail, JmPhotoDetail):
+            return self.detail
+        return None
+
+
+class BatchResult:
+    """批量下载结果集。
+
+    保持 FIFO 插入顺序，兼容 for album, dler in result 遍历与解包。
+    支持按车号检索：result[aid], result.get(aid), aid in result。
+    """
+
+    def __init__(self):
+        self.succeeded = []
+        self.failed: Dict[str, BaseException] = {}
+        self._id_map = {}
+
+    def add(self, item, aid=None) -> None:
+        self.succeeded.append(item)
+        if aid is None:
+            detail = getattr(item, 'detail', item)
+            aid = getattr(detail, 'id', None)
+        if aid is not None:
+            self._id_map[str(aid).strip()] = item
+
+    def get(self, aid, default=None):
+        """按车号安全获取成功结果。"""
+        return self._id_map.get(str(aid).strip(), default)
+
+    def __getitem__(self, aid):
+        """按车号下标获取成功结果，不存在抛 KeyError。"""
+        key = str(aid).strip()
+        if key in self._id_map:
+            return self._id_map[key]
+        raise KeyError(aid)
+
+    def __contains__(self, item) -> bool:
+        """支持车号判断 ('123' in result / 123 in result)，亦向下兼容实体判断。"""
+        if isinstance(item, (str, int)) and str(item).strip() in self._id_map:
+            return True
+        return item in self.succeeded
+
+    def __iter__(self):
+        return iter(self.succeeded)
+
+    def __len__(self) -> int:
+        return len(self.succeeded)
+
+    @property
+    def all_succeeded(self) -> bool:
+        return len(self.failed) == 0
+
+    @property
+    def total(self) -> int:
+        return len(self.succeeded) + len(self.failed)
+
+    def __repr__(self) -> str:
+        return f'<BatchResult: {len(self.succeeded)} succeeded, {len(self.failed)} failed>'
+
+
+class JmDownloader(BaseDownloader):
+    """
+    JmDownloader = BaseDownloader + 同步 I/O 调度逻辑
+    """
+
+    def __init__(self, option: JmOption):
+        super().__init__(option)
+        self.client = self.create_client()
+
+    def create_client(self):
+        """
+        创建该downloader使用的client。
+        """
+        return self.option.build_jm_client()
+
+    @record_download_duration('album_started_at')
+    def download_album(self, album_id):
+        self.raise_if_cancelled()
+        album = self.client.get_album_detail(album_id)
+        self.raise_if_cancelled()
+        self.begin_manifest(album)
+        try:
+            self.download_by_album_detail(album)
+        finally:
+            self.finish_manifest(album)
+        return album
+
+    @record_download_duration('album_started_at')
+    def download_by_album_detail(self, album: JmAlbumDetail):
+        album.save_path = self.option.dir_rule.decide_album_root_dir(album)
+        self.before_album(album)
+        if album.skip:
+            return
+        self.execute_on_condition(
+            iter_objs=album,
+            apply=self.download_by_photo_detail,
+            count_batch=self.option.decide_photo_batch_count(album),
+            level=JmRuntime.LEVEL_PHOTO,
+        )
+        self.after_album(album)
+
+    @record_download_duration('photo_started_at')
+    def download_photo(self, photo_id):
+        self.raise_if_cancelled()
+        photo = self.client.get_photo_detail(photo_id)
+        self.raise_if_cancelled()
+        self.begin_manifest(photo)
+        try:
+            self.download_by_photo_detail(photo)
+        finally:
+            self.finish_manifest(photo)
+        return photo
+
+    @catch_exception
+    @record_download_duration('photo_started_at')
+    def download_by_photo_detail(self, photo: JmPhotoDetail):
+        photo.save_path = self.option.decide_image_save_dir(photo)
+        self.client.check_photo(photo)
+        self.before_photo(photo)
+        if photo.skip:
+            return
+        self.execute_on_condition(
+            iter_objs=photo,
+            apply=self.download_by_image_detail,
+            count_batch=self.option.decide_image_batch_count(photo),
+            level=JmRuntime.LEVEL_IMAGE,
+        )
+        self.after_photo(photo)
+
+    @catch_exception
+    @record_download_duration('image_started_at')
+    def download_by_image_detail(self, image: JmImageDetail):
+        img_save_path = self.option.decide_image_filepath(image)
+        image.save_path = img_save_path
+        image.exists = file_exists(img_save_path)
+        image.cache = self.option.decide_download_cache(image)
+
+        self.before_image(image, img_save_path)
+        if image.skip:
+            return
+
+        if image.cache and image.exists:
+            self.after_image(image, img_save_path)
+            return
+
+        decode_image = self.option.decide_download_image_decode(image)
+        self.client.download_by_image_detail(
+            image,
+            img_save_path,
+            decode_image=decode_image,
+        )
+
+        self.after_image(image, img_save_path)
+
+    def execute_on_condition(self, iter_objs, apply, count_batch, level=None):
+        """使用当前 Runtime 调度本子或章节的下载。"""
+        runtime = JTC.get_runtime()
+        ExceptionTool.require_true(
+            runtime is None or isinstance(runtime, JmSyncRuntime),
+            'sync downloader requires JmSyncRuntime',
+        )
+
+        iter_objs = self.do_filter(iter_objs)
+        if len(iter_objs) == 0:
+            return
+
+        ExceptionTool.require_true(
+            not isinstance(count_batch, bool) and isinstance(count_batch, int) and count_batch > 0,
+            f'local download limit must be > 0, got {count_batch!r}',
+        )
+
+        self.raise_if_cancelled()
+
+        if runtime is not None and level is not None and runtime.has_executor(level):
+            runtime.multi_thread_launcher(
+                iter_objs=iter_objs,
+                apply_each_obj_func=bind_jm_task_context(apply),
+                level=level,
+            )
+        else:
+            with JmTempRuntime(workers=count_batch) as temp_launcher:
+                temp_launcher.multi_thread_launcher(
+                    iter_objs=iter_objs,
+                    apply_each_obj_func=bind_jm_task_context(apply),
+                )
+
+        # 批处理线程等待结束后，统一在此处检查取消状态
+        self.raise_if_cancelled()
+
+    # 下面是对with语法的支持
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            jm_log('dler.exception',
+                   f'{self.__class__.__name__} Exit with exception: {exc_type, str(exc_val)}'
+                   )
+
+    @classmethod
+    def use(cls, *args, **kwargs):
+        """
+        让本类替换JmModuleConfig.CLASS_DOWNLOADER
+        """
+        before_class = JmModuleConfig.downloader_class()
+        JmModuleConfig.CLASS_DOWNLOADER = cls
+        after_class = JmModuleConfig.downloader_class()
+        jm_log(
+            'downloader.use',
+            f'替换 Downloader class: '
+            f'[{before_class.__module__}.{before_class.__qualname__}] -> '
+            f'[{after_class.__module__}.{after_class.__qualname__}]'
+        )
+
+
+class DoNotDownloadImage(JmDownloader):
+    """
+    不会下载任何图片的Downloader，用作测试
+    """
+
+    def download_by_image_detail(self, image: JmImageDetail):
+        # ensure make dir
+        self.option.decide_image_filepath(image)
+
+
+class JustDownloadSpecificCountImage(JmDownloader):
+    """
+    只下载特定数量图片的Downloader，用作测试
+    """
+    from threading import Lock
+
+    count_lock = Lock()
+    count = 0
+
+    @catch_exception
+    def download_by_image_detail(self, image: JmImageDetail):
+        # ensure make dir
+        self.option.decide_image_filepath(image)
+
+        if self.try_countdown():
+            return super().download_by_image_detail(image)
+
+    def try_countdown(self):
+        if self.count < 0:
+            return False
+
+        with self.count_lock:
+            if self.count < 0:
+                return False
+
+            self.count -= 1
+
+            return self.count >= 0
+
+    @classmethod
+    def use(cls, count):
+        cls.count = count
+        super().use()

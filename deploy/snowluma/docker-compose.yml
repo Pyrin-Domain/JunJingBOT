@@ -1,0 +1,74 @@
+# SnowLuma（OneBot v11 协议端）容器编排
+#
+#   在 WSL 里执行：
+#     cd /mnt/d/Code/JungJingNew/deploy/snowluma
+#     docker compose up -d
+#
+# 端口：
+#   6081  noVNC 远程桌面（首次扫码登录 QQ）
+#   5099  SnowLuma WebUI
+#   3000  OneBot HTTP（备用，正向模式才需要）
+#   3001  OneBot WebSocket（备用，正向模式才需要）
+#
+# 反向模式（默认，推荐）下 run.py 监听 8085，由容器里的 SnowLuma 主动连出来，
+# 所以 3000 / 3001 不参与连接；保留映射只是方便切到正向模式时直接用。
+
+services:
+  snowluma:
+    image: ${SNOWLUMA_IMAGE:-motricseven7/snowluma:latest}
+    container_name: snowluma
+    restart: unless-stopped
+
+    # QQ 基于 Chromium：共享内存太小会白屏 / 崩。
+    shm_size: 1gb
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 1048576
+
+    # 这两项不能省：hook 要 ptrace 注入到 QQ 进程。
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+
+    environment:
+      TZ: Asia/Shanghai
+      # 留空则首次启动随机生成，用 docker logs snowluma | grep 远程桌面密码 查
+      VNC_PASSWD: ${VNC_PASSWD:-}
+      SNOWLUMA_UID: ${SNOWLUMA_UID:-1000}
+      SNOWLUMA_GID: ${SNOWLUMA_GID:-1000}
+      SNOWLUMA_WEBUI_HOST: 0.0.0.0
+      SNOWLUMA_WEBUI_PORT: 5099
+      SNOWLUMA_LOG_LEVEL: ${SNOWLUMA_LOG_LEVEL:-info}
+      SNOWLUMA_SCREEN: 1920x1080x24
+      # 1 = 自动把 hook 注入新发现的 QQ 进程（容器内默认开启）
+      SNOWLUMA_HOOK_AUTOLOAD: "1"
+      SNOWLUMA_QQ_FLAGS: "--disable-gpu --disable-software-rasterizer --disable-gpu-compositing"
+
+    ports:
+      - "${NOVNC_PORT:-6081}:6081"
+      - "${WEBUI_PORT:-5099}:5099"
+      - "${ONEBOT_HTTP_PORT:-3000}:3000"
+      - "${ONEBOT_WS_PORT:-3001}:3001"
+
+    # 关键：让容器里的 SnowLuma 能用 host.docker.internal 指向 WSL 宿主（Windows）。
+    # WSL 内的 Docker Engine 不自带 host.docker.internal，靠 host-gateway 补。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # ── SnowLuma 自己的三份数据，别删，删了要重新登录 ──
+      - qq-gateway-data:/app/data          # config/onebot.json、runtime.json
+      - qq-client-config:/app/.config      # QQ 客户端配置
+      - qq-client-data:/app/.local/share   # QQ 登录态 / 缓存
+      # ── Bot 项目目录：让协议端能读到 Windows 侧的文件（发图/发视频兜底） ──
+      - ${BOT_MOUNT:-/mnt/d/Code/JungJingNew}:/botdata
+
+volumes:
+  qq-gateway-data:
+    name: qq-gateway-data
+  qq-client-config:
+    name: qq-client-config
+  qq-client-data:
+    name: qq-client-data

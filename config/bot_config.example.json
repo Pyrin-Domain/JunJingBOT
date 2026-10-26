@@ -1,0 +1,349 @@
+{
+  "master_qq": [
+    "10001"
+  ],
+  "heartbeat": {
+    "min_minutes": 10,
+    "max_minutes": 20
+  },
+  "agent": {
+    "enable": true,
+    "persona_file": "agent/personas/junjing.md",
+    "persona_core_file": "agent/personas/core_qq.md",
+    "models": [
+      {
+        "name": "glm",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "api_key": "",
+        "api_key_env": "ZHI_PU_API_KEY",
+        "model": "glm-4-flash",
+        "temperature": 1,
+        "max_tokens": null,
+        "id": "m1"
+      },
+      {
+        "name": "openrouter",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "api_key": "",
+        "api_key_env": "ZHIPU_API_KEY",
+        "model": "glm-4-flash",
+        "temperature": null,
+        "max_tokens": null,
+        "id": "m2"
+      },
+      {
+        "name": "",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "api_key": "",
+        "api_key_env": "ZHIPU_API_KEY",
+        "model": "glm-4-flash",
+        "temperature": null,
+        "max_tokens": null,
+        "id": "m3"
+      }
+    ],
+    "active_model": "m1",
+    "judge_model": "m1",
+    "fallback_models": [],
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "api_key": "",
+    "api_key_env": "ZHI_PU_API_KEY",
+    "model": "glm-4-flash",
+    "temperature": 0.7,
+    "max_tokens": null
+  },
+  "message": {
+    "extraconfig": {
+      "tokenizer": false,
+      "recent": true
+    }
+  },
+  "meme": {
+    "enable": true,
+    "path": "data/memes.json",
+    "prompt_limit": 0
+  },
+  "emoji": {
+    "collect_group_id": 20001
+  },
+  "relations": {
+    "enable": true,
+    "data_dir": "data/relations",
+    "master_label": "主人",
+    "max_people": 6,
+    "max_chars": 1200,
+    "max_person_chars": 320,
+    "state_ttl_hours": 72,
+    "state_max_hours": 168,
+    "self_ttl_hours": 12,
+    "max_states": 6,
+    "max_memories": 30,
+    "max_labels": 8,
+    "auto_extract": true,
+    "auto_every": 8,
+    "auto_extract_min_seconds": 600
+  },
+  "interject": {
+    "enable": true,
+    "frequent": 10,
+    "extra_history": 5,
+    "idle_minutes": 30,
+    "cooldown_minutes": 1,
+    "hot_minutes": 10,
+    "hot_frequent": 1,
+    "hot_idle_minutes": 1,
+    "groups": [],
+    "blacklist_groups": [
+      20004,
+      20003
+    ],
+    "aliases": [
+      "君景",
+      "独角兽"
+    ],
+    "interests": {
+      "high": [
+        "女装",
+        "独角兽",
+        "男娘",
+        "可爱",
+        "小裙子"
+      ],
+      "low": [
+        "作业",
+        "考试",
+        "报错"
+      ]
+    }
+  },
+  "auto_forward": {
+    "enable": true,
+    "groupid_list": [
+      20002,
+      20003,
+      20005,
+      20006,
+      20004,
+      20007,
+      20008
+    ],
+    "target_groupid": [
+      20003,
+      20002,
+      20004
+    ],
+    "userid_list": [],
+    "task_userid": [],
+    "dedup": true,
+    "auto_img_forward_from_bot": {
+      "enable": true,
+      "bot_list": [
+        {
+          "bot_id": 10005,
+          "type": "all",
+          "group_id": [],
+          "user_id_list": []
+        },
+        {
+          "bot_id": 10006,
+          "type": "all",
+          "group_id": [],
+          "user_id_list": []
+        },
+        {
+          "bot_id": 10007,
+          "type": "all",
+          "group_id": [],
+          "user_id_list": []
+        },
+        {
+          "bot_id": 10001,
+          "type": "private",
+          "group_id": []
+        },
+        {
+          "bot_id": 10008,
+          "type": "group",
+          "group_id": []
+        }
+      ]
+    },
+    "strip_tail_ads": {
+      "enable": false,
+      "scan_tail": 3,
+      "drop_qr": true,
+      "drop_group_card": true,
+      "drop_link": true,
+      "image_timeout": 8,
+      "append": {
+        "enable": false,
+        "items": [
+          {
+            "uin": 10004,
+            "name": "N552AA🍥🍜🍣🍕💊🍫",
+            "content": "独角兽君景搬运喵~"
+          }
+        ]
+      }
+    }
+  },
+  "image_forward": {
+    "auto_target_group_ids": [
+      20003,
+      20002,
+      20005
+    ]
+  },
+  "jm": {
+    "enable": true,
+    "note": "占位：返回本地占位图，不抓取；/jm 只在私聊回执，不发群"
+  },
+  "prompts": {
+    "group_context": "",
+    "private_context": "",
+    "history_command_regex": "^历史"
+  },
+  "replies": {
+    "forwarded_already": "[发过了喵]",
+    "network_upgrade": "校园网升级，校园网助手取消"
+  },
+  "web_panel": {
+    "enable": true,
+    "host": "127.0.0.1",
+    "port": 8390,
+    "token": ""
+  },
+  "keyword_actions": [
+    {
+      "regex": "(男娘|南梁|nn)",
+      "action": "send_message",
+      "params": {
+        "message": "哪有男娘",
+        "filter": {
+          "type": "ban",
+          "data": [
+            "20014",
+            "20001"
+          ]
+        }
+      }
+    },
+    {
+      "regex": "女装",
+      "action": "send_message",
+      "params": {
+        "message": [
+          "看看女装",
+          "羡慕女装"
+        ]
+      }
+    },
+    {
+      "regex": "(月抛|约炮|(月|约|🈷️)(吗|么|嘛|🐴|🐎))",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/月抛找我.png",
+        "summary": "月抛找我"
+      }
+    },
+    {
+      "regex": "妈妈(?!])",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/妈妈.gif",
+        "summary": "妈妈"
+      }
+    },
+    {
+      "regex": "老大(?!])",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/老大.gif",
+        "summary": "老大？"
+      }
+    },
+    {
+      "regex": "抱",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/要抱.gif",
+        "summary": "要抱"
+      }
+    },
+    {
+      "regex": "(jjcn|dsn|dkn|顶死你|顶哭你|((jj|唧唧)(草|凿|燥|糙)(你|泥)))",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/速来.jpg",
+        "summary": "速来"
+      }
+    },
+    {
+      "regex": "(看看脚|白丝)",
+      "action": "send_img",
+      "params": {
+        "img_addr": "{imgs_dir}/脚.gif",
+        "summary": "脚"
+      }
+    },
+    {
+      "regex": "historydebug",
+      "action": "get_long_history_test",
+      "params": {}
+    },
+    {
+      "regex": "export",
+      "action": "export",
+      "params": {}
+    },
+    {
+      "regex": "recall",
+      "action": "recall",
+      "params": {}
+    },
+    {
+      "regex": "set_tokenizer",
+      "action": "set_tokenizer",
+      "params": {}
+    },
+    {
+      "regex": "ocr",
+      "action": "ocr",
+      "params": {}
+    },
+    {
+      "regex": "img_fd ",
+      "action": "img_forward_create_task",
+      "params": {}
+    },
+    {
+      "regex": "fabric",
+      "action": "fabric",
+      "params": {}
+    },
+    {
+      "regex": "(我想听|MUSIC_GET|GETMUSIC)",
+      "action": "get_music",
+      "params": {}
+    },
+    {
+      "regex": "^\\s*/jm\\b",
+      "action": "jm",
+      "params": {}
+    },
+    {
+      "regex": "(#napcat|#sl)",
+      "action": "send_message",
+      "params": {
+        "message": [
+          {
+            "type": "text",
+            "data": {
+              "text": "JunJingBot信息\n大家好，我是君景（二号机）\n因为 是 二号，固 为 继伯（jibo），\n伯 为 次序第一，\n继伯 便 是 继伯之志，次序第二。\n然后 因为 是 机器人，\n又 取 主 字辈 德 收尾。\n内部代号：机·继伯·德 (GG Bond)"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

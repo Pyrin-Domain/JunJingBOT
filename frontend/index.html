@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>君景 Bot 参数面板</title>
+  <!-- 相对路径：由后端托管（/）和 python -m http.server（frontend/）都能直接打开 -->
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">君</span>
+      <div class="brand-text">
+        <h1>Bot 参数面板</h1>
+        <div class="sub" id="configPath">加载中…</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="state" id="stateBadge">未修改</span>
+      <button class="btn ghost" id="btnReload" type="button">加载配置</button>
+      <button class="btn primary" id="btnSave" type="button">保存并热加载</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <div class="layout">
+    <nav class="tabs" id="tabs"></nav>
+    <main id="panels"></main>
+  </div>
+
+  <footer class="foot">
+    参数写入 <code>config/bot_config.json</code>；保存后热加载，关键词 / 搬运 / 文案下一条消息生效。
+    若已在外部编辑了配置文件，可点击“加载配置”直接重新读取并应用；
+    <code>web_panel.*</code> 与「连接方式」（<code>config/config.json</code>）仍需重启 Bot；<code>agent.*</code> 保存后会热重建。
+  </footer>
+
+  <noscript>这个面板需要启用 JavaScript。</noscript>
+  <script type="module" src="assets/js/app.js"></script>
+</body>
+</html>

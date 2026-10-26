@@ -1,0 +1,11 @@
+{
+  "bot_env": "windows",
+  "backend_env": "windows",
+  "path_profile": "same",
+  "wsl_distro": "Ubuntu",
+  "wsl_mount_root": "/mnt",
+  "imgs_dir": "imgs",
+  "downloads_dir": "data/downloads",
+  "temp_dir": "data/tmp",
+  "path_map": []
+}

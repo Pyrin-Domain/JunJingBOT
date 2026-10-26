@@ -1,0 +1,11 @@
+curl_cffi
+commonX
+PyYAML
+Pillow
+psutil
+pycryptodome
+requests
+rich
+jm-view-server
+zhconv
+img2pdf

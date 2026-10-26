@@ -1,0 +1,10 @@
+{
+  "type": "ws_re",
+  "backend": "snowluma",
+  "access_token": "YOUR_ONEBOT_TOKEN",
+  "ws_reverse_host": "127.0.0.1",
+  "ws_reverse_port": 8085,
+  "ws_reverse_strict_token": true,
+  "ws_host": "127.0.0.1",
+  "ws_port": 3001
+}

@@ -1,0 +1,18 @@
+JungJingNew
+===========
+
+本项目中包含第三方开源项目的代码，特此声明：
+
+1. JMComic-Crawler-Python
+   https://github.com/hect0x7/JMComic-Crawler-Python
+   MIT License
+   Copyright (c) 2023 hect0x7
+
+   位置：Extension/jm_crawer/（vendored 副本，未修改源码）
+   许可证全文：Extension/jm_crawer/LICENSE
+   调用点：download_system/providers/jm.py -> Extension.get_jmcomic_pdf()
+
+   本仓库不包含该项目的下载产物（Extension/jm_crawer/download/ 已忽略），
+   也不分发其抓取到的任何内容。
+
+本项目的其余部分源自作者自己的旧项目 Pyrin-Domain/JunJingBOT（行为等价重写）。

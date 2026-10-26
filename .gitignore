@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+.venv_win/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ── 敏感配置：仓库里只放 *.example.json ──
+config/config.json
+config/bot_config.json
+config/environment.json
+config/sender_config.json
+config/*.bak-*
+.env
+*.env.local
+
+# ── 本机数据 / 日志 / 会话 ──
+.workbuddy/
+data/
+logs/
+*.log
+*.db
+*.db-wal
+*.db-shm
+forward_dedup_log.jsonl
+
+# ── 私密图片与归档 ──
+imgs/dress/
+*.zip
+*.7z
+*.rar
+
+# ── 个人角色卡：仓库里只放 junjing.example.md ──
+agent/personas/junjing.md
+
+# ── 第三方 vendored 项目的下载产物（内容不入库）──
+Extension/jm_crawer/download/
+
+# 临时
+*.tmp
+.tmp/

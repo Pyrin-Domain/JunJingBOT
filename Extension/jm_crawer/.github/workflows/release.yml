@@ -1,0 +1,42 @@
+# manually release and publish from master
+name: Manual Release & Publish
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Manually release `jmcomic`
+    if: github.ref_name == 'master'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build Release Metadata
+        id: tb
+        run: |
+          python .github/release.py
+
+      - name: Build
+        run: |
+          python -m pip install build
+          python -m build
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tb.outputs.tag }}
+          body_path: release_body.txt
+
+      - name: Release PYPI
+        uses: pypa/gh-action-pypi-publish@release/v1

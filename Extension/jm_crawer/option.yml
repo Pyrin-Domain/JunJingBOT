@@ -1,0 +1,34 @@
+client:
+  async_impl: async_api
+  cache: null
+  domain: []
+  impl: api
+  postman:
+    meta_data:
+      headers: null
+      impersonate: chrome
+      proxies: {}
+    type: curl_cffi
+  retry_times: 5
+dir_rule:
+  base_dir: D:\Code\JungJingNew\Extension\jm_crawer\download\imgs
+  normalize_zh: null
+  rule: Bd_Aid
+download:
+  cache: true
+  image:
+    decode: true
+    suffix: null
+  threading:
+    image: 20
+    photo: 32
+log: true
+plugins:
+  dependencies_strategy: failed-fast
+  valid: log
+  after_album:
+    - plugin: img2pdf
+      kwargs:
+        pdf_dir: D:\Code\JungJingNew\Extension\jm_crawer\download\Pdf
+        filename_rule: Aid
+version: '2.1'

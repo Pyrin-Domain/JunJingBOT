@@ -1,0 +1,19 @@
+websockets>=15.0
+langchain-openai>=0.3
+langchain-core>=0.3
+langgraph>=1.0
+langchain>=1.0
+jieba>=0.42
+Pillow>=10.0
+aiohttp>=3.9
+requests>=2.32
+# 转发末尾广告裁剪：识别二维码（缺失时自动跳过二维码判定，其余规则照常）
+opencv-python>=4.8
+numpy>=1.24
+# JM 下载转 PDF：jmcomic 的 export_pdf(img2pdf) 插件运行期依赖
+# 加密 PDF 还需要 pikepdf，由 img2pdf 自动带入
+img2pdf>=0.6
+
+# 测试
+pytest>=8.0
+pytest-asyncio>=0.23
