@@ -51,6 +51,7 @@ python run.py
 | `PROJECT_DESIGN.md` | 总设计、模块树、数据流、迁移计划 |
 | `docs/CONFIG.md` | 配置项 + WSL/Windows 路径转换 |
 | `docs/RELATIONS.md` | 人设文件 + 每个人的关系标签 / 画像 / 近期状态 / 记忆 |
+| `docs/PSYCHOLOGY.md` | 心理分析：独立模型、三档图片策略、过滤门边界 |
 | `docs/SNOWLUMA.md` | SnowLuma 接入、端口 / token / 历史游标差异 |
 | `docs/DEVELOPMENT.md` | 怎么跑、怎么加功能、怎么调试 |
 | `docs/MIGRATION.md` | 旧代码 → 新代码对照、验收清单 |

@@ -74,7 +74,8 @@ pytest                         # 跑测试
 3. **数据结构与渲染分离**
    - `messaging/models.py` 只定义 `ChatMessage` / `ChatContext` 等结构。
    - `ChatContext.render()` 是纯函数，可重复调用，不产生副作用。
-   - 图片 URL 不进提示词；只留 `[图片]`，OCR 时按 `source + index` 从结构体解析。
+   - 图片 URL 不进提示词；图片只留 `[图片]`，表情留 `[表情:名字]` / `[表情]`（表情不是图片，
+     没有可看的画面，也不该进 OCR），OCR 时按 `source + index` 从结构体解析。
 
 4. **路径只在一个地方转换**
    - 业务代码永远拿到“本机可用路径”。
@@ -159,6 +160,15 @@ JungJingNew/
 │  ├─ image_hash.py             # ahash / dhash / 远程图片哈希
 │  └─ service.py                # MediaService：OCR、图片转发、B站发送的粘合层
 │
+├─ Extension/                   # 内嵌的第三方开源仓库（见各自的 VENDOR.md）
+│  ├─ __init__.py               # 惰性导出（启动不加载重型解析器）
+│  ├─ jm_crawer/                # JM 漫画
+│  └─ bilibilidownloadtool/     # B 站解析 / 下载（PyQt5 程序的无界面裁剪版）
+│     ├─ api.py                 # 唯一桥接层：BiliClient.parse / download
+│     ├─ utils.py               # 上游 core/utils.py 的无 Qt 替代
+│     ├─ core/ parsers/         # 上游源码（GUI 已裁掉）
+│     └─ VENDOR.md              # 来源 commit / 裁剪清单 / 升级步骤
+│
 ├─ download_system/             # 下载服务（用户要求的重点模块）
 │  ├─ __init__.py               # 公开：DownloadService / DownloadPool / DownloadTask
 │  ├─ task.py                   # 任务状态、结果、错误
@@ -192,7 +202,8 @@ JungJingNew/
 │     ├─ dedup.py               # SQLite 去重库（schema/hash 完全兼容旧库）
 │     ├─ dedup_rebuild.py       # 从日志重建
 │     ├─ range_task.py          # -b / -e 跨消息区间
-│     └─ interject.py           # 群聊主动插话
+│     ├─ interject.py           # 群聊主动插话
+│     └─ psychology.py          # 心理分析：关键词 → 回复/记录展开 → 过滤门 → 独立模型
 │
 ├─ agent/                       # LLM Agent
 │  ├─ __init__.py               # 公开：QQBotAgent
@@ -206,6 +217,7 @@ JungJingNew/
 │  ├─ hints.py                  # build_action_hint / 女装照判定
 │  ├─ logger.py                 # Agent/logs/日期.json
 │  ├─ campus.py                 # CampusAssistant
+│  ├─ psychology.py             # 心理分析：独立模型 + 三档图片策略（原样发图/仅OCR/辅助视觉）
 │  └─ tools/
 │     ├─ __init__.py            # build_tools(...)
 │     ├─ registry.py            # 工具注册 + 调用缓存 + current_context
@@ -285,7 +297,8 @@ JungJingNew/
 | `transport` | `core`, `config`, `AbstractionLayer` | `messaging` / `bot` / `agent` |
 | `messaging` | `core`, `config`, `images` | `transport`（只依赖 API 协议接口）, `agent`, `bot` |
 | `media` | `core`, `config`, `images`, `download_system` | `bot`, `agent` |
-| `download_system` | `core`, `config` | `bot`, `messaging`, `agent` |
+| `download_system` | `core`, `config`, `Extension` | `bot`, `messaging`, `agent`, `web` |
+| `Extension` | 标准库 + 第三方依赖 | 项目内任何模块（保持可整体替换） |
 | `agent` | `core`, `config`, `messaging`, `media` | `bot`, `web` |
 | `bot` | 所有下层 | `web` |
 | `web` | `core`, `config`, `bot`（只读状态/调用 reload） | 不改业务逻辑 |
@@ -376,6 +389,22 @@ agent.runtime.chat(context)
 
 **约束**：下载的临时文件必须在 `finally` 清理；发送失败要回退文本；B 站发送必须用
 `images.to_backend(local_path)`，不能手写 `/mnt/...`。
+
+**B 站的实现分层**（`providers/bilibili.py`）：
+
+```text
+BilibiliProvider.download()
+  ├─ 链接提取 / 短链解析 / 标题封面  ← 本文件（轻量，每条消息的卡片都要用）
+  ├─ 新引擎：Extension.bilibilidownloadtool.BiliClient
+  │    ├─ parse()    → DASH 码流、画质列表、分P / 合集、登录态
+  │    ├─ download() → 视频轨 + 音频轨（分片并发 / 断点续传 / 多 CDN）
+  │    └─ merge_media() → ffmpeg copy 合流，优先 H.264
+  └─ 旧引擎：_download_legacy()   ← 仅当 Extension 加载失败时兜底
+```
+
+画质默认封顶 1080P（`DEFAULT_MAX_QN=80`），可用 `task.options["quality"]` /
+`["max_qn"]` 覆盖；偏好 H.264 是为了手机能直接播，且可以 `copy` 不转码。
+
 
 ### 5.5 网页面板保存
 
@@ -593,7 +622,7 @@ class WebServer:
 | `Minitor/NapCatTools.py` | `messaging/processor.py` + `history.py` + `forward.py` + `context_builder.py` + `media/` | 按职责拆 |
 | `Minitor/BOTMain.py` | `bot/app.py` + `pipeline.py` + `keyword.py` | 编排与业务分开 |
 | `Minitor/Commands.py` | `bot/commands/*` | 每个命令一个文件 |
-| `Minitor/ForwardService.py` | `bot/services/forward.py` + `media/service.py` | 搬运/媒体分离 |
+| `Minitor/ForwardService.py` | `bot/services/forward/` + `media/service.py` | 搬运/媒体分离 |
 | `Minitor/forward_dedup.py` | `bot/services/dedup.py` | 算法与 DB schema 不变 |
 | `Minitor/forward_dedup_rebuild.py` | `bot/services/dedup_rebuild.py` | |
 | `Minitor/RangeTaskService.py` | `bot/services/range_task.py` | |
@@ -632,6 +661,7 @@ class WebServer:
 - [ ] token 从 query / `Authorization` 读取；默认不严格校验
 - [ ] 反向连接新客户端会作废旧 pending 并关闭旧连接
 - [ ] 启动先起面板，再等 NapCat；断点恢复不阻塞
+- [ ] 往回翻恢复时，起翻用的 `latest` 自己也回放（Bot 自己发的除外，既不回放也不推进断点）
 - [ ] 心跳 10~20 分钟 `get_login_info`
 
 ### 消息
@@ -649,7 +679,7 @@ class WebServer:
 - [ ] 一行一条：`时:分 [message_id] 昵称(QQ,主人) 提及：正文`
 - [ ] 引用只留一行摘要，不递归
 - [ ] 历史转发只留 `【转发 N 条】`，当前消息才展开
-- [ ] 图片只留 `[图片]`，URL 不进提示词
+- [ ] 图片只留 `[图片]`，URL 不进提示词；表情留 `[表情:名字]` / `[表情]`，且不进 OCR 的图片池
 - [ ] 预算：历史 12 条 / 2000 字，单条 300 字，当前 800 字；超了标注省略
 - [ ] `ChatContext.directed_at_me` / `replies_to_me` / 提及解析
 - [ ] Agent 输出解析：`<status>` / `<<message>` / `<next>`，`continue` / `end`
@@ -675,10 +705,18 @@ class WebServer:
 - [ ] `img_fd -a` 用 `image_forward.auto_target_group_ids`
 
 ### 下载 / 媒体
-- [ ] B 站短链解析；`durl` 优先，否则 dash 最高 id；分段全部拼接
+- [ ] B 站短链解析；`durl` 优先，否则 dash 最高 id；分段全部拼接（旧引擎兜底路径）
+- [ ] 新引擎：`BiliClient.parse()` 拿到画质列表；`auto` 取不超过 `max_qn` 的最高画质
+- [ ] 新引擎：优先 H.264（codecid 7），不可用时 HEVC → AV1，并写进 `meta.warnings`
+- [ ] 新引擎：分片下载返回的临时路径被搬进 `data/tmp/<task_id>/`，`D:\_bili_cache` 不留残渣
+- [ ] 新引擎：输出文件 ffprobe 同时有 h264 视频轨和 aac 音频轨
+- [ ] 新引擎加载失败（缺 pycryptodome 等）时自动回退旧引擎，且只记一次错误
 - [ ] ffmpeg 合并失败回退无音频视频；ffprobe 只判断音轨
 - [ ] 临时文件 `finally` 清理
 - [ ] 发送本地视频前转 NapCat 路径；失败回退下载地址文本
+- [ ] 协议端 `retcode != 0` 会抛 `OneBotAPIError`（不能再把「上传失败」当成功）
+- [ ] 需要校验的动作按能力表 `strict_actions` 走（send / forward / poke / delete / ban / emoji），`get_*` 保持宽松
+- [ ] 群文件发送失败 → 重试一次 → 改发视频消息 → 才回退下载地址文本
 - [ ] 点歌只发 `record` 远程 URL，不下载
 - [ ] OCR：Windows 用 winrt 无置信度；Linux `chi_sim+eng`，`conf<=60` 标 `[?word]`
 - [ ] OCR 缓存按 URL、只存 text、TTL 3600s、128 条 LRU；错误不入缓存

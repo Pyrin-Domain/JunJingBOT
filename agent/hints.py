@@ -38,7 +38,7 @@ def _image_urls(event: Optional[dict]) -> list[str]:
     return urls
 
 
-# 工具里的图片来源别名：模型可能写中文或英文，统一成 current / quote / history
+# 工具里的图片来源别名：模型可能写中文或英文，统一成 current / quote / history / forward
 _IMAGE_SOURCE_ALIASES = {
     "current": "current", "now": "current", "self": "current",
     "当前": "current", "当前消息": "current", "这条": "current",
@@ -47,6 +47,11 @@ _IMAGE_SOURCE_ALIASES = {
     "history": "history", "hist": "history",
     "历史": "history", "历史消息": "history", "上一条": "history", "上一张": "history",
     "前面": "history", "之前": "history", "刚才": "history",
+    # 合并转发 / 聊天记录卡片里的图：先 read_forward 展开，再 ocr_img(source="forward")
+    "forward": "forward", "fwd": "forward", "card": "forward",
+    "转发": "forward", "转发里": "forward", "转发消息": "forward",
+    "卡片": "forward", "聊天记录": "forward", "聊天记录里": "forward",
+    "记录里": "forward", "记录中": "forward",
 }
 
 
@@ -78,6 +83,69 @@ def _replied_message_id(event: Optional[dict]) -> Optional[str]:
             if rid:
                 return str(rid)
     return None
+
+
+# ── 合并转发 / 聊天记录卡片 ─────────────────────────────────────
+# 主人发一张转发卡片，过一会儿才问「总结一下这个聊天记录」。上下文里那张卡
+# 只有一行【转发聊天记录 N 条】，内容读不出来（现场：logs/agent/2026-11-02.json）。
+# 这里点名 read_forward，小模型才会真的去调工具，而不是回一句「读不出来呀」。
+_FORWARD_INTENT = re.compile(
+    r"聊天记录|合并转发|转发记录|这个转发|这段转发|转发里|转发中|转发里的|"
+    r"记录(?:里|中|内容|里的|卡片)|这段记录|这个记录"
+)
+# 「读转发里的图」：图在卡片里，得先展开卡片才拿得到 URL。
+_FORWARD_OCR_INTENT = re.compile(
+    r"识别|识图|ocr|读一下|读读|看看.{0,4}图|图(?:里|中|上|内).{0,8}(?:写|字|文字|什么|内容)|"
+    r"写了什么|什么字|这张图|那张图",
+    re.I,
+)
+# 「要很多条历史」：现场是「你能获取 1000 条嘛」，模型只敢答「一次最多 51 条，
+# 得翻二十轮」。上百条就该走 fetch_history（内部自动分页），别再让它一轮轮翻。
+_BULK_INTENT = re.compile(
+    r"[几上]百|[几上]千|上千|[一二三四五六七八九十]{1,3}[百千]|全部|所有|整个群"
+)
+# 「接着上一轮那个结果说」：模型上一轮翻完一大段，说「要不要我挑几句给你看」，
+# 主人下一句说「挑」——这时候工具结果已经不在上下文里了，得靠 recall_result 取回。
+_FOLLOWUP_INTENT = re.compile(
+    r"挑(?:几|出|一下|点|吧|啊|呀|$)|展开(?:说|讲|看看)?|具体(?:说|讲|点)|详细(?:说|点)|"
+    r"再说说|接着(?:说|讲)|继续(?:说|讲)|给我看|发我看看"
+)
+
+
+def wants_followup(text: str) -> bool:
+    """这句话是不是在承接上一轮的内容（挑几句 / 展开 / 具体说说 / 继续）。
+
+    ``chat()`` 和「本轮动作检查」共用这一份判据：命中时说明用户要的是**上一轮
+    那份内容的细节**，可以放心把留存正文直接带上，而不是只给一个编号让模型
+    自己去取。
+    """
+    return bool(_FOLLOWUP_INTENT.search(str(text or "")))
+
+
+def _wants_bulk_history(text: str) -> bool:
+    """这条消息是不是在要「很多条」历史（>=100 条）。"""
+    if _BULK_INTENT.search(text or ""):
+        return True
+    for number in re.findall(r"\d{2,5}", text or ""):
+        try:
+            if int(number) >= 100:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _forward_candidates(context: Optional["ChatContext"]) -> list[dict]:
+    """上下文里的转发卡片（引用 > 当前 > 历史）。"""
+    if context is None:
+        return []
+    getter = getattr(context, "forward_candidates", None)
+    if not callable(getter):
+        return []
+    try:
+        return list(getter() or [])
+    except Exception:  # noqa: BLE001 - 定位失败不该连累主流程
+        return []
 
 
 # ── 女装照意图识别 ─────────────────────────────────────────────
@@ -369,12 +437,27 @@ def build_action_hint(
     current_urls = sources.get("current") or []
     quote_urls = sources.get("quote") or []
     history_urls = sources.get("history") or {}
+    # 转发卡片：上下文里有卡片时，先展开卡片才拿得到里面的图
+    forward_cards = _forward_candidates(context)
+    forward_card = forward_cards[0] if forward_cards else None
     # 只有出现「上一条 / 前面那张」这类回指时才去历史里找图，
     # 避免普通聊到“图片”就把十楼前的图 OCR 一遍。
     wants_history = bool(history_urls) and bool(
         re.search(r"上一条|上一张|前面那|之前那|刚才那|刚才的图|那个图|历史.{0,4}图", text)
     )
-    if (current_urls or quote_urls or wants_history) and re.search(
+    # 图在转发卡片里：当前/引用都没有图、又在问「图里写了什么」，那图多半在卡里
+    wants_forward_ocr = bool(
+        forward_card
+        and not current_urls
+        and not quote_urls
+        and _FORWARD_OCR_INTENT.search(text)
+    )
+    if (
+        current_urls
+        or quote_urls
+        or wants_history
+        or wants_forward_ocr
+    ) and re.search(
         r"写了什么|什么字|识别|这图|图片|图上|截图|ocr", text, re.I
     ):
         calls: list[str] = []
@@ -394,20 +477,54 @@ def build_action_hint(
             calls.append(
                 'ocr_img(source="history")（默认取历史上最近一张带图的消息）'
             )
+        if wants_forward_ocr:
+            calls.append(
+                f'read_forward(message_id="{forward_card["message_id"]}") 展开卡片，'
+                f'再 ocr_img(source="forward", index=0)'
+            )
         hints.append(
             "对方想知道图片内容：你必须**先进行原生工具调用** "
             + "；".join(calls)
             + "，等工具返回后再输出。"
         )
 
-    # 6. 查历史
-    if re.search(r"历史|刚才说|之前说|上一条|前面说|记录|统计", text):
-        if group_id:
+    # 6. 解析转发卡片 / 查历史
+    #    「总结一下这个聊天记录」里的「记录」也会命中下面那条查历史的正则，
+    #    但上下文里明明有张卡片 —— 这时该做的是 read_forward，不是 get_msg_history。
+    #    两条提示同时出现会把小模型带偏（它可能去翻一遍群历史然后说「没有记录」）。
+    if forward_card and _FORWARD_INTENT.search(text):
+        hints.append(
+            f"对方要你解析一张合并转发/聊天记录卡片：你必须**先进行原生工具调用** "
+            f'read_forward(message_id="{forward_card["message_id"]}") 把卡片里的内容读出来，'
+            f"再依据结果回答。卡片里如果有图，再调 "
+            f'ocr_img(source="forward", index=0) 读图上的字。'
+        )
+    elif re.search(
+        r"历史|刚才说|之前说|上一条|前面说|记录|统计", text
+    ) or (_wants_bulk_history(text) and re.search(r"条|消息|聊天", text)):
+        if group_id and _wants_bulk_history(text):
+            hints.append(
+                f"对方要的数量很大：请**先进行原生工具调用** "
+                f"fetch_history(group_id={group_id}, count=目标条数) 一次翻够"
+                f"（内部自动分页，几千上万条都行，单次上限 10000）；要提炼某个人时用 digest_user。"
+                f"不要用 get_msg_history 一轮一轮翻。"
+            )
+        elif group_id:
             hints.append(
                 f"对方要查聊天记录：请**先进行原生工具调用** "
                 f"get_msg_history(group_id={group_id}, message_id={message_id}, count=20)，"
                 f"再依据结果回答。"
             )
+
+    # 7. 接着上一轮的工具结果说：工具结果不会自动带到这一轮，得 recall_result 取回
+    if wants_followup(text):
+        hints.append(
+            "对方在接着上一轮的结论往下问：消息里如果已经有「上一轮的结果原文 · "
+            "R… · 已经自动带上」，直接用那段内容回答；"
+            '只看到「[可复用结果]」索引时，才需要**先进行原生工具调用** '
+            'recall_result(result_id="<编号>") 把原文取回来。'
+            "两种情况都别重新翻一遍历史，也别凭印象编。"
+        )
 
     if not hints:
         return ""
@@ -425,4 +542,5 @@ __all__ = [
     "_wants_dress_photo",
     "build_action_hint",
     "build_meme_hint",
+    "wants_followup",
 ]

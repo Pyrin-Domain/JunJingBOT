@@ -5,8 +5,6 @@ from core.anchors import (
     anchor_kwargs,
     anchor_matches,
     anchor_of,
-    anchor_value,
-    anchors_equal,
     same_id,
 )
 
@@ -42,7 +40,6 @@ def test_anchor_preferred_respects_backend_field():
     assert anchor.preferred("message_id") == -9
     # 后端偏好字段不存在时按 seq → id → real_id 兜底
     assert anchor_of({"real_id": 3}).preferred("message_seq") == 3
-    assert anchor_value({"message_seq": 7, "message_id": -9}, "message_id") == -9
 
 
 def test_anchor_matches_and_intersects_ignore_duplicate_real_id():
@@ -52,8 +49,6 @@ def test_anchor_matches_and_intersects_ignore_duplicate_real_id():
     assert anchor.matches("1")
     assert not anchor.matches(3)
     assert anchor.intersects(MessageAnchor(message_id="2"))
-    assert anchors_equal({"message_seq": 1}, {"message_id": 1})
-    assert anchors_equal(anchor, {"message_id": 2})
     assert anchor_matches({"message_seq": 1, "message_id": 2}, "2")
 
 

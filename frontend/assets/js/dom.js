@@ -67,12 +67,17 @@ export function setBanner(kind, title, lines = []) {
   const banner = $('#banner');
   if (!banner) return;
   banner.className = `banner ${kind}`;
+  banner.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+  banner.setAttribute('aria-live', kind === 'err' ? 'assertive' : 'polite');
   banner.innerHTML = '';
-  banner.append(el('div', { text: title }));
+  banner.append(el('div', { class: 'banner-title', text: title }));
   if (lines.length) {
     const ul = el('ul');
     for (const line of lines) ul.append(el('li', { text: line }));
     banner.append(ul);
+  }
+  if (kind === 'err' && typeof banner.scrollIntoView === 'function') {
+    banner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 }
 
@@ -80,6 +85,8 @@ export function clearBanner() {
   const banner = $('#banner');
   if (!banner) return;
   banner.className = 'banner hidden';
+  banner.removeAttribute('role');
+  banner.removeAttribute('aria-live');
   banner.innerHTML = '';
 }
 
@@ -158,6 +165,87 @@ export function renderFieldGroup(items) {
   return grid;
 }
 
+/* ══════════════ 页面内二级菜单 ══════════════
+ * sections: [{ id, label, content: Node | Node[] }]
+ * 只切换显隐、不重建内容；当前分组按 key 记在 state.subTabs 里，
+ * 保存后 renderAll 重建页面时还能回到原分组。
+ */
+export function renderSubTabs(sections, key = '') {
+  const prefix = `subtabs-${key || `page-${Math.random().toString(36).slice(2, 8)}`}`;
+  const shell = el('div', { class: 'subtabs-shell' });
+  const nav = el('div', { class: 'subtabs', role: 'tablist' });
+  const body = el('div', { class: 'subpages' });
+  const buttons = new Map();
+  const pages = new Map();
+
+  const first = sections.length ? sections[0].id : '';
+  let current = key ? state.subTabs[key] : '';
+  if (!sections.some((section) => section.id === current)) current = first;
+
+  function show(id) {
+    current = id;
+    if (key) state.subTabs[key] = id;
+    for (const [sectionId, button] of buttons) {
+      const active = sectionId === id;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+      button.setAttribute('tabindex', active ? '0' : '-1');
+    }
+    for (const [sectionId, page] of pages) {
+      const active = sectionId === id;
+      page.classList.toggle('hidden', !active);
+      page.setAttribute('aria-hidden', active ? 'false' : 'true');
+    }
+  }
+
+  for (const section of sections) {
+    const button = el('button', {
+      class: 'subtab',
+      id: `${prefix}-tab-${section.id}`,
+      type: 'button',
+      role: 'tab',
+      text: section.label,
+      'aria-controls': `${prefix}-panel-${section.id}`,
+      onclick: () => show(section.id),
+      onkeydown: (event) => {
+        const currentIndex = sections.findIndex((item) => item.id === current);
+        let nextIndex = currentIndex;
+        if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+          nextIndex = (currentIndex + 1) % sections.length;
+        } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+          nextIndex = (currentIndex - 1 + sections.length) % sections.length;
+        } else if (event.key === 'Home') {
+          nextIndex = 0;
+        } else if (event.key === 'End') {
+          nextIndex = sections.length - 1;
+        } else {
+          return;
+        }
+        event.preventDefault();
+        const nextId = sections[nextIndex].id;
+        show(nextId);
+        buttons.get(nextId)?.focus();
+      },
+    });
+    buttons.set(section.id, button);
+    nav.append(button);
+
+    const page = el('div', {
+      class: 'subpage',
+      id: `${prefix}-panel-${section.id}`,
+      role: 'tabpanel',
+      'aria-labelledby': `${prefix}-tab-${section.id}`,
+      dataset: { subtab: section.id },
+    }, section.content || []);
+    pages.set(section.id, page);
+    body.append(page);
+  }
+
+  shell.append(nav, body);
+  if (current) show(current);
+  return shell;
+}
+
 /* ══════════════ 多值参数（群号 / QQ 号）的表格编辑器 ══════════════ */
 export function normalizeListItem(text) {
   const raw = String(text == null ? '' : text).trim();
@@ -196,12 +284,14 @@ export function renderListEditor(field) {
     const counts = new Map();
     for (const item of list) counts.set(String(item == null ? '' : item), (counts.get(String(item == null ? '' : item)) || 0) + 1);
     let blank = 0; let dup = 0; let bad = 0;
+    // field.numeric = false 时不做「必须是数字」检查（哈希黑名单这类十六进制值）
+    const numeric = field.numeric !== false;
     const rows = rowsBox.querySelectorAll('.list-row');
     rows.forEach((row, index) => {
       const key = String(list[index] == null ? '' : list[index]);
       const isBlank = key === '';
       const isDup = !isBlank && counts.get(key) > 1;
-      const isBad = !isBlank && !/^\d+$/.test(key);
+      const isBad = !isBlank && numeric && !/^\d+$/.test(key);
       if (isBlank) blank += 1;
       if (isDup) dup += 1;
       if (isBad) bad += 1;
@@ -344,7 +434,11 @@ export function normalizeObjectEntry(field, raw) {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) Object.assign(entry, raw);
   else if (raw !== null && raw !== undefined && String(raw).trim() !== '') entry[idKey] = normalizeListItem(raw);
   for (const sub of field.subFields || []) {
-    if (sub.kind === 'intlist' && !Array.isArray(entry[sub.key])) entry[sub.key] = [];
+    if (sub.kind === 'intlist' && !Array.isArray(entry[sub.key])) {
+      // 后端也接受单值；前端统一转成数组，免得编辑一次就被清空
+      const value = entry[sub.key];
+      entry[sub.key] = value === undefined || value === null || value === '' ? [] : [value];
+    }
   }
   return entry;
 }

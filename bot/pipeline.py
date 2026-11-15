@@ -72,8 +72,8 @@ class MessagePipeline:
 
         self._emoji_function(event)
 
-        # 自动搬运：命中就结束，不再走 AI / 关键词
-        if self.settings.auto_forward_enabled and await self.forward.auto_forward(
+        # 自动搬运：识别 → 分派（聊天记录 / 图片）；命中就结束，不再走 AI / 关键词
+        if self.settings.auto_forward_enabled and await self.forward.forward(
             event=event,
             is_recover=is_recover,
             **self.settings.auto_forward_kwargs,
@@ -102,7 +102,11 @@ class MessagePipeline:
                 attention.evidence,
             )
 
-        if (ated_user or replying_to_bot or summoned) and not is_recover:
+        if not ated_user :
+            is_match = await self._match_keywords(event, is_recover)
+
+
+        if (ated_user or ( replying_to_bot and not is_match) or summoned) and not is_recover:
             await self._handle_ai(
                 event=event,
                 message_id=message_id,
@@ -114,7 +118,6 @@ class MessagePipeline:
             )
             return
 
-        await self._match_keywords(event, is_recover)
 
     # ════════════════════ AI 分支 ════════════════════
     async def _handle_ai(

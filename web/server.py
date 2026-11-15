@@ -24,7 +24,12 @@ from aiohttp import web
 
 from config import BotSettings, load_settings
 
-from .auth import make_auth_middleware, make_cors_middleware
+from .auth import (
+    is_loopback_host,
+    make_auth_middleware,
+    make_cors_middleware,
+    normalize_cors_origins,
+)
 from .routes import WEB_SERVER_KEY, register_routes
 from .validation import FALLBACK_ACTIONS
 
@@ -63,13 +68,19 @@ class WebServer:
         cfg_host = self.settings.get("web_panel.host", DEFAULT_HOST)
         cfg_port = self.settings.get("web_panel.port", DEFAULT_PORT)
         cfg_token = self.settings.get("web_panel.token") or None
+        cfg_cors_origins = self.settings.get("web_panel.cors_origins", [])
 
         self.host = str(host if host is not None else (cfg_host or DEFAULT_HOST))
         # port=0 表示让系统随机分配（测试用），所以必须用 is not None 判断
         self.port = _as_port(port if port is not None else cfg_port)
-        self.token = (
-            str(token) if token is not None else (str(cfg_token) if cfg_token else None)
-        )
+        raw_token = token if token is not None else cfg_token
+        self.token = str(raw_token).strip() if raw_token else None
+        self.cors_origins = normalize_cors_origins(cfg_cors_origins)
+        if not is_loopback_host(self.host) and not self.token:
+            raise ValueError(
+                "web_panel 监听非本机地址时必须设置 token，"
+                "否则局域网内任何人都能修改 Bot 配置"
+            )
         self.static_dir = Path(static_dir) if static_dir else self.settings.paths.frontend_dir
 
         # 群列表缓存（面板下拉框用，避免每次问 NapCat）
@@ -84,7 +95,10 @@ class WebServer:
     # ════════════════════════ 构造 ════════════════════════
     def _build_app(self) -> web.Application:
         app = web.Application(
-            middlewares=[make_cors_middleware(), make_auth_middleware(self.token)]
+            middlewares=[
+                make_cors_middleware(allow_origins=self.cors_origins),
+                make_auth_middleware(self.token),
+            ]
         )
         app[WEB_SERVER_KEY] = self
 
@@ -366,12 +380,27 @@ class WebServer:
         task_dict = getattr(range_tasks_obj, "task_dict", {}) or {}
         mp = getattr(self.bot, "mp", None)
         auto_group_ids = settings.get("auto_forward.groupid_list", []) or []
+        # 心理分析是独立模型：状态里直接给它一行，排查「为什么没反应」时先看这里
+        psychology = getattr(self.bot, "psychology", None)
+        psychology_status = ""
+        psychology_keywords: list[str] = []
+        if psychology is not None:
+            try:
+                psychology_status = psychology.analyzer.status()
+                psychology_keywords = list(psychology.keywords)
+            except Exception as exc:  # noqa: BLE001 - 状态读取失败不能连累整页
+                psychology_status = f"读取失败：{exc}"
 
         return {
             "user_id": getattr(mp, "user_id", None),
             "agent_enabled": settings.agent_enabled,
             "agent_loaded": agent is not None,
             "campus_loaded": getattr(self.bot, "campus_assistant", None) is not None,
+            "psychology": {
+                "enabled": bool(getattr(psychology, "enabled", False)),
+                "status": psychology_status,
+                "keywords": psychology_keywords,
+            },
             "heartbeat_running": bool(
                 getattr(self.bot, "heartbeat_running", False)
                 or (heartbeat is not None and not heartbeat.done())

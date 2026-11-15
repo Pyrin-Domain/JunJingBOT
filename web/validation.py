@@ -13,13 +13,15 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from config.backends import DEFAULT_BACKEND, normalize_backend
 from config.connection import MODE_REVERSE, normalize_mode
 from config.environment import EnvKind
 from config.path_profiles import normalize_profile
 from core.pathmap import looks_windows
+from web.auth import is_loopback_host, normalize_cors_origins
 
 # Bot 不在场（standalone）时的兜底 action 清单，与
 # ``bot/commands/registry.py`` 的注册表保持一致。
@@ -37,6 +39,9 @@ FALLBACK_ACTIONS: tuple[str, ...] = (
     "try_send_bili_video",
     "try_send_reply_bili_card",
     "jm",
+    "psychology",
+    "sex_filter_test",
+    "audit_release",
 )
 
 KNOWN_TOP_KEYS: tuple[str, ...] = (
@@ -47,9 +52,14 @@ KNOWN_TOP_KEYS: tuple[str, ...] = (
     "message",
     "meme",
     "emoji",
+    "relations",
     "auto_forward",
+    "forward_image_dedup",
     "image_forward",
+    "image_filter",
+    "export",
     "jm",
+    "psychology",
     "prompts",
     "replies",
     "keyword_actions",
@@ -364,6 +374,63 @@ def _bool_section(data: dict, section: str, label: str, err) -> dict:
     return node
 
 
+def _validate_forward_filter(auto: dict, err, warn) -> list:
+    """按「来源群 + 发送者」过滤转发（``auto_forward.filter``）。
+
+    结构::
+
+        [
+          {"group_id": 123456, "user_id": [10001, 10002]},
+          {"group_id": 234567, "user_id": [10003]}
+        ]
+    """
+    raw = auto.get("filter")
+    label = "auto_forward.filter"
+    if raw is None and "forward_filter" in auto:
+        raw = auto.get("forward_filter")
+        label = "auto_forward.forward_filter"
+    if raw is None or raw is False:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        err(f"{label} 必须是数组，例如 [{{\"group_id\": 123456, \"user_id\": [10001]}}]")
+        return []
+
+    for index, entry in enumerate(raw):
+        tag = f"{label}[{index}]"
+        if not isinstance(entry, dict):
+            err(f'{tag} 必须是对象，例如 {{"group_id": 123456, "user_id": [10001]}}')
+            continue
+        group_id = entry.get("group_id", entry.get("qgroup_id"))
+        if group_id is None or not str(group_id).strip():
+            err(f"{tag}.group_id 不能为空（事件所在的来源群号）")
+        elif not str(group_id).strip().isdigit():
+            warn(f"{tag}.group_id = {group_id!r} 不是纯数字，运行时可能匹配不到")
+
+        users = entry.get("user_id")
+        if users is None:
+            users = entry.get("user_ids") or entry.get("userid_list")
+        if users is None:
+            err(f"{tag}.user_id 不能为空（可以配数组，空数组表示不过滤）")
+            continue
+        if isinstance(users, (str, int)):
+            warn(f"{tag}.user_id 建议写成数组，例如 [10001]")
+            users = [users]
+        if not isinstance(users, (list, tuple)):
+            err(f"{tag}.user_id 必须是数组，例如 [10001, 10002]")
+            continue
+        if not users:
+            warn(f"{tag}.user_id 是空数组，这条过滤不会生效")
+        for user_index, user_id in enumerate(users):
+            text = str(user_id).strip()
+            if not text:
+                warn(f"{tag}.user_id[{user_index}] 为空，运行时会忽略")
+            elif not text.isdigit():
+                warn(f"{tag}.user_id[{user_index}] = {user_id!r} 不是纯数字")
+    return raw
+
+
 def _validate_strip_tail_ads(auto: dict, err, warn) -> dict:
     """末尾广告裁剪 + 尾部追加（``auto_forward.strip_tail_ads``）。
 
@@ -426,6 +493,100 @@ def _validate_strip_tail_ads(auto: dict, err, warn) -> dict:
     return raw
 
 
+def _validate_image_filter(data: dict, err, warn) -> dict:
+    """图片过滤门（``image_filter``）。
+
+    结构::
+
+        {
+          "enable": true, "audit_group_id": 1032125562,
+          "single_tag_mode": "single", "record_tag_mode": "reply",
+          "block_matched": true, "scan_all_images": true,
+          "max_images": 0, "image_timeout": 8, "max_tag_images": 6,
+          "filters": [
+            {"id": "phoebe_bullshit", "enable": true, "params": {}},
+            {"id": "nsfw", "enable": false, "params": {"threshold": 0.5}}
+          ]
+        }
+    """
+    raw = data.get("image_filter")
+    if raw is None:
+        return {}
+    if isinstance(raw, bool):
+        return {}
+    if not isinstance(raw, dict):
+        err("image_filter 必须是对象")
+        return {}
+    label = "image_filter"
+    for key in ("enable", "block_matched", "scan_all_images"):
+        _bool_field(raw, key, f"{label}.{key}", err)
+
+    for key, allowed in (
+        ("single_tag_mode", ("single", "forward_reply")),
+        ("record_tag_mode", ("reply", "before", "after")),
+    ):
+        value = raw.get(key)
+        if value is not None and str(value).strip().lower() not in allowed:
+            err(f"{label}.{key} 只能是 " + " / ".join(allowed))
+
+    audit = raw.get("audit_group_id")
+    if audit not in (None, "", 0, "0"):
+        if not str(audit).strip().isdigit():
+            err(f"{label}.audit_group_id 必须是纯数字群号")
+    elif bool(raw.get("enable")):
+        warn(f"{label}.audit_group_id 为空，命中后没有地方打标签")
+
+    for key, minimum, maximum in (
+        # max_images 的 0 = 不设上限（默认）。老默认 12 会让大记录后面的图
+        # 直接不判 —— 等于把没判过的图当安全图放过，别再把下限卡在 1。
+        ("max_images", 0, 1000),
+        ("max_tag_images", 1, 20),
+    ):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool):
+            err(f"{label}.{key} 必须是整数")
+        elif not minimum <= value <= maximum:
+            hint = "（0 = 不设上限）" if key == "max_images" else ""
+            err(f"{label}.{key} 只能是 {minimum}~{maximum}{hint}")
+
+    timeout = raw.get("image_timeout")
+    if timeout is not None and (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or timeout <= 0
+    ):
+        err(f"{label}.image_timeout 必须是正数（秒）")
+
+    filters = raw.get("filters")
+    if filters is None:
+        return raw
+    if not isinstance(filters, list):
+        err(f"{label}.filters 必须是数组（每项 id + enable + params）")
+        return raw
+    seen: set[str] = set()
+    for index, entry in enumerate(filters):
+        tag = f"{label}.filters[{index}]"
+        if isinstance(entry, str):
+            entry = {"id": entry}
+        if not isinstance(entry, dict):
+            err(f'{tag} 必须是对象，例如 {{"id": "nsfw", "enable": true}}')
+            continue
+        filter_id = str(entry.get("id") or entry.get("filter_id") or "").strip()
+        if not filter_id:
+            err(f"{tag}.id 不能为空")
+        elif filter_id in seen:
+            err(f"{tag}.id={filter_id!r} 与其它过滤项重复")
+        else:
+            seen.add(filter_id)
+        _bool_field(entry, "enable", f"{tag}.enable", err)
+        params = entry.get("params")
+        if params is not None and not isinstance(params, dict):
+            err(f"{tag}.params 必须是对象")
+    return raw
+
+
 def _model_ids(models: Any) -> set[str]:
     if not isinstance(models, list):
         return set()
@@ -434,6 +595,40 @@ def _model_ids(models: Any) -> set[str]:
         for entry in models
         if isinstance(entry, dict) and isinstance(entry.get("id"), str)
     }
+
+
+def _validate_psychology_model(
+    node: dict, tag: str, known_ids: set[str], err, warn
+) -> None:
+    """心理分析的模型来源：``model_id`` 引用 agent.models，或自己填一套。"""
+    model_id = node.get("model_id")
+    if model_id is not None:
+        if not isinstance(model_id, str):
+            err(f"{tag}.model_id 必须是字符串（agent.models 里某条的 id，留空 = 用下面的独立配置）")
+        elif model_id.strip() and known_ids and model_id not in known_ids:
+            warn(
+                f"{tag}.model_id={model_id!r} 不在 agent.models 里，"
+                "会改用本节的独立配置"
+            )
+
+    base_url = node.get("base_url")
+    if base_url is not None:
+        if not isinstance(base_url, str):
+            err(f"{tag}.base_url 必须是字符串")
+        elif base_url.strip() and not re.match(r"^https?://", base_url.strip(), re.I):
+            err(f"{tag}.base_url 必须以 http:// 或 https:// 开头")
+    api_key = node.get("api_key")
+    if api_key is not None and not isinstance(api_key, str):
+        err(f"{tag}.api_key 必须是字符串（留空 = 用环境变量）")
+    api_key_env = node.get("api_key_env")
+    if api_key_env is not None and (
+        not isinstance(api_key_env, str)
+        or (api_key_env.strip() and not api_key_env.strip().isidentifier())
+    ):
+        err(f"{tag}.api_key_env 必须是合法的环境变量名（例如 MY_API_KEY）")
+    model = node.get("model")
+    if model is not None and not isinstance(model, str):
+        err(f"{tag}.model 必须是字符串（例如 qwen-vl-max）")
 
 
 # ════════════════════════ 主配置校验 ════════════════════════
@@ -512,6 +707,21 @@ def validate_config(
     # ── Agent ──
     agent = _bool_section(data, "agent", "agent", err)
     _bool_field(agent, "enable", "agent.enable", err)
+    for name in ("persona_file", "persona_core_file"):
+        value = agent.get(name)
+        if value is not None and not isinstance(value, str):
+            err(f"agent.{name} 必须是字符串（Markdown 路径）")
+    for name in ("catchphrase_file", "catchphrases_file"):
+        value = agent.get(name)
+        if value is not None and value is not False and not isinstance(value, str):
+            err(f"agent.{name} 必须是字符串（JSON 路径），留空 / false 可关闭")
+    catchphrase_limit = agent.get("catchphrase_limit")
+    if catchphrase_limit is not None and (
+        not isinstance(catchphrase_limit, int)
+        or isinstance(catchphrase_limit, bool)
+        or catchphrase_limit < 0
+    ):
+        err("agent.catchphrase_limit 必须是 0 或正整数（0 = 全部写进提示词）")
     if "provider_index" in agent:
         warn(
             "agent.provider_index 已废弃（模型改为 agent.models 列表维护），"
@@ -689,6 +899,7 @@ def validate_config(
         warn,
     )
     _int_list(auto.get("task_userid"), "auto_forward.task_userid", err, warn)
+    _validate_forward_filter(auto, err, warn)
 
     from_bot = auto.get("auto_img_forward_from_bot")
     if from_bot is not None and not isinstance(from_bot, dict):
@@ -728,10 +939,140 @@ def validate_config(
 
     _strip = _validate_strip_tail_ads(auto, err, warn)
 
+    # ── 机器人图片送达库（forward_image_dedup）──
+    image_dedup = _bool_section(
+        data, "forward_image_dedup", "forward_image_dedup", err
+    )
+    _bool_field(image_dedup, "enable", "forward_image_dedup.enable", err)
+    _bool_field(image_dedup, "perceptual", "forward_image_dedup.perceptual", err)
+    db_path = image_dedup.get("db_path")
+    if db_path is not None and not isinstance(db_path, str):
+        err("forward_image_dedup.db_path 必须是字符串（只写文件名时落在 data/ 下）")
+    for name in ("keep_days", "image_keep_days", "perceptual_keep_days"):
+        value = image_dedup.get(name)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            err(f"forward_image_dedup.{name} 必须是 0 或正整数（0 = 不清理）")
+    distance = image_dedup.get("perceptual_max_distance")
+    if distance is not None and (
+        not isinstance(distance, int)
+        or isinstance(distance, bool)
+        or not 0 <= distance <= 128
+    ):
+        err("forward_image_dedup.perceptual_max_distance 必须是 0~128 的整数（汉明距离）")
+    timeout = image_dedup.get("perceptual_timeout")
+    if timeout is not None and (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or timeout <= 0
+    ):
+        err("forward_image_dedup.perceptual_timeout 必须是正数（秒）")
+
+    _validate_image_filter(data, err, warn)
+
+    # ── 心理分析（独立模型 / 三档图片策略）──
+    psychology = _bool_section(data, "psychology", "psychology", err)
+    if psychology:
+        _bool_field(psychology, "enable", "psychology.enable", err)
+        _bool_field(psychology, "use_image_filter", "psychology.use_image_filter", err)
+        _bool_field(psychology, "allow_private", "psychology.allow_private", err)
+        _bool_field(
+            psychology,
+            "forward_include_images",
+            "psychology.forward_include_images",
+            err,
+        )
+        reply_mode = psychology.get("reply_mode")
+        if reply_mode is not None and (
+            not isinstance(reply_mode, str)
+            or reply_mode.strip().lower() not in ("text", "forward", "both")
+        ):
+            err("psychology.reply_mode 只能是 text / forward / both（总结 / 聊天记录 / 两者都发）")
+        keywords = psychology.get("keywords")
+        if keywords is not None:
+            if not isinstance(keywords, list):
+                err("psychology.keywords 必须是数组（唤醒词列表）")
+            else:
+                for index, word in enumerate(keywords):
+                    if not isinstance(word, str) or not word.strip():
+                        err(f"psychology.keywords[{index}] 必须是非空字符串")
+        mode = psychology.get("image_mode")
+        if mode is not None and (
+            not isinstance(mode, str) or mode.strip().lower() not in ("image", "ocr", "vision")
+        ):
+            err("psychology.image_mode 只能是 image / ocr / vision（原样发图 / 仅 OCR / 辅助视觉分析）")
+        _validate_psychology_model(psychology, "psychology", known_ids, err, warn)
+        vision = psychology.get("vision")
+        if vision is not None:
+            if not isinstance(vision, dict):
+                err("psychology.vision 必须是对象（视觉模型的独立配置）")
+            else:
+                _validate_psychology_model(vision, "psychology.vision", known_ids, err, warn)
+        for name in ("prompt", "vision_prompt", "nodes_prompt"):
+            value = psychology.get(name)
+            if value is not None and not isinstance(value, str):
+                err(f"psychology.{name} 必须是字符串（留空 = 用内置提示词）")
+        for name, default_hint in (
+            ("max_images", "0 = 不带图"),
+            ("max_records", "至少 1"),
+            ("image_max_bytes", "字节数"),
+            ("image_max_side", "像素"),
+        ):
+            value = psychology.get(name)
+            if value is None:
+                continue
+            minimum = 0 if name == "max_images" else 1
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < minimum
+            ):
+                err(f"psychology.{name} 必须是 ≥ {minimum} 的整数（{default_hint}）")
+        cooldown = psychology.get("cooldown_seconds")
+        if cooldown is not None and (
+            not isinstance(cooldown, (int, float))
+            or isinstance(cooldown, bool)
+            or cooldown < 0
+        ):
+            err("psychology.cooldown_seconds 必须是 ≥ 0 的数字（秒）")
+        forward_tokens = psychology.get("forward_max_tokens")
+        if forward_tokens is not None and (
+            not isinstance(forward_tokens, int)
+            or isinstance(forward_tokens, bool)
+            or forward_tokens <= 0
+        ):
+            err("psychology.forward_max_tokens 必须是正整数（逐条侧写的输出额度）")
+        temperature = psychology.get("temperature")
+        if temperature is not None and (
+            not isinstance(temperature, (int, float))
+            or isinstance(temperature, bool)
+            or not 0 <= float(temperature) <= 2
+        ):
+            err("psychology.temperature 必须是 0~2 的数字")
+        max_tokens = psychology.get("max_tokens")
+        if max_tokens is not None and (
+            not isinstance(max_tokens, int)
+            or isinstance(max_tokens, bool)
+            or max_tokens <= 0
+        ):
+            err("psychology.max_tokens 必须是正整数")
+        for name in ("groups", "blacklist_groups"):
+            _int_list(psychology.get(name), f"psychology.{name}", err, warn)
+
     image_forward = _bool_section(data, "image_forward", "image_forward", err)
     _int_list(
         image_forward.get("auto_target_group_ids"),
         "image_forward.auto_target_group_ids",
+        err,
+        warn,
+    )
+
+    # ── export -a 的默认目标群（留空则沿用 auto_forward.target_groupid）──
+    export = _bool_section(data, "export", "export", err)
+    _int_list(
+        export.get("auto_target_group_ids"),
+        "export.auto_target_group_ids",
         err,
         warn,
     )
@@ -862,6 +1203,77 @@ def validate_config(
             elif limit < 0:
                 err("meme.prompt_limit 不能小于 0")
 
+    # ── 关系档案 ──
+    relations = _bool_section(data, "relations", "relations", err)
+    if relations:
+        _bool_field(relations, "enable", "relations.enable", err)
+        _bool_field(relations, "auto_extract", "relations.auto_extract", err)
+        data_dir = relations.get("data_dir")
+        if data_dir is not None and not isinstance(data_dir, str):
+            err("relations.data_dir 必须是字符串（档案目录）")
+        for name, minimum in (
+            ("max_people", 1),
+            ("max_chars", 200),
+            ("max_person_chars", 80),
+            ("state_ttl_hours", 1),
+            ("state_max_hours", 1),
+            ("self_ttl_hours", 1),
+            ("max_states", 1),
+            ("max_memories", 1),
+            ("max_labels", 1),
+            ("auto_every", 1),
+            ("auto_extract_min_seconds", 0),
+        ):
+            value = relations.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                err(f"relations.{name} 必须是整数")
+            elif value < minimum:
+                err(f"relations.{name} 不能小于 {minimum}")
+
+    # ── 多轮留存（跨轮 prefix 复用 + 话题裁决）──
+    memory = _bool_section(data, "thread_memory", "thread_memory", err)
+    if memory:
+        _bool_field(memory, "stable_prefix", "thread_memory.stable_prefix", err)
+        _bool_field(memory, "verdict", "thread_memory.verdict", err)
+        parity = memory.get("ab_day_parity")
+        if parity is not None and (
+            isinstance(parity, bool) or parity not in (0, 1)
+        ):
+            err(
+                "thread_memory.ab_day_parity 只能是 0 / 1 或 null"
+                "（1=奇数日开、0=偶数日开、null=不轮换）"
+            )
+        groups = memory.get("groups")
+        if groups is None:
+            pass
+        elif not isinstance(groups, list):
+            err(
+                'thread_memory.groups 必须是数组，例如 ["1132313813"]'
+                "（留空 = 全部会话生效）"
+            )
+        else:
+            for index, gid in enumerate(groups):
+                text = str(gid).strip()
+                if text.startswith("group_"):
+                    text = text[len("group_"):]
+                if not text.isdigit():
+                    err(f"thread_memory.groups[{index}] = {gid!r} 不是群号")
+        for name, minimum in (
+            ("new_after_minutes", 0),
+            ("ttl_minutes", 1),
+            ("max_turns", 1),
+            ("max_chars", 1000),
+        ):
+            value = memory.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                err(f"thread_memory.{name} 必须是数字")
+            elif value < minimum:
+                err(f"thread_memory.{name} 不能小于 {minimum}")
+
     # ── 面板自身 ──
     panel = _bool_section(data, "web_panel", "web_panel", err)
     _bool_field(panel, "enable", "web_panel.enable", err)
@@ -876,13 +1288,14 @@ def validate_config(
     token = panel.get("token")
     if token is not None and not isinstance(token, str):
         err("web_panel.token 必须是字符串（留空表示不需要 token）")
-    elif (
-        isinstance(host, str)
-        and host
-        and host not in ("127.0.0.1", "localhost", "::1")
-        and not token
-    ):
-        warn("面板监听非本机地址且没有设置 token，任何能访问该端口的人都能改参数")
+    origins = panel.get("cors_origins")
+    if origins is not None:
+        try:
+            normalize_cors_origins(origins)
+        except (TypeError, ValueError) as exc:
+            err(f"web_panel.cors_origins 无效：{exc}")
+    if isinstance(host, str) and host and not is_loopback_host(host) and not token:
+        err("web_panel 监听非本机地址时必须设置 token")
 
     # ── 未知参数段 ──
     for key in data:

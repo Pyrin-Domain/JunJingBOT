@@ -83,6 +83,7 @@ async def main() -> None:
         await listener
     finally:
         listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
         await web.stop()
         await app.stop()
         await events_conn.stop()
@@ -95,3 +96,12 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[退出] 已停止")
+    except OSError as exc:
+        # 端口被占用这类启动失败：给能照着做的提示，别甩一坨 traceback。
+        if exc.errno == 10048 or getattr(exc, "winerror", None) == 10048:
+            print(f"\n[启动失败] {exc.strerror}")
+            sys.exit(1)
+        raise
+    except Exception as exc:  # noqa: BLE001 - 顶层兜底：打印可读信息
+        print(f"\n[启动失败] {type(exc).__name__}: {exc}")
+        raise

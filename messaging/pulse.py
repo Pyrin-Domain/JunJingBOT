@@ -32,8 +32,15 @@ _ENDED_MAX_CHARS = 15
 _LOW_ENERGY_RE = re.compile(r"^(哈哈+|草+|笑死|好家伙|牛逼|绝了|\.\.\.+|…+|6+|啊这|确实|是的)$")
 
 # 提问信号（负向断言避开「没什么」「不怎么样」这类否定说法）
+#
+# 「怎么这么多」「这么多」这类是**感叹**，不是提问。以前把它们算成提问，
+# 于是「机器人话怎么这么多」这种吐槽会被判成「悬空提问」→ 模型去 answer，
+# 插话就变吵了、还答得莫名其妙。
+# 规则：疑问词后面跟着「这么」时不算提问；「多少」前面有「这么」时也不算。
 _QUESTION_RE = re.compile(
-    r"[?？]|(?<![没不])(什么|怎么|为什么|为啥|谁|哪里|哪儿|多少|"
+    r"[?？]|(?<![没不])(什么|为什么|为啥|谁|哪里|哪儿|"
+    r"(?<!这么)多少|"
+    r"怎么(?!这么)|"
     r"能不能|可不可以|是不是|有没有|要不要|会不会|请问|帮我|求推荐|求个)"
 )
 
@@ -97,7 +104,12 @@ class SelfPosition:
     def spoke_just_now(self) -> bool:
         return self.last_minutes is not None and self.last_minutes < 3
 
-    def render(self) -> list[str]:
+    def render(self, *, has_dangling_question: bool = False) -> list[str]:
+        """渲染成 ``<me>`` 里的几行。
+
+        ``has_dangling_question`` 为真时不给「别再添一句」这句压制：
+        刚说完 ≠ 不能答问题。有人提问还没人接的时候，答问题不算添乱。
+        """
         lines: list[str] = []
         if self.last_minutes is None:
             lines.append("我还没在这个群说过话")
@@ -112,7 +124,10 @@ class SelfPosition:
         if self.today_count:
             lines.append(f"今天我在这里说过 {self.today_count} 次")
         if self.spoke_just_now:
-            lines.append("注意：我刚说完没多久，没有新内容就别再添一句")
+            if has_dangling_question:
+                lines.append("我刚说完没多久，但现在是有人提问没人接，答问题不算添一句")
+            else:
+                lines.append("注意：我刚说完没多久，没有新内容就别再添一句")
         return lines
 
 

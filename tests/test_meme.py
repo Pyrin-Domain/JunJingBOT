@@ -160,6 +160,37 @@ def test_mface_cq_escapes_brackets_in_summary(library):
     assert code.count("[") == 1 and code.count("]") == 1
 
 
+def test_mface_cq_renders_standalone_face():
+    """不在表情库里的固定表情（搬运去重的提示）也能渲染成 CQ 码。"""
+    code = meme_mod.mface_cq({
+        "summary": "[此条news已被其他群友发布过]",
+        "emoji_id": "2d831a9731974a5bd0fa57e892bc0bd8",
+        "emoji_package_id": 233590,
+        "key": "fe89fd36de66bdc2",
+    })
+    assert code.startswith("[CQ:mface,")
+    assert "emoji_id=2d831a9731974a5bd0fa57e892bc0bd8" in code
+    assert "emoji_package_id=233590" in code
+    assert "key=fe89fd36de66bdc2" in code
+    assert "summary=&#91;此条news已被其他群友发布过&#93;" in code
+    # 还原成消息段：summary 还原原文，package_id 还原成数字
+    segments = to_segments(code)
+    assert segments == [{
+        "type": "mface",
+        "data": {
+            "emoji_id": "2d831a9731974a5bd0fa57e892bc0bd8",
+            "key": "fe89fd36de66bdc2",
+            "summary": "[此条news已被其他群友发布过]",
+            "emoji_package_id": 233590,
+        },
+    }]
+
+
+def test_mface_cq_without_data_is_empty():
+    assert meme_mod.mface_cq({}) == ""
+    assert meme_mod.mface_cq(None) == ""
+
+
 def test_face_cq_uses_id(library):
     assert library.cq("赞") == "[CQ:face,id=76]"
 

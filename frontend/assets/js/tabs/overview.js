@@ -54,6 +54,14 @@ export function renderStatusInto(status) {
       ? (bot.agent_loaded ? '已启用并加载完成' : '已启用，后台加载中…')
       : '已在配置里关闭', bot.agent_enabled ? 'on' : 'off');
     add('校园网助手', bot.campus_loaded ? '已加载' : '未加载', bot.campus_loaded ? 'on' : 'off');
+    if (bot.psychology) {
+      const py = bot.psychology;
+      add(
+        '心理分析',
+        py.enabled ? (py.status || '已启用') : '已在配置里关闭',
+        py.enabled ? 'on' : 'off',
+      );
+    }
     add('心跳保活', bot.heartbeat_running ? '运行中' : '未运行', bot.heartbeat_running ? 'on' : 'off');
     add('自动搬运', bot.auto_forward_enabled ? '已启用' : '已关闭', bot.auto_forward_enabled ? 'on' : 'off');
     add('关键词规则', `${bot.keyword_count ?? 0} 条`);

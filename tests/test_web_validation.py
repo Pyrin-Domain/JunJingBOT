@@ -68,10 +68,16 @@ def test_known_actions_can_be_extended():
 
 def test_invalid_web_panel_and_ws_config():
     data = _base()
-    data["web_panel"] = {"port": True, "host": "0.0.0.0", "token": ""}
-    errors, warnings = validate_config(data)
+    data["web_panel"] = {
+        "port": True,
+        "host": "0.0.0.0",
+        "token": "",
+        "cors_origins": ["https://panel.example.com/with-a-path"],
+    }
+    errors, _warnings = validate_config(data)
     assert any("web_panel.port" in item for item in errors)
-    assert any("token" in item for item in warnings)
+    assert any("token" in item for item in errors)
+    assert any("cors_origins" in item for item in errors)
 
     ws_errors, cleaned = validate_ws_config(
         {
@@ -91,6 +97,87 @@ def test_invalid_web_panel_and_ws_config():
     assert any("ws_port" in item for item in ws_errors)
 
     assert set(ws_section({"type": "ws", "extra": 1})) == {"type"}
+
+
+def test_agent_catchphrase_config_validation():
+    data = _base(catchphrase_file="agent/catchphrases.json", catchphrase_limit=10)
+    errors, _ = validate_config(data)
+    assert not any("catchphrase" in item for item in errors)
+
+    data = _base(catchphrase_file=123, catchphrase_limit=-1)
+    errors, _ = validate_config(data)
+    assert any("catchphrase_file" in item for item in errors)
+    assert any("catchphrase_limit" in item for item in errors)
+
+
+def test_auto_forward_sender_filter_validation():
+    data = _base()
+    data["auto_forward"] = {
+        "filter": [
+            {"group_id": 20002, "user_id": [10003, "10004"]},
+        ]
+    }
+    errors, _ = validate_config(data)
+    assert not any("auto_forward.filter" in item for item in errors)
+
+    data["auto_forward"] = {
+        "filter": [
+            {"user_id": [10003]},
+            "bad",
+            {"group_id": 20002, "user_id": {"not": "a list"}},
+        ]
+    }
+    errors, warnings = validate_config(data)
+    assert any("group_id" in item for item in errors)
+    assert any("[1] 必须是对象" in item for item in errors)
+    assert any("user_id 必须是数组" in item for item in errors)
+
+
+def test_forward_image_dedup_validation():
+    data = _base()
+    data["forward_image_dedup"] = {
+        "db_path": "forward_image.db",
+        "keep_days": 30,
+        "image_keep_days": 2,
+    }
+    errors, _ = validate_config(data)
+    assert not any("forward_image_dedup" in item for item in errors)
+
+    data["forward_image_dedup"] = {
+        "enable": "yes",
+        "db_path": 5,
+        "keep_days": -1,
+        "image_keep_days": True,
+    }
+    errors, _ = validate_config(data)
+    assert any("forward_image_dedup.enable" in item for item in errors)
+    assert any("forward_image_dedup.db_path" in item for item in errors)
+    assert any("forward_image_dedup.keep_days" in item for item in errors)
+    assert any("forward_image_dedup.image_keep_days" in item for item in errors)
+
+
+def test_relations_section_is_known_and_validated():
+    data = _base()
+    data["relations"] = {
+        "enable": "yes",
+        "data_dir": 5,
+        "max_people": 0,
+        "auto_extract_min_seconds": -1,
+    }
+    errors, warnings = validate_config(data)
+
+    assert any("relations 必须是对象" in item or "relations.enable" in item for item in errors)
+    assert any("relations.data_dir" in item for item in errors)
+    assert any("relations.max_people" in item for item in errors)
+    assert any("relations.auto_extract_min_seconds" in item for item in errors)
+    assert not any("未知参数段 'relations'" in item for item in warnings)
+
+
+def test_persona_file_must_be_a_string():
+    data = _base()
+    data["agent"]["persona_file"] = 123
+    errors, _ = validate_config(data)
+    assert any("agent.persona_file" in item for item in errors)
 
 
 def test_ws_config_accepts_backend_aliases():
@@ -189,3 +276,17 @@ def test_ws_settings_save_normalizes_backend_and_syncs_sender(tmp_path):
     assert config["backend"] == "snowluma"
     assert sender["backend"] == "snowluma"
     assert sender["ws_port"] == 3000
+
+
+def test_export_section_is_known_and_validated():
+    """``export.auto_target_group_ids``：已知段不报警告，类型错要报错。"""
+    data = _base()
+    data["export"] = {"auto_target_group_ids": [20003, 20002]}
+    errors, warnings = validate_config(data)
+    assert errors == []
+    assert not any("未知参数段 'export'" in item for item in warnings)
+
+    broken = _base()
+    broken["export"] = {"auto_target_group_ids": 20003}
+    errors, _ = validate_config(broken)
+    assert any("export.auto_target_group_ids 必须是数组" in item for item in errors)

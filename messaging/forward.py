@@ -65,6 +65,48 @@ def get_miniapp_info(msg_event: dict) -> dict:
     return {}
 
 
+#: B 站链接：只认这两种域名，别的小程序卡片（外卖 / 音乐）一律不碰
+_BILI_LINK_RE = re.compile(
+    r"https?://(?:[A-Za-z0-9.-]+\.)?(?:bilibili\.com|b23\.tv)/", re.I
+)
+
+
+def get_bili_card_link(msg_event: dict) -> str:
+    """从卡片消息里取 B 站链接，取不到返回空串。
+
+    比 :func:`get_miniapp_info` 宽一档，专供「回复卡片 → 下载视频」：
+
+    - ``com.tencent.miniapp_01``：QQ 小程序卡片（B 站小程序）；
+    - ``com.tencent.structmsg``：普通结构化分享卡片，**B 站视频分享走这个**，
+      链接通常在 ``meta.news.jumpUrl``，老版本在 ``meta.detail.qqdocurl``。
+
+    只返回 host 是 bilibili.com / b23.tv 的链接 —— 回复外卖卡片时不该触发下载。
+    """
+    candidates: list = []
+
+    miniapp = get_miniapp_info(msg_event)
+    candidates.extend([miniapp.get("link"), miniapp.get("url")])
+
+    for payload in iter_json_payloads(msg_event):
+        if payload.get("app") not in ("com.tencent.structmsg", "com.tencent.miniapp_01"):
+            continue
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            continue
+        for block in meta.values():
+            if not isinstance(block, dict):
+                continue
+            candidates.extend(
+                [block.get("jumpUrl"), block.get("qqdocurl"), block.get("url")]
+            )
+
+    for item in candidates:
+        text = str(item or "").strip()
+        if text and _BILI_LINK_RE.match(text):
+            return text
+    return ""
+
+
 def get_multimsg_detail(msg_event: dict) -> dict:
     """解析新版合并转发卡片（com.tencent.multimsg）的 meta.detail。"""
     for payload in iter_json_payloads(msg_event):

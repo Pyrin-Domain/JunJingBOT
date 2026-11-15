@@ -180,6 +180,24 @@ def test_cooldown_blocks_back_to_back():
     assert len(asyncio.run(run()).calls) == 1
 
 
+def test_first_trigger_is_not_blocked_by_small_monotonic(monkeypatch):
+    """刚开机的机器 monotonic 可能小于 cooldown，第一次插话不能被误判成冷却中。"""
+    import bot.services.interject as interject_module
+
+    monkeypatch.setattr(interject_module, "time", SimpleNamespace(monotonic=lambda: 10.0))
+
+    async def run():
+        mp, agent = FakeMP(), FakeAgent()
+        svc = _svc(mp, agent, frequent=2, cooldown_minutes=5)
+        svc.note_message(_event(1))
+        svc.note_message(_event(2))
+        await asyncio.sleep(0.05)
+        svc.close()
+        return agent
+
+    assert len(asyncio.run(run()).calls) == 1
+
+
 def test_hot_followup_during_cooldown_is_checked_after_cooldown():
     """Bot 刚回完话，对方在冷却期追问一句，冷却结束要补看一次。"""
 

@@ -19,6 +19,13 @@ from .attention import (
     message_text,
 )
 from .context_builder import build_chat_context, collect_message
+from .dialogue import (
+    Addressee,
+    DialogueView,
+    addressee_markers,
+    describe_dialogue,
+    resolve_addressees,
+)
 from .forward import (
     check_is_miniapp,
     check_is_multimsg_forward,
@@ -31,8 +38,12 @@ from .forward_filter import (
     build_append_nodes,
     build_forward_nodes,
     build_nodes,
-    normalize_settings as normalize_forward_filter,
+    is_sender_filtered,
+    normalize_sender_filter,
     strip_tail_ads,
+)
+from .forward_filter import (
+    normalize_settings as normalize_forward_filter,
 )
 from .history import (
     collect_history,
@@ -98,6 +109,12 @@ __all__ = [
     # 上下文
     "build_chat_context",
     "collect_message",
+    # 对话关系（谁对谁说的）
+    "Addressee",
+    "DialogueView",
+    "addressee_markers",
+    "describe_dialogue",
+    "resolve_addressees",
     # 历史
     "collect_history",
     "get_group_latest_msg",
@@ -118,6 +135,8 @@ __all__ = [
     "build_append_nodes",
     "build_forward_nodes",
     "build_nodes",
+    "is_sender_filtered",
     "normalize_forward_filter",
+    "normalize_sender_filter",
     "strip_tail_ads",
 ]

@@ -10,7 +10,9 @@ from __future__ import annotations
 from typing import Any
 
 from .chat import build_chat_tools
+from .forward import build_forward_tools
 from .history import build_history_tools
+from .history_bulk import build_history_bulk_tools
 from .media import build_media_tools
 from .methods import build_method_tools
 from .moderation import build_moderation_tools
@@ -36,8 +38,11 @@ from .registry import (
 )
 
 # 与旧版 ``_build_tools()`` 返回顺序一致（模型看到的工具顺序不变）
+# ``read_forward`` 紧挨 ``ocr_img``：两个都是「读内容」的工具，模型遇到
+# 【转发聊天记录 N 条】时最容易想起的就是它们。
 TOOL_ORDER = (
     "ocr_img",
+    "read_forward",
     "send_message",
     "get_message",
     "add_Method",
@@ -50,6 +55,9 @@ TOOL_ORDER = (
     "recall_msg",
     "send_dress",
     "get_msg_history",
+    "fetch_history",
+    "digest_user",
+    "recall_result",
     "update_person",
     "update_group",
 )
@@ -57,7 +65,9 @@ TOOL_ORDER = (
 _BUILDERS = (
     build_media_tools,
     build_chat_tools,
+    build_forward_tools,
     build_history_tools,
+    build_history_bulk_tools,
     build_method_tools,
     build_moderation_tools,
     build_relation_tools,
@@ -101,7 +111,9 @@ __all__ = [
     "_current_user_text_var",
     "api_of",
     "build_chat_tools",
+    "build_forward_tools",
     "build_history_tools",
+    "build_history_bulk_tools",
     "build_media_tools",
     "build_method_tools",
     "build_moderation_tools",

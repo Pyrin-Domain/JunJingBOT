@@ -17,6 +17,73 @@ from typing import Any
 from .config import ConnectionSettings, coerce_connection_settings
 from .connection import OneBotConnection
 
+#: 直接带 ``message`` 的发送动作；file 段补名字在这里统一做，业务层不用管。
+_MESSAGE_ACTIONS = frozenset({"send_group_msg", "send_private_msg"})
+
+
+def _normalize_message_params(action: str, params: dict[str, Any] | None) -> dict[str, Any] | None:
+    """给 ``file`` 段补 ``name``（SnowLuma 缺它会被 QQ 以 -134 拒绝）。
+
+    放在 ``_call_api`` 这个唯一出口，``send_group_message`` /
+    ``send_private_message`` 的所有调用方都自动兼容 NapCat 与 SnowLuma。
+    """
+    if action not in _MESSAGE_ACTIONS or not isinstance(params, dict):
+        return params
+    message = params.get("message")
+    if message is None:
+        return params
+    from AbstractionLayer.segments import normalize_outgoing
+
+    normalized = normalize_outgoing(message)
+    if normalized is message:
+        return params
+    return {**params, "message": normalized}
+
+
+class OneBotAPIError(RuntimeError):
+    """协议端明确返回了失败（``status != ok`` 或 ``retcode != 0``）。
+
+    为什么要抛：协议端（NapCat / SnowLuma）在「群文件上传失败」「被禁言」
+    这类情况下**仍然会回一条正常格式的响应**，只是 ``retcode`` 非 0。旧代码
+    只看有没有异常，于是把失败当成功 —— 既不重试，也不触发回退文案。
+    """
+
+    def __init__(
+        self,
+        action: str,
+        retcode: int | None = None,
+        message: str = "",
+        raw: dict | None = None,
+    ):
+        self.action = action
+        self.retcode = retcode
+        self.message = message
+        self.raw = raw or {}
+        detail = f"retcode={retcode}" if retcode is not None else "no retcode"
+        if message:
+            detail = f"{detail} {message}"
+        super().__init__(f"{action} 失败：{detail}")
+
+
+def ensure_ok(action: str, result: Any) -> Any:
+    """``status`` / ``retcode`` 正常就原样返回，否则抛 :class:`OneBotAPIError`。
+
+    判据与 :func:`AbstractionLayer.kernal.api_result` 一致：只有
+    ``status == "ok"``（或缺失）且 ``retcode in (0, None)`` 才算成功。
+    """
+    if not isinstance(result, dict):
+        return result
+    status = str(result.get("status") or "")
+    retcode = result.get("retcode")
+    if status in ("", "ok") and retcode in (0, None):
+        return result
+    raise OneBotAPIError(
+        action,
+        retcode if isinstance(retcode, int) else None,
+        str(result.get("message") or result.get("wording") or ""),
+        result,
+    )
+
 
 class OneBotAPI:
     """OneBot API 接口（NapCat / SnowLuma 通用）。
@@ -43,6 +110,8 @@ class OneBotAPI:
         self._history_cursor_probed: str | None = None
         # 懒创建的协议内核（承载实测出的后端能力）。
         self._kernel = None
+        # 懒查的「必须成功」动作集合（来自能力表，见 strict_actions）
+        self._strict_actions: frozenset[str] | None = None
 
     # ── 后端信息 ──
     @property
@@ -119,9 +188,30 @@ class OneBotAPI:
 
     # ── 通用 ──
     async def _call_api(self, action: str, params: dict | None = None, timeout: float | None = None) -> dict:
+        params = _normalize_message_params(action, params)
         if timeout is None:
-            return await self.connection.call_api(action, params or {})
-        return await self.connection.call_api(action, params or {}, timeout=timeout)
+            result = await self.connection.call_api(action, params or {})
+        else:
+            result = await self.connection.call_api(action, params or {}, timeout=timeout)
+        # 有副作用的动作必须校验：``retcode != 0`` 时抛错，别让上层以为发出去了。
+        if action in self.strict_actions:
+            return ensure_ok(action, result)
+        return result
+
+    @property
+    def strict_actions(self) -> frozenset[str]:
+        """必须 ``retcode == 0`` 的动作集合（来自后端能力表）。
+
+        不经过 ``self.kernel``：那会在 ``_call_api`` 里造内核，而内核又包着
+        ``_call_api``，多绕一圈没有收益，还可能踩到初始化顺序。
+        """
+        if self._strict_actions is None:
+            from AbstractionLayer.kernal import capabilities_for
+
+            self._strict_actions = frozenset(
+                capabilities_for(self.backend).strict_actions
+            )
+        return self._strict_actions
 
     # ── 历史游标实测 ──
     async def verify_history_cursor(self, group_id: Any = None) -> str:
@@ -155,7 +245,9 @@ class OneBotAPI:
 
         返回 :class:`AbstractionLayer.RelayPlan`：``action="single"`` 走
         ``forward_group_single_msg`` 整卡搬，``action="rebuild"`` 必须重建成
-        node 再 ``send_group_forward_msg``（SnowLuma 跨群搬嵌套记录属于这种）。
+        node 再 ``send_group_forward_msg``（SnowLuma 跨群搬嵌套记录属于这种），
+        ``action="skip"`` 表示内容拿不全（内层多消息卡 ``m_resid`` 为空），
+        按策略**不搬**——既不整卡搬也不重建。
         """
         from AbstractionLayer import plan_relay
 
@@ -188,6 +280,9 @@ class OneBotAPI:
 
         :param timeout: 等响应的秒数。文件字节不过这条连接（协议端自己从本地读），
                         但带大文件时**响应要等上传结束才回来**，默认 30 秒不够。
+
+        失败会抛 :class:`OneBotAPIError`（``send_group_msg`` 在能力表的
+        ``strict_actions`` 里，见 :meth:`_call_api`）。
         """
         return await self._call_api(
             action="send_group_msg",
@@ -198,12 +293,43 @@ class OneBotAPI:
     async def send_private_message(
         self, user_id, message: Any, *, timeout: float | None = None
     ) -> dict:
-        """发送私聊消息（``timeout`` 同上）。"""
+        """发送私聊消息（``timeout`` / 失败抛错同上）。"""
         return await self._call_api(
             action="send_private_msg",
             params={"user_id": user_id, "message": message},
             timeout=timeout,
         )
+
+    # ── 闪传（群文件上传失败时的备用文件通道）──
+    async def create_flash_task(
+        self, files: list[str] | str, *, name: str | None = None, timeout: float | None = None
+    ) -> dict:
+        """创建闪传上传任务并等它传完，返回协议端响应。
+
+        ``files`` 是协议端可读的本地路径（``images.to_napcat`` 转过的形式）。
+        NapCat / SnowLuma 都接受字符串或字符串数组；返回形状不同，取
+        fileset id 的路径见 ``BackendCapabilities.flash_fileset_path``。
+        """
+        params: dict[str, Any] = {"files": files}
+        if name:
+            params["name"] = name
+        return await self._call_api("create_flash_task", params, timeout=timeout)
+
+    async def send_flash_msg(
+        self,
+        fileset_id: str,
+        *,
+        group_id: Any = None,
+        user_id: Any = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """把闪传文件集作为卡片消息发到群 / 私聊（``group_id`` 优先）。"""
+        params: dict[str, Any] = {"fileset_id": str(fileset_id)}
+        if group_id is not None:
+            params["group_id"] = group_id
+        elif user_id is not None:
+            params["user_id"] = user_id
+        return await self._call_api("send_flash_msg", params, timeout=timeout)
 
     async def send_group_img(self, group_id, img_addr: str, summary: str = "") -> dict:
         """发送群图片"""
@@ -426,6 +552,54 @@ class OneBotAPI:
         """获取小程序 Ark 卡片"""
         return await self._call_api(action="get_mini_app_ark", params=params)
 
+    # ── 收藏表情（账号自定义表情）──
+    async def fetch_custom_faces(self) -> tuple:
+        """抓当前账号的收藏表情。
+
+        两个后端给的数据字段不一样（SnowLuma 是 ``emoji_id``，NapCat 是
+        ``resId``），这里已经归一成 :class:`AbstractionLayer.face.CustomFace`，
+        主键是**用户自己写的备注（desc）**，没写备注就用 md5。
+
+        抓失败返回空元组，不抛异常：表情包只是加分项，不能连累主流程。
+        """
+        from AbstractionLayer.face import fetch_custom_faces
+
+        try:
+            return await fetch_custom_faces(self.kernel)
+        except Exception:  # noqa: BLE001 - 抓不到表情不该影响启动
+            return ()
+
+    async def send_custom_face(
+        self,
+        key,
+        *,
+        group_id=None,
+        user_id=None,
+        reply_to=None,
+    ) -> dict:
+        """按备注名发表情（收藏表情）。
+
+        后端有专用动作（SnowLuma 的 ``send_custom_face``）就走专用动作，
+        否则退回 image 段——两条路都保住「收藏表情」的外观。
+
+        失败会抛 :class:`OneBotAPIError`（发包动作在能力表的 ``strict_actions`` 里）。
+        """
+        from AbstractionLayer.face import CustomFaceService
+
+        service = CustomFaceService(self.kernel)
+        await service.refresh()
+        result = await service.send(
+            key, group_id=group_id, user_id=user_id, reply_to=reply_to
+        )
+        if not result.ok:
+            raise OneBotAPIError(
+                action="send_custom_face",
+                retcode=result.retcode,
+                message=result.error or "发送收藏表情失败",
+                raw=result.raw,
+            )
+        return result.data if result.data is not None else {"message_id": None}
+
 
 # 旧名字，方便迁移期对照；新代码建议用 OneBotAPI。
 NapCatAPI = OneBotAPI
@@ -434,6 +608,8 @@ NapCatAPIInterface = OneBotAPI
 
 __all__ = [
     "OneBotAPI",
+    "OneBotAPIError",
     "NapCatAPI",
     "NapCatAPIInterface",
+    "ensure_ok",
 ]

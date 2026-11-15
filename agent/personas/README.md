@@ -21,8 +21,34 @@
 
 - 相对路径按项目根目录解析，也可以写绝对路径。
 - 文件缺失或为空时回退到 `agent/prompts.py` 的 `FALLBACK_PERSONA` / `FALLBACK_CORE`。
+- 仓库里只提交 `junjing.example.md`；真实的 `junjing.md` 在 `.gitignore` 里。
+  新环境先把 example 复制成 `junjing.md` 再改。
 - 改文件后需要重启 Bot（Agent 初始化时读一次）。
 - 输出格式、工具、系统动作、表情包目录仍由 `agent/prompts.py` 负责；人设文件只决定「我是谁、我怎么说话」。
+
+## 口头禅文件
+
+Agent 自己的口头禅放在 `agent/catchphrases.json`，由 `agent.catchphrase_file`
+指定（仓库里只提交 `catchphrases.example.json`）：
+
+```json
+[
+  {
+    "context": "那当然啦~",
+    "describe": "被夸可爱、被夸厉害时说；表达开心又有点得意"
+  },
+  {
+    "context": "你猜",
+    "describe": "被问到是不是机器人时用；不正面回答，带点调皮"
+  }
+]
+```
+
+- `context` 是口头禅正文，`describe` 是使用说明（什么时候用、什么意思）。
+- 提示词把它当「命中时优先使用」的表达：情境对得上就优先用，没有合适情境就不说。
+- `describe` 里的「」引号例子会当轻量触发词，命中时本轮会额外提醒模型优先使用。
+- 也兼容顶层 `{"catchphrases": [...]}`，以及 `phrase` / `text` 等字段别名。
+- 修改后需要重启 Bot。
 
 ## 关系档案（不是提示词）
 

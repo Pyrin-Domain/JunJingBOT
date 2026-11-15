@@ -18,6 +18,7 @@ export const state = {
   groupsError: '',     // 群列表没取到时的原因
   listEditors: [],     // 已渲染的列表编辑器（群列表刷新后重画名字与下拉框）
   tab: 'status',
+  subTabs: {},         // 页面内的二级菜单：{ [页面 id]: 当前分组 id }
   statusTimer: null,   // 运行状态自动刷新
 };
 
@@ -29,8 +30,10 @@ export const TABS = [
   { id: 'basic', label: '基础参数' },
   { id: 'agent', label: 'AI Agent' },
   { id: 'interject', label: '群聊插话' },
+  { id: 'psychology', label: '心理分析' },
   { id: 'meme', label: '表情包' },
   { id: 'forward', label: '搬运与去重' },
+  { id: 'image_filter', label: '图片过滤' },
   { id: 'text', label: '提示词与回复' },
   { id: 'keywords', label: '关键词 / 命令' },
   { id: 'raw', label: '原始 JSON' },
@@ -47,6 +50,9 @@ export const ACTION_HINTS = {
   fabric: '无参数：按 [qq:xxx][name:xxx][context:xxx] 造一条转发节点发出去',
   get_music: '无参数：点歌，取消息里 [歌名] 作为搜索词',
   img_forward_create_task: '无参数：img_fd -g 群 / -u QQ / -a，再用 -b / -e 标出区间',
+  jm: '无参数：/jm <id> 占位图，只在私聊回执',
+  sex_filter_test: '无参数：回复一条聊天记录发送 junjingtest_sex_filter，全量跑图片过滤并回逐张图的判定报告（目前只在测试群触发）',
+  psychology: '无参数：关键词「分析心理」的等价入口；回复一条消息 / 聊天记录，用「心理分析」页配置的独立模型做侧写',
 };
 
 /** 普通字段定义：基础 / 插话 / 搬运 / 提示词。 */
@@ -81,11 +87,42 @@ export const FIELDS = {
   forward: [
     { path: 'auto_forward.enable', label: '启用自动搬运', type: 'bool' },
     { path: 'auto_forward.dedup', label: '启用内容去重（搬过就不再搬）', type: 'bool', hint: '关闭后同一内容会被反复搬运' },
+    {
+      path: 'auto_forward.filter',
+      label: '转发过滤（按来源群 + 发送者屏蔽）',
+      type: 'objlist',
+      full: true,
+      idKey: 'group_id',
+      addLabel: '＋ 添加屏蔽规则',
+      blankNote: '条没填来源群号',
+      dupNote: '条来源群号重复',
+      hint: '命中这些规则里的「来源群 + 外层发送者」时，聊天记录转发会直接跳过：不进去重、不交给 AI。bot 图片 / 小程序转发不受影响；留空 = 不过滤',
+      empty: () => ({ group_id: '', user_id: [] }),
+      subFields: [
+        { key: 'group_id', label: '来源群号', kind: 'id', placeholder: '事件所在的群号，不是目标群' },
+        { key: 'user_id', label: '要屏蔽的发送者 QQ', kind: 'intlist', item: 'qq' },
+      ],
+    },
     { path: 'auto_forward.groupid_list', label: '监听的来源群', type: 'intlist', item: 'group', full: true, hint: '只有这些群里发的转发卡片才会被搬运；可用「从群列表添加」按群名选' },
     { path: 'auto_forward.target_groupid', label: '搬运的目标群', type: 'intlist', item: 'group', full: true, hint: '会跳过消息原本所在的群' },
     { path: 'auto_forward.userid_list', label: '私聊来源 QQ（userid_list）', type: 'intlist', item: 'qq', full: true, hint: '私聊消息只有这些 QQ 会被搬运；留空 = 不搬任何私聊。也认 user_id_list 这种写法' },
     { path: 'auto_forward.task_userid', label: '另外私聊转发的好友（task_userid）', type: 'intlist', item: 'qq', full: true, hint: '搬运时除了目标群，还会私聊转发给这些好友' },
     { path: 'auto_forward.auto_img_forward_from_bot.enable', label: '机器人发的图片也自动搬运', type: 'bool' },
+    { path: 'forward_image_dedup.enable', label: '启用机器人图片查重', type: 'bool', hint: '关闭后白名单机器人发的图会直接搬运，不查送达记录；图片过滤门仍然生效' },
+    {
+      path: 'forward_image_dedup.keep_days',
+      label: '图片送达记录保留天数',
+      type: 'number',
+      step: 1,
+      hint: '同一张图在同一个群 / 私聊多久之内不重复搬运；0 = 永不清理（重启后仍然记得）。图片查重不受「启用内容去重」影响，单独在这里配置',
+    },
+    {
+      path: 'forward_image_dedup.image_keep_days',
+      label: '图片内容身份保留天数',
+      type: 'number',
+      step: 1,
+      hint: '按图片文件哈希识别「同一张图换了消息 id」的保留天数；0 = 跟随上面的送达记录保留天数，不单独清理',
+    },
     {
       path: 'auto_forward.auto_img_forward_from_bot.bot_list',
       label: '视为机器人的 QQ（可限定生效范围）',
@@ -133,7 +170,11 @@ export const FIELDS = {
     { path: 'prompts.group_context', label: '群聊补充说明（可选）', type: 'textarea', full: true, hint: '群号/发言人/时间/历史已经自动结构化，这里只写模型看不出来的背景（如「这是大连理工的校园群」）；留空即可' },
     { path: 'prompts.private_context', label: '私聊补充说明（可选）', type: 'textarea', hint: '同上，留空即可' },
     { path: 'prompts.history_command_regex', label: '「历史」指令前缀正则', type: 'text' },
-    { path: 'replies.forwarded_already', label: '「搬过了」图片说明', type: 'text' },
+    { path: 'replies.forwarded_already', label: '「搬过了」文字说明', type: 'text', hint: '只在没配商城表情时才用：退回本地图片时当图片说明' },
+    { path: 'auto_forward.forwarded_already_mface.summary', label: '「搬过了」表情名', type: 'text', hint: '商城表情（mface）：只发这一个表情，表情名就是这句话，不用再配文字' },
+    { path: 'auto_forward.forwarded_already_mface.emoji_id', label: '「搬过了」表情 emoji_id', type: 'text' },
+    { path: 'auto_forward.forwarded_already_mface.emoji_package_id', label: '「搬过了」表情包 ID', type: 'text' },
+    { path: 'auto_forward.forwarded_already_mface.key', label: '「搬过了」表情 key', type: 'text' },
     { path: 'replies.network_upgrade', label: '校园网升级提示文案', type: 'text' },
   ],
 };

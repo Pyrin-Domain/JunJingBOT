@@ -19,17 +19,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from contextvars import ContextVar
+from datetime import date
 from typing import Any, Optional
 
 from messaging.meme import configure as configure_memes
 
+from .catchphrase import catchphrase_hint, load_catchphrases_for_settings
 from .config import (
     find_model_entry,
     model_label,
     resolve_llm_config,
     resolve_model_entry,
 )
-from .hints import _image_urls, build_action_hint, build_meme_hint
+from .hints import _image_urls, build_action_hint, build_meme_hint, wants_followup
 from .logger import append_log, build_log_entry, configure_log_dir
 from .output import (
     _ANSWER_TOOLS,
@@ -53,12 +57,16 @@ from .prompts import (
     _RELATION_EXTRACT_SYSTEM,
     build_system_prompt,
     interject_hint,
+    persona_voice_excerpt,
     _REPLY_CHAIN_HINT,
     _REPHRASE_SYSTEM,
     SYSTEM_PROMPT,
 )
 from .relations import RelationStore
+from .result_vault import ResultVault, thread_key
 from .router import ModelRoute, ModelRouter
+from .thread_turns import ThreadTurns
+from .thread_verdict import VERDICT_NEW, resolve_verdict
 from .tools import (
     _MISSING,
     _current_context_var,
@@ -76,6 +84,18 @@ from .tools import (
 from .tools.methods import MethodLibrary
 
 logger = logging.getLogger("QQBotAgent")
+
+#: 当前这一轮是哪个会话、走的哪个实验臂。LLM 回调里用它给日志打标 ——
+#: 没有这两项，事后只能靠「离哪条 [会话] 行最近」去猜，judge（GLM）的调用
+#: 还会混进来，统计出来的命中率直接是错的。
+_llm_session_var: ContextVar[str] = ContextVar("llm_session", default="")
+_llm_arm_var: ContextVar[str] = ContextVar("llm_arm", default="")
+
+# judge 判了 silent、理由却说「我能答」——这两种输出互相打架，
+# 值得单独喊一嗓子，不然日志看着像闹矛盾，其实没人知道当时发生了什么。
+_SILENT_BUT_ANSWERABLE = re.compile(
+    r"(可以答|能答|该答|应该答|我来答|我来回答|能回答|可以回答|答得上|接得住)"
+)
 
 # ── langchain 可选依赖：没装也允许 import（BotApp 会捕获初始化失败）──
 try:  # pragma: no cover - 有依赖时走这里
@@ -127,6 +147,58 @@ MODEL_TYPE = "deepseek"
 _MAX_CONTINUE_ROUNDS = 2
 _MAX_OUT_MESSAGES = 6
 
+# 承接上一轮内容时，自动带上的留存正文上限（字符）。再多的部分让模型用
+# recall_result(offset=...) 自己取 —— 这里的目标是「一定看得到」，不是「全塞进去」。
+_AUTO_INJECT_CHARS = 6000
+
+
+def _render_vault_body(entry: Any, limit: int = _AUTO_INJECT_CHARS) -> str:
+    """把留存正文直接铺进本轮提示（只在用户明确承接上一轮时用）。"""
+    text = str(getattr(entry, "text", "") or "")
+    shown = text[: max(0, int(limit))]
+    result_id = getattr(entry, "result_id", "")
+    label = getattr(entry, "label", "") or getattr(entry, "tool", "")
+    head = (
+        f"[上一轮的结果原文 · {result_id} · {label} · "
+        f"已经自动带上，不用再 recall_result]"
+    )
+    rest = len(text) - len(shown)
+    if rest <= 0:
+        return f"{head}\n{shown}"
+    return (
+        f"{head}\n{shown}\n"
+        f"…（原文共 {len(text)} 字，还有 {rest} 字没带上；"
+        f'需要就 recall_result(result_id="{result_id}", offset={len(shown)})）'
+    )
+
+
+def _cached_tokens(response: Any) -> tuple[int, int]:
+    """从 provider 的 usage 里抠出 ``(prompt tokens, 命中缓存 tokens)``。
+
+    字段名随后端变：OpenAI 是 ``prompt_tokens_details.cached_tokens``，
+    DeepSeek 是 ``prompt_cache_hit_tokens``。拿不到就当 0（不是错误，
+    只说明这个网关没告诉你）。
+    """
+    payload = getattr(response, "llm_output", None)
+    if not isinstance(payload, dict):
+        return 0, 0
+    usage = payload.get("token_usage") or payload.get("usage") or {}
+    if not isinstance(usage, dict):
+        return 0, 0
+
+    def _num(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    total = _num(usage.get("prompt_tokens"))
+    cached = _num(usage.get("prompt_cache_hit_tokens"))
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached = cached or _num(details.get("cached_tokens"))
+    return total, cached
+
 
 class LLMCallbackHandler(BaseCallbackHandler):
     """把 LLM / 工具的调试信息写进 ``QQBotAgent`` logger。"""
@@ -140,6 +212,19 @@ class LLMCallbackHandler(BaseCallbackHandler):
         logger.debug(
             f"[LLM] 收到回复: {content[:100]}{'...' if len(content) > 100 else ''}"
         )
+        # 服务端 prompt 缓存到底有没有命中，只有 usage 里能看出来。不同网关字段
+        # 名不一样（OpenAI 的 prompt_tokens_details.cached_tokens / DeepSeek 的
+        # prompt_cache_hit_tokens），拿不到就打 0 —— 打出来才知道值不值得为它
+        # 调整消息结构（稳定前缀放前面）。
+        total, cached = _cached_tokens(response)
+        if total:
+            session = _llm_session_var.get()
+            arm = _llm_arm_var.get()
+            tag = f"[{session}|{arm}]" if session else ""
+            logger.info(
+                f"[LLM]{tag} prompt {total} tokens，缓存命中 {cached}"
+                f"（{int(cached * 100 / total) if total else 0}%）"
+            )
 
     def on_llm_error(self, error, **kwargs):
         logger.error(f"[LLM] 请求出错: {error}")
@@ -187,8 +272,78 @@ class QQBotAgent:
         # 人物关系档案：data/relations/；没有 settings 时是禁用状态（测试友好）
         self.relations = RelationStore.from_settings(settings)
 
+        # 工具结果的跨轮暂存：模型上一轮翻出来的大段内容，下一轮还能取回
+        # （``recall_result``），不用重新翻一遍历史。见 agent/result_vault.py。
+        self.result_vault = ResultVault()
+
+        # 多轮留存：第一轮的完整上下文冻结，之后每轮只追加增量（见 thread_turns.py）。
+        # 默认关闭 —— 先看日志里的「缓存命中 X%」有没有起来，再决定要不要开。
+        memory_config: dict = {}
+        if settings is not None:
+            try:
+                memory_config = settings.section("thread_memory") or {}
+            except Exception:  # noqa: BLE001 - 旧配置没有这个段
+                memory_config = {}
+        self._thread_memory_enabled = bool(memory_config.get("stable_prefix", False))
+        # 裁决：模型在输出里写 <thread>新话题</thread> 就丢掉前面那段；漏写则由
+        # thread_verdict.resolve_verdict 按代码信号兜底（默认留）。
+        self._thread_memory_verdict = bool(memory_config.get("verdict", True))
+        # 「隔太久就当新话题」：比 ttl 更短，0 表示不按时间判（只信模型）。
+        try:
+            self._thread_memory_new_after = (
+                float(memory_config.get("new_after_minutes") or 0) * 60
+            )
+        except (TypeError, ValueError):
+            self._thread_memory_new_after = 15 * 60
+        # 灰度：留空 = 全部会话生效；填了群号就只在这些群生效。
+        self._thread_memory_groups = {
+            str(item).strip()
+            for item in (memory_config.get("groups") or [])
+            if str(item).strip()
+        }
+        # 对照实验：1 = 奇数日开、0 = 偶数日开，None = 不按日轮换。
+        # 按「天」而不是按「条」翻转，是因为这个功能要连续几轮才能攒出可回放的
+        # 上下文；按条随机的话实验组永远从冷启动开始，等于没测。
+        parity = memory_config.get("ab_day_parity")
+        try:
+            self._thread_memory_day_parity = (
+                None if parity is None or parity == "" else int(parity) % 2
+            )
+        except (TypeError, ValueError):
+            self._thread_memory_day_parity = None
+        try:
+            self.thread_turns = ThreadTurns(
+                ttl=float(memory_config.get("ttl_minutes") or 30) * 60,
+                max_turns=int(memory_config.get("max_turns") or 8),
+                max_chars=int(memory_config.get("max_chars") or 12000),
+            )
+        except (TypeError, ValueError):
+            self.thread_turns = ThreadTurns()
+
+        # 启动就说清楚这条链路是不是真的开着 / 开在哪些群 —— 排查时第一眼看这个，
+        # 别再靠「我明明改了配置」来推断。
+        parity = self._thread_memory_day_parity
+        logger.info(
+            "多轮留存（stable_prefix）: %s｜灰度群: %s｜裁决: %s｜新话题阈值: %s｜对照实验: %s",
+            "开" if self._thread_memory_enabled else "关",
+            ",".join(sorted(self._thread_memory_groups)) or "全部会话",
+            "开" if self._thread_memory_verdict else "关（只保留）",
+            (
+                f"{self._thread_memory_new_after / 60:.0f} 分钟"
+                if self._thread_memory_new_after > 0
+                else "不按时间判"
+            ),
+            (
+                f"{'奇' if parity else '偶'}数日开"
+                if parity is not None
+                else "无（始终开）"
+            ),
+        )
+
         self.model_type = MODEL_TYPE
         self._recent_replies: dict[str, list[str]] = {}
+        self._relation_tasks: set[asyncio.Task] = set()
+        self._closed = False
 
         # 日志目录：settings 有就用 logs/agent
         if settings is not None:
@@ -221,6 +376,7 @@ class QQBotAgent:
             f"已注册 {len(self.tools)} 个工具: {[getattr(t, 'name', '?') for t in self.tools]}"
         )
 
+        self.catchphrases = load_catchphrases_for_settings(self.settings)
         self.system_prompt = SystemMessage(content=self._build_system_prompt())
         self._setup_model_routes(merged_config)
         logger.info("QQBotAgent 初始化完成")
@@ -409,11 +565,144 @@ class QQBotAgent:
             )
         return await self.agent.ainvoke(payload)
 
+    # ════════════════════ 多轮留存 ════════════════════
+    def _memory_arm(
+        self, thread_id: str = "", *, today: date | None = None
+    ) -> tuple[bool, str]:
+        """这一轮走不走多轮留存，返回 ``(是否生效, 原因)``。
+
+        原因会写进日志（``多轮 arm=on/off（…）``），事后按臂分桶统计时不用再猜。
+        ``ab_day_parity`` 是给对照实验用的：同一天内所有群行为一致，隔天翻转，
+        这样「网关今天缓存热不热」这种日级噪声会平均分到两边。
+        """
+        if not getattr(self, "_thread_memory_enabled", False):
+            return False, "disabled"
+
+        allowed = getattr(self, "_thread_memory_groups", None) or set()
+        if allowed and thread_id:
+            key = str(thread_id)
+            gid = key.split("_", 1)[-1] if "_" in key else key
+            # 群号写 "20001" 或 "group_20001" 都认
+            if key not in allowed and gid not in allowed:
+                return False, "not-in-groups"
+
+        parity = getattr(self, "_thread_memory_day_parity", None)
+        if parity is None:
+            return True, "on"
+
+        day = (today or date.today()).day
+        label = "奇数日" if day % 2 else "偶数日"
+        if day % 2 != int(parity) % 2:
+            return False, f"ab-day {day} 号{label}（对照组）"
+        return True, f"ab-day {day} 号{label}（实验组）"
+
+    def _thread_memory(self, thread_id: str = ""):
+        """开关打开时返回留存器；关闭返回 None（行为与旧版完全一致）。"""
+        ok, _ = self._memory_arm(thread_id)
+        return getattr(self, "thread_turns", None) if ok else None
+
+    def _verdict_of(self, parsed: Any, *, turns: list, user_text: str) -> tuple[str, str]:
+        """本轮该不该丢掉前面那段：返回 ``(verdict, source)``。
+
+        裁决**下一轮生效**：模型说「新话题」时它已经生成完这一轮的回复了，
+        这一轮仍然是带着旧 turns 生成的，来不及改。
+        """
+        if not getattr(self, "_thread_memory_verdict", True):
+            return "", "disabled"
+        return resolve_verdict(
+            str((parsed or {}).get("thread") or ""),
+            turns=turns,
+            user_text=user_text,
+            new_after=float(getattr(self, "_thread_memory_new_after", 0) or 0),
+        )
+
+    @staticmethod
+    def _build_turn_messages(turns: list, current_text: str) -> list[BaseMessage]:
+        """把留存的历史轮次拼成 messages，末尾接本轮增量。"""
+        out: list[BaseMessage] = []
+        for turn in turns:
+            out.append(HumanMessage(content=turn.human))
+            out.append(AIMessage(content=turn.ai))
+        out.append(HumanMessage(content=current_text))
+        return out
+
+    @staticmethod
+    def _drop_turns_for_new_topic(
+        memory: Any, thread_id: str, turns: list, verdict: str
+    ) -> None:
+        """本轮没接话、但裁决是新话题：把旧的一段清掉，下一轮重新开始。"""
+        if memory is None or verdict != VERDICT_NEW or not turns:
+            return
+        memory.reset(thread_id)
+        logger.info(
+            f"[会话 {thread_id}] 裁决为新话题（本轮没接话），多轮留存已清空"
+        )
+
+    def _remember_turn(
+        self,
+        memory: Any,
+        thread_id: str,
+        *,
+        turns_before: list,
+        full_text: str,
+        incremental: str,
+        ai_text: str,
+        continued: bool,
+        replied: bool,
+        token: str = "",
+        verdict: str = "",
+    ) -> None:
+        """本轮结束后记账；只在「真的回了话、且没续说」时记。
+
+        续说那轮实际是 ``H→A→H→A``，这里只存得下一对 ``(H, A)``，回放序列对
+        不上、前缀已经不成立，清掉重来更干净。
+
+        ``verdict == "new"`` 表示这一段该断了：用**本轮的完整上下文**重开一段，
+        而不是空着。本轮就是拿完整上下文答的，把它当成新一段的起点才自洽；
+        丢掉它的话下一轮还得重渲染一遍完整上下文，白多一次前缀断裂。
+        """
+        try:
+            if continued:
+                memory.reset(thread_id)
+                logger.info(f"[会话 {thread_id}] 续说过，多轮留存重置")
+                return
+            if not replied or not str(ai_text or "").strip():
+                # 没接话也要认裁决：对方换了话题、这轮没吭声，下一轮不该还拖着
+                # 上一段的上下文。
+                self._drop_turns_for_new_topic(memory, thread_id, turns_before, verdict)
+                return
+            if verdict == VERDICT_NEW and turns_before:
+                memory.start(thread_id, full_text, ai_text, token=token)
+                logger.info(
+                    f"[会话 {thread_id}] 裁决为新话题，多轮留存重开一段"
+                    f"（完整上下文 {len(full_text)} 字）"
+                )
+                return
+            if turns_before:
+                if not memory.append(thread_id, incremental, ai_text, token=token):
+                    logger.info(f"[会话 {thread_id}] 多轮留存到上限，已重置")
+            else:
+                memory.start(thread_id, full_text, ai_text, token=token)
+                logger.info(
+                    f"[会话 {thread_id}] 多轮留存起始（完整上下文 {len(full_text)} 字）"
+                )
+        except Exception as exc:  # noqa: BLE001 - 留存失败不能影响回复
+            logger.warning(f"[会话 {thread_id}] 多轮留存写入失败: {exc}")
+
     async def _invoke_judge(self, messages: list[BaseMessage]) -> Any:
-        router = getattr(self, "judge_router", None)
-        if router is not None:
-            return await router.ainvoke(messages, use_agent=False)
-        return await self.llm.ainvoke(messages)
+        # 判断器不是主模型：显式打标成 judge，否则它会继承上一轮 chat() 留在
+        # ContextVar 里的会话号，被统计成「这个群的主模型调用」（上一次统计就是
+        # 这么把 261 次判断器调用混进去的）。
+        session_token = _llm_session_var.set("judge")
+        arm_token = _llm_arm_var.set("")
+        try:
+            router = getattr(self, "judge_router", None)
+            if router is not None:
+                return await router.ainvoke(messages, use_agent=False)
+            return await self.llm.ainvoke(messages)
+        finally:
+            _llm_session_var.reset(session_token)
+            _llm_arm_var.reset(arm_token)
 
     async def _invoke_reply_light(self, messages: list[BaseMessage]) -> Any:
         router = getattr(self, "reply_router", None)
@@ -491,10 +780,19 @@ class QQBotAgent:
         if recent:
             prompt += f"你说过的（不要再用）：{' / '.join(recent[-4:])}\n"
         prompt += "请顺着对方的话换一种说法，意思相近但用词明显不同。"
+        # 人设接上：改写提示词很短，光靠「你是君景」一句话模型会退回通用中文，
+        # 改出来阴阳怪气、没有可爱感。把人设里「说话方式」那段接过去。
+        system = _REPHRASE_SYSTEM
+        try:
+            voice = persona_voice_excerpt(self.settings)
+        except Exception:  # noqa: BLE001 - 人设读不到就照常改写
+            voice = ""
+        if voice:
+            system = f"{system}\n\n【君景说话的方式】\n{voice}"
         try:
             res = await self._invoke_reply_light(
                 [
-                    SystemMessage(content=_REPHRASE_SYSTEM),
+                    SystemMessage(content=system),
                     HumanMessage(content=prompt),
                 ]
             )
@@ -807,9 +1105,19 @@ class QQBotAgent:
         *,
         thread_id: str = "default",
     ) -> Optional[str]:
-        base = messages[0].content if messages else ""
-        if not isinstance(base, str):
-            base = str(base)
+        """「该回却没回」时强制再生成一次。
+
+        ``messages`` 可能是累积的多轮对话（[H1, A1, H2, A2, H3]），早先这里取
+        ``messages[0]``，多轮之后会拿**第一轮的上下文**重新生成 —— 答非所问，
+        而且这条路径只在沉默时触发，线上很难发现。所以取最后一条 HumanMessage。
+        """
+        base = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                base = message.content if isinstance(message.content, str) else str(message.content)
+                break
+        if not base and messages:
+            base = str(messages[0].content or "")
         retry_messages: list[BaseMessage] = [
             HumanMessage(content=f"{base}\n\n{_FORCE_REPLY_HINT}")
         ]
@@ -927,6 +1235,48 @@ class QQBotAgent:
         if not context_text:
             parts.append(user_text)
 
+        # 上一轮工具结果的去向：
+        # - 用户这句话在承接（「挑几句 / 展开 / 具体说说」）→ **正文直接带上**，
+        #   保证模型一定看得到，不赌它会不会调 recall_result；
+        # - 其他情况 → 只给两三行索引，要不要取回由模型自己决定，不白占 token。
+        vault = getattr(self, "result_vault", None)
+        if vault is not None:
+            # 工具里只能从 context 拼 key，这里可能拿到别的 thread_id，两个都试。
+            keys = [thread_id]
+            try:
+                derived = thread_key(context)
+            except Exception:  # noqa: BLE001
+                derived = ""
+            if derived and derived not in keys:
+                keys.append(derived)
+
+            entry = None
+            for key in keys:
+                if not key:
+                    continue
+                try:
+                    entry = vault.get(key)
+                except Exception as exc:  # noqa: BLE001 - 留存坏了不能挡聊天
+                    entry = None
+                    logger.debug(f"[会话 {thread_id}] 可复用结果读取失败: {exc}")
+                if entry is not None:
+                    break
+
+            if entry is not None:
+                if wants_followup(user_text):
+                    parts.append(_render_vault_body(entry))
+                    logger.info(
+                        f"[会话 {thread_id}] 承接上一轮，自动带上 "
+                        f"{entry.result_id}（{len(entry.text)} 字）"
+                    )
+                else:
+                    hint = vault.render_hint(getattr(entry, "thread_id", "") or thread_id)
+                    if hint:
+                        parts.append(hint)
+                        logger.info(
+                            f"[会话 {thread_id}] 注入可复用结果索引 {len(hint)} 字"
+                        )
+
         action_hints: list[str] = []
         if action_check:
             action_hint = build_action_hint(
@@ -947,13 +1297,59 @@ class QQBotAgent:
                 f"[会话 {thread_id}] 注入动作检查: {combined_hint[:120]}"
             )
 
+        catch_hint = catchphrase_hint(user_text, getattr(self, "catchphrases", ()))
+        if catch_hint:
+            parts.append(f"[本轮口头禅]\n{catch_hint}")
+            logger.info(f"[会话 {thread_id}] 注入口头禅提示: {catch_hint[:120]}")
+
         if hint:
             parts.append(hint)
         elif context is not None and context.replies_to_me:
             parts.append(_REPLY_CHAIN_HINT)
             logger.info(f"[会话 {thread_id}] 续聊：对方回复了我上一条")
 
-        messages: list[BaseMessage] = [HumanMessage(content="\n".join(parts))]
+        full_text = "\n".join(parts)
+        # 本轮身份：并发下两条消息同时在跑时，用它给多轮留存去重（不能用文本，
+        # 连发两句一样的话会被误判成重复）。
+        turn_token = ""
+        if context is not None:
+            turn_token = str(getattr(context.current, "message_id", "") or "")
+        if not turn_token and event:
+            turn_token = str(event.get("message_id") or "")
+
+        arm_on, arm_reason = self._memory_arm(thread_id)
+        memory = getattr(self, "thread_turns", None) if arm_on else None
+        # 给 LLM 日志打标：会话 + 实验臂。事后统计命中率时直接按这两个字段分桶，
+        # 不用再靠「离哪条 [会话] 行最近」去猜（judge 的调用还会混进来）。
+        _llm_session_var.set(str(thread_id))
+        _llm_arm_var.set("on" if arm_on else "off")
+        logger.info(
+            f"[会话 {thread_id}] 多轮 arm={'on' if arm_on else 'off'}（{arm_reason}）"
+        )
+        turns: list = []
+        if memory is not None:
+            try:
+                turns = memory.get(thread_id)
+            except Exception as exc:  # noqa: BLE001
+                turns = []
+                logger.warning(f"[会话 {thread_id}] 多轮留存读取失败: {exc}")
+
+        incremental = ""
+        if turns:
+            # 已经有一段在跑：前缀（H1/A1/…）原样回放，本轮只追加增量。
+            # 不能再渲染 <scene>/<history>，否则前缀每轮都变，缓存全废。
+            incremental = (
+                context.render_increment(since=getattr(turns[-1], "token", ""))
+                if context is not None
+                else full_text
+            )
+            messages = self._build_turn_messages(turns, incremental)
+            logger.info(
+                f"[会话 {thread_id}] 多轮模式：回放 {len(turns)} 轮 + 增量 "
+                f"{len(incremental)} 字"
+            )
+        else:
+            messages = [HumanMessage(content=full_text)]
         log_context = context_text or extra_context
 
         logger.info(f"[会话 {thread_id}] 正在请求 LLM ...")
@@ -981,6 +1377,20 @@ class QQBotAgent:
             result = state["result"]
             parsed = state["parsed"]
             messages_out = list(state["out"])
+
+            # 这一段还留不留：模型在 <thread> 里说了算，漏写则由代码兜底。
+            # 多轮留存没开时不用算（verdict 恒空，_remember_turn 也不会被调用）。
+            if memory is None:
+                verdict, verdict_src = "", "off"
+            else:
+                verdict, verdict_src = self._verdict_of(
+                    parsed, turns=turns, user_text=user_text
+                )
+                if verdict:
+                    logger.info(
+                        f"[会话 {thread_id}] 多轮裁决={verdict or '未定'}"
+                        f"（{verdict_src}，当前 {len(turns)} 轮）"
+                    )
 
             silenced = any(
                 c.get("tool") == "silent_observe" for c in state["calls"]
@@ -1029,6 +1439,11 @@ class QQBotAgent:
             if silenced and not messages_out and not delivered:
                 logger.info(
                     f"[会话 {thread_id}] Agent 选择静默观察，不回复"
+                )
+                # 没接话也要认裁决：对方换了话题、这轮没吭声，下一轮不该还拖着
+                # 上一段的上下文。
+                self._drop_turns_for_new_topic(
+                    memory, thread_id, turns, verdict
                 )
                 append_log(
                     build_log_entry(
@@ -1084,6 +1499,21 @@ class QQBotAgent:
                 result = nxt["result"]
 
             messages_out = messages_out[:_MAX_OUT_MESSAGES]
+
+            # 给下一轮留好拼装材料（续说过 / 没回话都不记，见 _remember_turn）
+            if memory is not None:
+                self._remember_turn(
+                    memory,
+                    thread_id,
+                    turns_before=turns,
+                    full_text=full_text,
+                    incremental=incremental,
+                    ai_text=state.get("text") or "",
+                    continued=extra > 0,
+                    replied=bool(messages_out),
+                    token=turn_token,
+                    verdict=verdict if extra == 0 else "",
+                )
 
             if parsed is not None:
                 if messages_out:
@@ -1174,23 +1604,37 @@ class QQBotAgent:
     # ════════════════════ 关系档案自动整理 ════════════════════
     def _schedule_relation_extract(
         self, context: Any, replies: list[str], thread_id: str
-    ) -> None:
+    ) -> Optional[asyncio.Task]:
         """低频异步整理：不阻塞本轮回复，失败也不影响聊天。"""
+        if self._closed:
+            return None
         store = getattr(self, "relations", None)
         if store is None or context is None or not getattr(store, "enabled", False):
-            return
+            return None
         try:
             direct = bool(context.directed_at_me)
         except Exception:  # noqa: BLE001
             direct = True
         if not store.should_extract(thread_id, direct=direct):
-            return
+            return None
         try:
-            asyncio.get_running_loop().create_task(
-                self._extract_relations(context, replies, thread_id)
+            task = asyncio.get_running_loop().create_task(
+                self._extract_relations(context, replies, thread_id),
+                name=f"relation-extract:{thread_id}",
             )
         except RuntimeError:  # pragma: no cover - chat() 一定在事件循环里
-            pass
+            return None
+        self._relation_tasks.add(task)
+        task.add_done_callback(self._relation_tasks.discard)
+        return task
+
+    def close(self) -> None:
+        """停止接受新的关系整理任务，并取消仍在运行的任务。"""
+        self._closed = True
+        tasks = list(getattr(self, "_relation_tasks", ()))
+        self._relation_tasks.clear()
+        for task in tasks:
+            task.cancel()
 
     async def _extract_relations(
         self, context: Any, replies: list[str], thread_id: str
@@ -1246,16 +1690,28 @@ class QQBotAgent:
             return None
 
         plan = parse_interject_verdict(verdict)
+        # 把 judge 的原话也记下来：只看解析结果的话，
+        # 「日志说沉默、理由却说『我可以回答』」这种自相矛盾根本没法查。
+        raw_preview = " ".join(verdict.split())
+        if len(raw_preview) > 200:
+            raw_preview = raw_preview[:200] + "…"
         if plan.act == "silent":
             logger.info(
                 f"[插话] {tag} 判断为沉默（{reason or '触发'}）"
                 + (f"：{plan.why}" if plan.why else "")
+                + f"｜原文：{raw_preview}"
             )
+            if _SILENT_BUT_ANSWERABLE.search(plan.why or ""):
+                logger.warning(
+                    f"[插话] {tag} 动作和理由打架：判了沉默，理由却说能答。"
+                    f"原文：{raw_preview}"
+                )
             return None
 
         logger.info(
             f"[插话] {tag} 判断为 {plan.act}（{reason or '触发'}）"
             + (f"：{plan.why}" if plan.why else "")
+            + f"｜原文：{raw_preview}"
         )
         if plan.act == "nod":
             return plan

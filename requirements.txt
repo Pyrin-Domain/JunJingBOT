@@ -10,9 +10,18 @@ requests>=2.32
 # 转发末尾广告裁剪：识别二维码（缺失时自动跳过二维码判定，其余规则照常）
 opencv-python>=4.8
 numpy>=1.24
+# 图片过滤门：可选 NSFW ViT 模型推理（缺依赖时该过滤自动停用）
+onnxruntime>=1.18
 # JM 下载转 PDF：jmcomic 的 export_pdf(img2pdf) 插件运行期依赖
 # 加密 PDF 还需要 pikepdf，由 img2pdf 自动带入
 img2pdf>=0.6
+
+# B 站下载（Extension/bilibilidownloadtool）
+# pycryptodome 是上游解析器顶层的硬依赖（WBI 签名 / 登录加密），缺了它整个引擎加载不起来
+# orjson / curl_cffi 为可选加速：缺失时上游自动回退标准 json / requests
+pycryptodome>=3.20
+orjson>=3.9
+curl_cffi>=0.7
 
 # 测试
 pytest>=8.0

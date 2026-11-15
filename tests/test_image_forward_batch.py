@@ -4,6 +4,7 @@
 以及空区间 / 发送失败都要在日志里说清楚，而不是「看起来跑完了」。
 """
 import asyncio
+import logging
 from types import SimpleNamespace
 
 from bot.services.forward import ForwardService
@@ -90,26 +91,27 @@ def test_only_images_are_collected():
     assert count == 2  # 文本和视频都不进 node
 
 
-def test_failed_send_is_reported(capsys):
-    _run(status="failed", retcode=1200)
-    out = capsys.readouterr().out
-    assert "发送失败" in out
+def test_failed_send_is_reported(caplog):
+    with caplog.at_level(logging.WARNING, logger="bot.services.forward"):
+        _run(status="failed", retcode=1200)
+    assert "发送失败" in caplog.text
 
 
-def test_timeout_counts_as_sent(capsys):
-    _run(timeout=True)
-    out = capsys.readouterr().out
-    assert "按已发出处理" in out
+def test_timeout_counts_as_sent(caplog):
+    with caplog.at_level(logging.WARNING, logger="bot.services.forward"):
+        _run(timeout=True)
+    assert "按已发出处理" in caplog.text
 
 
-def test_empty_range_skips_send(capsys):
+def test_empty_range_skips_send(caplog):
     svc, api = _service()
     svc.mp = _FakeMP(msgs=[{"message_id": 14, "message_seq": 14,
                             "message": [{"type": "text", "data": {"text": "只有文字"}}]}])
-    asyncio.run(
-        svc.image_forward_batch(
-            group_id=GROUP, target_id_list=[GROUP], begin_id=10, end_id=14, msg_type="group"
+    with caplog.at_level(logging.WARNING, logger="bot.services.forward"):
+        asyncio.run(
+            svc.image_forward_batch(
+                group_id=GROUP, target_id_list=[GROUP], begin_id=10, end_id=14, msg_type="group"
+            )
         )
-    )
     assert api.calls == []
-    assert "没有可搬运的图片" in capsys.readouterr().out
+    assert "没有可搬运的图片" in caplog.text

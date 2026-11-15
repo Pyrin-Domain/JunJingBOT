@@ -481,7 +481,7 @@ _MULTIMSG_XML = (
 
 
 def test_opaque_multimsg_is_recognized():
-    from AbstractionLayer import is_opaque_multimsg, titles_of_multimsg
+    from AbstractionLayer import is_opaque_multimsg, multimsg_resid_of, titles_of_multimsg
 
     xml_seg = {"type": "xml", "data": {"data": _MULTIMSG_XML, "resid": 35}}
     assert is_opaque_multimsg(xml_seg)
@@ -497,17 +497,51 @@ def test_opaque_multimsg_is_recognized():
 
     assert titles_of_multimsg(xml_seg) == ["某某的聊天记录", "某某: [图片]", "某某: 神了"]
 
+    # 同层的 data.resid 是 serviceID（实测恒为 35），不是子消息 id —— 不能拿来展开
+    assert xml_seg["data"]["resid"] == 35
+    assert multimsg_resid_of(xml_seg) == ""
+    assert multimsg_resid_of({"type": "xml", "data": {"data": _MULTIMSG_XML.replace(
+        "<msg ", '<msg m_resid="RID-9" ', 1)}}) == "RID-9"
+    assert multimsg_resid_of({"type": "xml", "data": {"data": _MULTIMSG_XML.replace(
+        "<msg ", '<msg m_resid="" ', 1)}}) == ""
 
-def test_plan_relay_rebuilds_opaque_nested_on_both_backends():
-    """xml 死卡片与后端无关：谁整卡重发都救不回来，一律重建。"""
+
+def test_plan_relay_skips_opaque_nested_without_resid():
+    """m_resid 为空 = 只剩 <title> 摘要、没有子消息 id：不重建，也不搬。"""
     from AbstractionLayer import plan_relay
 
     messages = [{"message": [{"type": "xml", "data": {"data": _MULTIMSG_XML}}]}]
-    snow = plan_relay(SNOWLUMA, messages)
-    nap = plan_relay(NAPCAT, messages)
+    explicit_empty = _MULTIMSG_XML.replace("<msg ", '<msg m_resid="" ', 1)
 
-    assert snow.action == "rebuild" and snow.opaque and snow.lossy
-    assert nap.action == "rebuild" and nap.opaque
+    for caps in (SNOWLUMA, NAPCAT):
+        plan = plan_relay(caps, messages)
+        assert plan.action == "skip" and plan.skip, plan.reason
+        # 不搬既不是重建、也不算「重建有损」
+        assert plan.opaque and not plan.needs_rebuild and not plan.lossy
+
+        empty_plan = plan_relay(caps, [{"message": [{"type": "xml", "data": {"data": explicit_empty}}]}])
+        assert empty_plan.action == "skip"
+
+
+def test_plan_relay_rebuilds_opaque_nested_with_resid():
+    """有 m_resid 的死卡（换会话后文件失效）仍走重建，把摘要内联成文本。"""
+    from AbstractionLayer import plan_relay
+
+    xml = _MULTIMSG_XML.replace("<msg ", '<msg m_resid="RID-9" ', 1)
+    messages = [{"message": [{"type": "xml", "data": {"data": xml}}]}]
+
+    for caps in (SNOWLUMA, NAPCAT):
+        plan = plan_relay(caps, messages)
+        assert plan.action == "rebuild" and plan.opaque and plan.lossy
+
+
+def test_plan_relay_reads_json_multimsg_resid():
+    """json 版多消息卡的 resid 在 meta.detail.resid：有它就不算死卡。"""
+    from AbstractionLayer import plan_relay
+
+    payload = '{"app":"com.tencent.multimsg","meta":{"detail":{"resid":"RID-1"}}}'
+    seg = {"type": "json", "data": {"data": payload}}
+    assert plan_relay(SNOWLUMA, [{"message": [seg]}]).action == "rebuild"
 
 
 def test_plan_relay_trusts_fixed_single_forward_for_forward_segments():
@@ -593,3 +627,89 @@ async def _reply(messages):
 
 async def _fail(action, params):
     return {"status": "failed", "retcode": 400, "message": "should not call"}
+
+
+# ══════════════════════════════════════════════════════════
+# 断点回放：方向由调用方给不给 latest 决定
+# ══════════════════════════════════════════════════════════
+def test_replay_forward_walks_to_the_end():
+    """SnowLuma 方向：从断点往后翻到底，拿到断点之后的全部消息。
+
+    NapCat 不走这条路（``history_latest_is_authoritative=True``，它的 id 重启
+    就变，只能从现取的最新往回翻），所以这里只测 SnowLuma。
+    """
+    kernel, _ = _kernel("snowluma", SNOWLUMA)
+    pager = HistoryPager(kernel)
+    checkpoint = _make_messages("snowluma")[5]
+
+    result = _run(pager.replay(GROUP, checkpoint=checkpoint, count=6))
+
+    assert result.found, "往后翻没有「找断点」这回事，恒为 True"
+    assert result.pages >= 2
+    assert [MessageCursor.from_message(m).real_seq for m in result.messages] == list(
+        range(BASE_SEQ + 6, BASE_SEQ + TOTAL)
+    )
+
+
+def test_replay_backward_from_latest_stops_at_checkpoint():
+    """NapCat 方向：从最新往旧翻，命中断点即停。
+
+    注意 ``latest`` 自己是游标，不回放（旧实现同样剔除锚点）——它本来就会
+    由实时事件处理，重复回放会搬两次。
+    """
+    for mode, caps in (("napcat", NAPCAT), ("snowluma", SNOWLUMA)):
+        kernel, _ = _kernel(mode, caps)
+        pager = HistoryPager(kernel)
+        messages = _make_messages(mode)
+        checkpoint, latest = messages[5], messages[-1]
+
+        result = _run(pager.replay(GROUP, checkpoint=checkpoint, latest=latest, count=6))
+
+        assert result.found
+        assert [MessageCursor.from_message(m).real_seq for m in result.messages] == list(
+            range(BASE_SEQ + 6, BASE_SEQ + TOTAL - 1)
+        )
+
+
+def test_replay_backward_reports_missing_checkpoint():
+    """断点已被清空：翻到历史起点也找不到，found=False 且给出原因。"""
+    kernel, _ = _kernel("napcat", NAPCAT)
+    pager = HistoryPager(kernel)
+    messages = _make_messages("napcat")
+    gone = {"message_id": 1, "message_seq": 1, "real_id": 1, "real_seq": "1"}
+
+    result = _run(pager.replay(GROUP, checkpoint=gone, latest=messages[-1], count=6))
+
+    assert result.found is False
+    assert result.reached_start is True
+    # 仍然把沿途看到的消息交回来（比断点新的全是要回放的）
+    assert len(result.messages) == TOTAL - 1
+
+
+def test_replay_stops_when_page_only_has_cursor():
+    """后端原地不动、每页只回游标本身：一页就收尾，不空翻 max_pages。"""
+    calls = []
+    checkpoint = _make_messages("snowluma")[5]
+
+    async def only_cursor(action, params):
+        calls.append(dict(params))
+        return {"status": "ok", "retcode": 0, "data": {"messages": [checkpoint]}}
+
+    kernel = OneBotKernel(CallableTransport(only_cursor), capabilities=SNOWLUMA)
+    pager = HistoryPager(kernel)
+
+    result = _run(pager.replay(GROUP, checkpoint=checkpoint, count=4, max_pages=20))
+
+    assert result.messages == []
+    assert len(calls) == 1
+
+
+def test_replay_returns_empty_when_checkpoint_is_latest():
+    kernel, _ = _kernel("snowluma", SNOWLUMA)
+    pager = HistoryPager(kernel)
+    latest = _make_messages("snowluma")[-1]
+
+    result = _run(pager.replay(GROUP, checkpoint=latest, count=6))
+
+    assert result.messages == []
+    assert result.found is True

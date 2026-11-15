@@ -35,6 +35,20 @@ def _base(**agent):
 
 
 # ── 配置合并 ────────────────────────────────────────────────
+def test_auto_forward_filter_alias_is_passed_to_forward_service(tmp_path):
+    cfg = BotConfig(
+        path=tmp_path / "bot_config.json",
+        overrides={
+            "auto_forward": {
+                "filter": [{"group_id": 20002, "user_id": [10003]}]
+            }
+        },
+    )
+    assert cfg.auto_forward_kwargs["forward_filter"] == [
+        {"group_id": 20002, "user_id": [10003]}
+    ]
+
+
 def test_resolve_llm_config_merges_and_normalizes():
     cfg = resolve_llm_config(
         {
@@ -331,3 +345,80 @@ def test_reload_config_hot_reloads_agent_section(tmp_path, monkeypatch):
     assert result["agent_reloading"] is True
     assert "agent" in result["applied"]
     assert result["restart_required"] is False
+
+
+def test_reload_config_restarts_agent_when_thread_memory_changes(tmp_path, monkeypatch):
+    """多轮留存的开关是 Agent 初始化时读的，改完必须重建 Agent。
+
+    不重建的话面板上点了保存、日志一切正常，行为却还是旧的 —— 这种「静默不
+    生效」比报错更难查。重建的代价是内存里的 ThreadTurns / ResultVault 清空。
+    """
+    path = tmp_path / "bot_config.json"
+    BotConfig(
+        path=path, overrides={"thread_memory": {"stable_prefix": False, "groups": []}}
+    ).save()
+
+    bot = BotApp.__new__(BotApp)
+    bot.settings = BotConfig(path=path)
+    bot.mp = SimpleNamespace(extraconfig={})
+    calls = []
+    monkeypatch.setattr(bot, "_restart_agent", lambda: calls.append(1))
+
+    BotConfig(
+        path=path,
+        overrides={
+            "thread_memory": {"stable_prefix": True, "groups": ["1132313813"]}
+        },
+    ).save()
+    result = bot.reload_config()
+
+    assert len(calls) == 1
+    section = bot.settings.section("thread_memory")
+    assert section["stable_prefix"] is True
+    assert section["groups"] == ["1132313813"]
+    assert result["agent_reloading"] is True
+    assert "thread_memory" in result["applied"]
+
+
+def test_reload_config_does_not_restart_when_nothing_changed(tmp_path, monkeypatch):
+    """配置没动就别重建 Agent：重启会丢掉多轮留存和工具结果暂存。"""
+    path = tmp_path / "bot_config.json"
+    BotConfig(path=path, overrides={"thread_memory": {"stable_prefix": True}}).save()
+
+    bot = BotApp.__new__(BotApp)
+    bot.settings = BotConfig(path=path)
+    bot.mp = SimpleNamespace(extraconfig={})
+    calls = []
+    monkeypatch.setattr(bot, "_restart_agent", lambda: calls.append(1))
+
+    result = bot.reload_config()
+
+    assert calls == []
+    assert result["agent_reloading"] is False
+
+
+def test_reload_config_detects_change_saved_through_panel(tmp_path, monkeypatch):
+    """面板保存的真实顺序：update(内存) → save(写盘) → reload_config。
+
+    这里必须能比出差异，否则点了保存、界面显示成功、行为却还是旧的。
+    基准只能取「上次从磁盘读进来的配置」，不能用当前内存值。
+    """
+    path = tmp_path / "bot_config.json"
+    BotConfig(path=path, overrides={"thread_memory": {"stable_prefix": False}}).save()
+
+    bot = BotApp.__new__(BotApp)
+    settings = BotConfig(path=path)  # 不带 overrides，模拟进程启动时读盘
+    bot.settings = settings
+    bot.mp = SimpleNamespace(extraconfig={})
+    calls = []
+    monkeypatch.setattr(bot, "_restart_agent", lambda: calls.append(1))
+
+    settings.update(
+        {"thread_memory": {"stable_prefix": True, "groups": ["583261953"]}}
+    )
+    settings.save()
+    result = bot.reload_config()
+
+    assert calls == [1]
+    assert result["agent_reloading"] is True
+    assert settings.section("thread_memory")["groups"] == ["583261953"]

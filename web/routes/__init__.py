@@ -12,7 +12,7 @@ from typing import Any
 
 from aiohttp import web
 
-WEB_SERVER_KEY = "web_server"
+WEB_SERVER_KEY = web.AppKey("web_server", object)
 
 
 def json_response(payload: Any, status: int = 200) -> web.Response:

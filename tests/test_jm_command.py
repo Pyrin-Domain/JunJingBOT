@@ -15,10 +15,12 @@ from pathlib import Path
 
 import pytest
 
+from AbstractionLayer.kernal import NAPCAT, SNOWLUMA
 from bot.commands import CommandHandlers
 from bot.commands import jm as jm_cmd
 from download_system import DownloadService, DownloadStorage
 from download_system.providers.jm import JmNotConfigured, normalize_source
+from transport.api import ensure_ok
 
 
 def _run(coro):
@@ -48,6 +50,14 @@ class FakeMP:
 
 
 class FakeAPI:
+    """按真实 ``OneBotAPI`` 的行为回包：明确失败**抛异常**，不返回失败 dict。
+
+    ``send_group_msg`` / ``send_private_msg`` 在能力表的 ``strict_actions``
+    里，真实实现会用 ``ensure_ok`` 把 ``retcode != 0`` 转成
+    ``OneBotAPIError``。替身如果只返回失败 dict，会把「重试死代码」这种
+    问题放过去，所以这里也走同一个校验函数。
+    """
+
     def __init__(self):
         self.private_files = []
         self.group_files = []
@@ -55,24 +65,40 @@ class FakeAPI:
         self.responses: list[dict] = []   # 依次返回；用完就回 ok
         self.timeouts = 0                 # >0 时接下来几次抛 TimeoutError
         self.timeouts_seen: list = []
+        self.flash_tasks: list = []       # (files, name)
+        self.flash_msgs: list = []        # (fileset_id, group_id, user_id)
+        self.flash_response: dict = {
+            "status": "ok", "retcode": 0, "data": {"fileset_id": "set-1"}
+        }
+        self.flash_send_response: dict = {
+            "status": "ok", "retcode": 0, "data": {"message_id": 0}
+        }
 
-    def _next(self, **kwargs):
+    def _next(self, action, **kwargs):
         self.calls += 1
         self.timeouts_seen.append(kwargs.get("timeout"))
         if self.timeouts:
             self.timeouts -= 1
             raise TimeoutError("send_group_msg 在 300 秒内没有响应")
         if self.responses:
-            return self.responses.pop(0)
+            return ensure_ok(action, self.responses.pop(0))
         return {"status": "ok", "retcode": 0, "data": {"message_id": 2}}
 
     async def send_private_message(self, user_id, message, **kwargs):
         self.private_files.append((user_id, message))
-        return self._next(**kwargs)
+        return self._next("send_private_msg", **kwargs)
 
     async def send_group_message(self, group_id, message, **kwargs):
         self.group_files.append((group_id, message))
-        return self._next(**kwargs)
+        return self._next("send_group_msg", **kwargs)
+
+    async def create_flash_task(self, files, name=None, timeout=None):
+        self.flash_tasks.append((files, name))
+        return ensure_ok("create_flash_task", self.flash_response)
+
+    async def send_flash_msg(self, fileset_id, group_id=None, user_id=None, timeout=None):
+        self.flash_msgs.append((fileset_id, group_id, user_id))
+        return ensure_ok("send_flash_msg", self.flash_send_response)
 
 
 class _FakeDownloads:
@@ -226,6 +252,23 @@ def test_rejected_upload_is_retried_then_succeeds(tmp_path, monkeypatch):
     assert mp.sent == []           # 成功不发任何提示
 
 
+def test_group_rejection_is_retried(tmp_path, monkeypatch):
+    """实测故障发生在群聊：``ensure_ok`` 抛出的 OneBotAPIError 同样要重试。"""
+    monkeypatch.setattr(jm_cmd, "RETRY_DELAYS", (0,))
+    handlers, mp, api = _handlers(downloads=_FakeDownloads(_pdf(tmp_path)))
+    api.responses = [_reject()]
+
+    result = _run(handlers.jm(_event("/jm 25", message_type="group")))
+
+    assert result is True
+    assert api.calls == 2
+    assert mp.sent == []
+    segment = api.group_files[0][1][0]
+    assert segment["type"] == "file"
+    # name 由抽象层统一补（OneBotAPI._call_api），命令层只负责给路径。
+    assert "name" not in segment["data"]
+
+
 def test_rejections_end_with_reason(tmp_path, monkeypatch):
     """重试用尽仍失败：把 QQ 的原话回给用户，不能静默。"""
     monkeypatch.setattr(jm_cmd, "RETRY_DELAYS", (0, 0))
@@ -251,6 +294,63 @@ def test_timeout_is_not_retried(tmp_path, monkeypatch):
     assert result is False
     assert api.calls == 1          # 只发了一次
     assert "超时" in mp.sent[0][1]
+
+
+# ─────────────────────── 发送：闪传兜底 ───────────────────────
+def _use_caps(api, caps):
+    """给 FakeAPI 挂一份能力表（真实实现里在 ``api.kernel.capabilities``）。"""
+    api.kernel = type("K", (), {"capabilities": caps})()
+
+
+def test_file_rejection_falls_back_to_flash(tmp_path, monkeypatch):
+    """群文件链路被 -134 拒绝后，改走闪传（独立上传服务），用户仍能收到文件。"""
+    monkeypatch.setattr(jm_cmd, "RETRY_DELAYS", ())
+    handlers, mp, api = _handlers(downloads=_FakeDownloads(_pdf(tmp_path)))
+    _use_caps(api, SNOWLUMA)
+    api.responses = [_reject()]
+
+    result = _run(handlers.jm(_event("/jm 25", message_type="group")))
+
+    assert result is True
+    target = jm_cmd._to_napcat(handlers, tmp_path / "25.pdf")
+    assert api.flash_tasks == [([target], "25.pdf")]
+    assert api.flash_msgs == [("set-1", 1000, None)]
+    assert mp.sent == []           # 兜底成功，不打扰用户
+
+
+def test_flash_fileset_path_differs_per_backend(tmp_path, monkeypatch):
+    """NapCat 的 fileset id 在内核结构里，SnowLuma 在顶层，不能写死。"""
+    monkeypatch.setattr(jm_cmd, "RETRY_DELAYS", ())
+    handlers, mp, api = _handlers(downloads=_FakeDownloads(_pdf(tmp_path)))
+    _use_caps(api, NAPCAT)
+    api.responses = [_reject()]
+    api.flash_response = {
+        "status": "ok",
+        "retcode": 0,
+        "data": {"result": 0, "createFlashTransferResult": {"fileSetId": "set-nc"}},
+    }
+
+    result = _run(handlers.jm(_event("/jm 25")))
+
+    assert result is True
+    assert api.flash_msgs[0][0] == "set-nc"
+
+
+def test_flash_failure_reports_both_channels(tmp_path, monkeypatch):
+    """两条通道都失败：把文件通道的原因和闪传的原因一起回给用户。"""
+    monkeypatch.setattr(jm_cmd, "RETRY_DELAYS", ())
+    handlers, mp, api = _handlers(downloads=_FakeDownloads(_pdf(tmp_path)))
+    _use_caps(api, SNOWLUMA)
+    api.responses = [_reject()]
+    api.flash_response = {
+        "status": "failed", "retcode": 100, "wording": "flash upload failed"
+    }
+
+    result = _run(handlers.jm(_event("/jm 25")))
+
+    assert result is False
+    assert "-134" in mp.sent[0][1]
+    assert "闪传" in mp.sent[0][1]
 
 
 # ─────────────────────── 配置接线 ───────────────────────

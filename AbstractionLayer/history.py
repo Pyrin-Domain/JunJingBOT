@@ -25,7 +25,7 @@ from typing import Any
 from .cursor import MessageCursor
 from .kernal import OneBotKernel, _sorted_ascending
 
-__all__ = ["HistoryPage", "HistoryPager", "WalkResult"]
+__all__ = ["HistoryPage", "HistoryPager", "ReplayResult", "WalkResult"]
 
 
 @dataclass
@@ -67,12 +67,35 @@ class WalkResult:
     reason: str = ""
 
 
+@dataclass
+class ReplayResult:
+    """断点回放要翻的那一段（升序，已剔除断点本身）。"""
+
+    #: 断点**之后**（更新）的消息，旧 → 新，可直接按顺序回放。
+    messages: list[dict] = field(default_factory=list)
+    #: 是否找到断点。从断点往后翻时没有「找」这回事，恒为 True。
+    found: bool = True
+    #: 从最新往旧翻时，是否已经翻到历史起点（说明断点可能被清空了）。
+    reached_start: bool = False
+    pages: int = 0
+    #: 非空表示提前收尾的原因（游标没前进 / 游标字段不对 / 接口报错）。
+    reason: str = ""
+
+
 class HistoryPager:
     """按归一化契约拉历史的门面。"""
 
-    def __init__(self, kernel: OneBotKernel, *, default_count: int = 20) -> None:
+    def __init__(
+        self,
+        kernel: OneBotKernel,
+        *,
+        default_count: int = 20,
+        before_page: Any = None,
+    ) -> None:
         self.kernel = kernel
         self.default_count = default_count
+        #: 每页发出前的异步钩子（重连用）。翻页途中掉线时，下一发才能连上。
+        self._before_page = before_page
 
     @property
     def capabilities(self):
@@ -98,6 +121,9 @@ class HistoryPager:
         """
         caps = self.capabilities
         requested = max(1, min(int(count or self.default_count), caps.history_max_count))
+
+        if self._before_page is not None:
+            await self._before_page()
 
         params: dict[str, Any] = {
             "group_id": group_id,
@@ -257,6 +283,102 @@ class HistoryPager:
         collected.reverse()
         result.messages = collected
         return result
+
+    async def replay(
+        self,
+        group_id: Any,
+        *,
+        checkpoint: Any = None,
+        latest: Any = None,
+        count: int | None = None,
+        max_pages: int = 80,
+        stall_limit: int = 2,
+    ) -> ReplayResult:
+        """断点回放：返回断点**之后**的消息（升序，不含断点本身）。
+
+        方向由「调用方给不给 ``latest``」决定，因为这取决于**断点里的 id 还能不能
+        当游标**——那是后端的特性，pager 不该猜：
+
+        - 给了 ``latest``：从最新往旧翻，直到命中 ``checkpoint``。
+          适合 NapCat：它的 ``message_id`` / ``message_seq`` 每次重启都会重新
+          分配，断点里的旧 id 不能当游标，只能用现取的最新 id 起翻，靠
+          ``real_id`` / 全局序号认出断点。
+        - 没给：从 ``checkpoint`` 往新翻，直到后端没有更多消息。
+          适合 SnowLuma：id 跨重启稳定，但不带游标取到的「最新」可能只是它
+          **本地观测过**的消息（关掉登录历史同步时正好等于断点），信任它就会把
+          整段更新跳过。
+
+        「翻不动」连续 ``stall_limit`` 页就收尾，不硬翻 80 页：NapCat 收到错的
+        游标字段不报错，而是返回「以锚点为中心的窗口」并忽略 ``reverse_order``，
+        没有这道闸门就会原地打转。
+        """
+        target = MessageCursor.from_message(checkpoint) if checkpoint is not None else None
+        backward = latest is not None
+        if backward:
+            cursor = MessageCursor.from_message(latest)
+            if not cursor:
+                return ReplayResult(found=False, reason="latest 游标为空")
+        else:
+            if not target:
+                return ReplayResult(found=False, reason="断点游标为空")
+            cursor = target
+
+        collected: list[dict] = []
+        seen: set[tuple] = set()
+        result = ReplayResult(found=not backward)
+        stalled = 0
+
+        for _ in range(max_pages):
+            page = await self.page(group_id, cursor=cursor, backward=backward, count=count)
+            result.pages += 1
+            if page.error:
+                result.reason = page.error
+                break
+            if not page.messages:
+                result.reached_start = backward
+                break
+
+            if backward:
+                # 页内升序，倒着扫才是「新 → 旧」。
+                for item in reversed(page.messages):
+                    if target is not None and target.matches(item):
+                        result.found = True
+                        break
+                    key = _identity(item)
+                    if key not in seen:
+                        seen.add(key)
+                        collected.append(item)
+                if result.found:
+                    break
+            else:
+                for item in page.messages:
+                    key = _identity(item)
+                    if key not in seen:
+                        seen.add(key)
+                        collected.append(item)
+
+            if page.stalled:
+                stalled += 1
+                if stalled >= stall_limit:
+                    result.reason = f"游标连续 {stalled} 页没有前进"
+                    break
+            else:
+                stalled = 0
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+
+        # 往旧翻时是按「新 → 旧」攒的，倒回来才是升序。
+        if backward:
+            collected.reverse()
+        result.messages = collected
+        return result
+
+
+def _identity(message: Any) -> tuple:
+    """跨页去重用的身份。字段全等才算同一条（同一后端内足够）。"""
+    cur = MessageCursor.from_message(message)
+    return (cur.real_seq, str(cur.real_id), str(cur.message_id), str(cur.message_seq), cur.time)
 
 
 def _seq(cursor: MessageCursor) -> int | None:

@@ -22,7 +22,16 @@ try:  # pragma: no cover - 有 langchain 时走这里
 except Exception:  # pragma: no cover - 没装 langchain 也要能 import
     langchain_tool = None
 
-# 按 async Task 隔离的工具调用记录，防止并发 chat() 互相污染
+# 按 async Task 隔离的工具调用记录，防止并发 chat() 互相污染。
+#
+# **默认值必须是可变容器，不能是 None**：langchain 的 ``BaseTool.arun`` 用
+# ``coro_with_context`` 在**复制出来的 context** 里跑工具，工具里
+# ``ContextVar.set()`` 的新值传不回调用方（实测：ainvoke 之后外面读到的还是
+# 旧值）。所以工具只能靠「原地改一个已经存在的对象」把结果传出去——
+# 容器必须由发起这一轮的人（runtime 每轮 set 一个新的）先准备好。
+#
+# 正因为如此，这里的默认值是**进程内共享**的容器：只有在没人 set 过的时候
+# 才会用到它（单测直接调工具）。生产路径每轮都换新的，不会跨轮泄漏。
 _current_tool_calls_var: contextvars.ContextVar[list[dict]] = contextvars.ContextVar(
     "current_tool_calls", default=[]
 )
@@ -33,7 +42,8 @@ _current_tool_cache_var: contextvars.ContextVar[dict[tuple[str, str], Any]] = co
 _current_user_text_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_user_text", default=""
 )
-# 本轮工具可访问的图片：current=当前消息，quote=被引用/回复的消息。
+# 本轮工具可访问的图片：current=当前消息，quote=被引用/回复的消息，
+# forward=合并转发卡片里的图（read_forward 展开后才有）。
 # URL 由服务端持有，模型只传 source + index，避免复述 QQ 的长签名 URL 时抄错。
 _current_images_var: contextvars.ContextVar[dict[str, list[str]]] = contextvars.ContextVar(
     "current_images", default={}
@@ -77,7 +87,8 @@ def settings_of(agent: Any) -> Any:
 
 # ── 工具调用记录 / 缓存 ──────────────────────────────────────
 def current_tool_calls() -> list[dict]:
-    return _current_tool_calls_var.get()
+    calls = _current_tool_calls_var.get()
+    return calls if isinstance(calls, list) else []
 
 
 def current_context() -> Any:
@@ -98,11 +109,16 @@ def make_tool_cache_key(tool_name: str, args: dict) -> tuple[str, str]:
 
 def get_cached_tool_result(tool_name: str, args: dict) -> Any:
     cache = _current_tool_cache_var.get()
+    if not isinstance(cache, dict):
+        return _MISSING
     return cache.get(make_tool_cache_key(tool_name, args), _MISSING)
 
 
 def set_cached_tool_result(tool_name: str, args: dict, result: Any) -> None:
     cache = _current_tool_cache_var.get()
+    if not isinstance(cache, dict):
+        cache = {}
+        _current_tool_cache_var.set(cache)
     cache[make_tool_cache_key(tool_name, args)] = result
 
 
@@ -111,6 +127,9 @@ def record_tool_call(
 ) -> None:
     """将工具调用记录到当前 async Task 的上下文变量中，实现并发隔离。"""
     calls = _current_tool_calls_var.get()
+    if not isinstance(calls, list):
+        calls = []
+        _current_tool_calls_var.set(calls)
     entry: dict[str, Any] = {"tool": tool_name, "args": args}
     if result is not None:
         entry["result"] = result

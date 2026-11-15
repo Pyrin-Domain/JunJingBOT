@@ -150,6 +150,234 @@ def test_chat_returns_empty_list_when_silent():
     assert asyncio.run(agent.chat("在吗")) == []
 
 
+def test_chat_injects_reusable_result_hint():
+    """不是在承接上一轮时，只给编号索引（省 token），不把正文硬灌进去。
+
+    现场（2026-11-13）：模型翻完 1500 条说「要不要我挑几句给你看」，主人下一句
+    「挑」——工具结果已经不在上下文里了。不注入索引，模型只能重翻或者凭印象编。
+    """
+    from agent.result_vault import ResultVault
+
+    agent = _bare_agent("")
+    agent.result_vault = ResultVault()
+    agent.result_vault.put("g1", "digest_user", "★ 他说的话", label="digest_user 小菲")
+
+    captured = {}
+
+    async def _invoke(payload):
+        captured["content"] = payload["messages"][0].content
+        return {
+            "messages": [
+                {"role": "assistant", "content": "<output><message>嗯</message></output>"}
+            ]
+        }
+
+    agent.agent = type("_A", (), {"ainvoke": staticmethod(_invoke)})()
+    assert asyncio.run(agent.chat("在吗", thread_id="g1")) == ["嗯"]
+
+    content = captured["content"]
+    assert "[可复用结果]" in content
+    assert "R1" in content
+    assert "recall_result" in content
+    assert "★ 他说的话" not in content  # 索引阶段不铺正文
+
+
+def test_chat_auto_loads_body_when_user_follows_up():
+    """用户明确承接（「挑」）时，正文要直接铺进提示，不赌模型会不会调工具。"""
+    from agent.result_vault import ResultVault
+
+    agent = _bare_agent("")
+    agent.result_vault = ResultVault()
+    agent.result_vault.put(
+        "g1",
+        "digest_user",
+        "★ 21:04 他说：我要是不又丑又穷就好了",
+        label="digest_user 小菲",
+    )
+
+    captured = {}
+
+    async def _invoke(payload):
+        captured["content"] = payload["messages"][0].content
+        return {
+            "messages": [
+                {"role": "assistant", "content": "<output><message>嗯</message></output>"}
+            ]
+        }
+
+    agent.agent = type("_A", (), {"ainvoke": staticmethod(_invoke)})()
+    assert asyncio.run(agent.chat("挑", thread_id="g1")) == ["嗯"]
+
+    content = captured["content"]
+    assert "已经自动带上" in content
+    assert "★ 21:04 他说：我要是不又丑又穷就好了" in content
+    # 正文已经在了，就不该再出现「还留着、去取回」的索引块
+    assert "[可复用结果] 之前的工具结果还留着" not in content
+
+
+def test_chat_matches_vault_by_group_when_thread_id_differs():
+    """工具侧只能从 context 拼 key（group_xxx），runtime 收到的 thread_id 可能是别的。
+
+    两边对不上就等于留存白做 —— 这里必须两个 key 都试。
+    """
+    from agent.result_vault import ResultVault
+    from messaging.models import ChatContext, ChatMessage, Segment, Sender
+
+    agent = _bare_agent("")
+    agent.result_vault = ResultVault()
+    agent.result_vault.put(
+        "group_20001", "digest_user", "★ 他说的话", label="digest_user 小菲"
+    )
+
+    captured = {}
+
+    async def _invoke(payload):
+        captured["content"] = payload["messages"][0].content
+        return {
+            "messages": [
+                {"role": "assistant", "content": "<output><message>嗯</message></output>"}
+            ]
+        }
+
+    agent.agent = type("_A", (), {"ainvoke": staticmethod(_invoke)})()
+    ctx = ChatContext(
+        chat_type="group",
+        group_id="20001",
+        self_id="10002",
+        current=ChatMessage(
+            sender=Sender(qq="10001", name="Pyrin", is_master=True),
+            segments=[Segment("text", text="在吗")],
+        ),
+    )
+    assert asyncio.run(
+        agent.chat(
+            context=ctx,
+            thread_id="g1",
+            event={"message_type": "group", "group_id": 20001, "user_id": 10001},
+        )
+    ) == ["嗯"]
+
+    assert "[可复用结果]" in captured["content"]
+    assert "R1" in captured["content"]
+
+
+def test_chat_skips_vault_hint_when_empty():
+    """没有留存时不能往提示里塞空块。"""
+    from agent.result_vault import ResultVault
+
+    agent = _bare_agent("")
+    agent.result_vault = ResultVault()
+    captured = {}
+
+    async def _invoke(payload):
+        captured["content"] = payload["messages"][0].content
+        return {
+            "messages": [
+                {"role": "assistant", "content": "<output><message>嗯</message></output>"}
+            ]
+        }
+
+    agent.agent = type("_A", (), {"ainvoke": staticmethod(_invoke)})()
+    assert asyncio.run(agent.chat("在吗", thread_id="g1")) == ["嗯"]
+    assert "[可复用结果]" not in captured["content"]
+
+
+def test_chat_reuses_prefix_when_thread_memory_enabled():
+    """开关打开后：第二轮发 [H1, A1, H2]，且 H1 与第一轮逐字节相同。
+
+    前缀稳定是服务端缓存命中的唯一前提；增量里出现 <scene>/<history> 就前功尽弃。
+    """
+    from agent.thread_turns import ThreadTurns
+    from messaging.models import ChatContext, ChatMessage, Segment, Sender
+
+    agent = _bare_agent("")
+    agent.thread_turns = ThreadTurns()
+    agent._thread_memory_enabled = True
+
+    payloads: list[list] = []
+
+    async def _invoke(payload):
+        payloads.append(list(payload["messages"]))
+        return {
+            "messages": [
+                {"role": "assistant", "content": "<output><message>嗯</message></output>"}
+            ]
+        }
+
+    agent.agent = type("_A", (), {"ainvoke": staticmethod(_invoke)})()
+
+    def _ctx(message_id: str, text: str) -> ChatContext:
+        return ChatContext(
+            chat_type="group",
+            group_id="20001",
+            self_id="10002",
+            master_ids=["10001"],
+            current=ChatMessage(
+                message_id=message_id,
+                sender=Sender(qq="10001", name="Pyrin", is_master=True),
+                segments=[Segment("text", text=text)],
+            ),
+        )
+
+    event = {"message_type": "group", "group_id": 20001, "user_id": 10001}
+    assert asyncio.run(
+        agent.chat(context=_ctx("1", "第一句"), thread_id="g1", event=event)
+    ) == ["嗯"]
+    assert asyncio.run(
+        agent.chat(context=_ctx("2", "第二句"), thread_id="g1", event=event)
+    ) == ["嗯"]
+
+    first, second = payloads
+    assert len(first) == 1
+    assert len(second) == 3
+    assert second[0].content == first[0].content  # 前缀逐字节相同
+    assert "<scene>" not in second[2].content
+    assert "<history>" not in second[2].content
+    assert "第二句" in second[2].content
+
+
+def test_chat_stays_single_message_when_thread_memory_disabled():
+    """默认关闭：每轮仍是单条完整上下文，行为与旧版一致。"""
+    from agent.thread_turns import ThreadTurns
+    from messaging.models import ChatContext, ChatMessage, Segment, Sender
+
+    agent = _bare_agent("")
+    agent.thread_turns = ThreadTurns()  # 存在，但开关没开
+
+    payloads: list[list] = []
+
+    async def _invoke(payload):
+        payloads.append(list(payload["messages"]))
+        return {
+            "messages": [
+                {"role": "assistant", "content": "<output><message>嗯</message></output>"}
+            ]
+        }
+
+    agent.agent = type("_A", (), {"ainvoke": staticmethod(_invoke)})()
+
+    def _ctx(message_id: str, text: str) -> ChatContext:
+        return ChatContext(
+            chat_type="group",
+            group_id="20001",
+            self_id="10002",
+            current=ChatMessage(
+                message_id=message_id,
+                sender=Sender(qq="10001", name="Pyrin"),
+                segments=[Segment("text", text=text)],
+            ),
+        )
+
+    event = {"message_type": "group", "group_id": 20001, "user_id": 10001}
+    for message_id, text in (("1", "第一句"), ("2", "第二句")):
+        asyncio.run(
+            agent.chat(context=_ctx(message_id, text), thread_id="g1", event=event)
+        )
+
+    assert [len(payload) for payload in payloads] == [1, 1]
+    assert "<scene>" in payloads[1][0].content
+
+
 def test_chat_ignores_output_after_send_tool(monkeypatch):
     """已经用过 send_message 工具时，不能再把 <output> 的文字重复发一遍。"""
     agent = _bare_agent("<output><message>重复内容</message></output>")
@@ -634,16 +862,22 @@ def test_hint_is_empty_for_small_talk():
 
 # ── 复读检测 / 改写 ────────────────────────────────────────
 def test_template_lines_are_collected_from_prompt():
-    # 示例台词自动从 SYSTEM_PROMPT 抽取，改示例不用改代码
-    assert "喏看完就还我别存下来" in TEMPLATE_LINES
+    # 示例台词自动从 SYSTEM_PROMPT 抽取，改示例不用改代码 —— 所以这里也**不写死
+    # 某一句**，只断言「抽得到，且抽到的都能被识别成复读」。写死的话每次改人设
+    # 都要回来修测试（这次就是：那句「喏，看完就还我，别存下来。」已被删掉）。
+    assert TEMPLATE_LINES
+    assert all(looks_like_repeat(line) for line in TEMPLATE_LINES)
     # 输出格式段里的占位符不该被当成台词
     assert not any("图片链接或本地图片路径" in t for t in TEMPLATE_LINES)
 
 
 def test_looks_like_repeat_detects_example_copy():
-    assert looks_like_repeat("喏，看完就还我，别存下来。")
-    assert looks_like_repeat("喏  看完就还我 别存下来")  # 标点/空格差异也算
-    assert looks_like_repeat("文明点啦，群里还有小孩子呢")
+    copied = TEMPLATE_LINES[0]
+    assert looks_like_repeat(copied)
+    assert looks_like_repeat(" ".join(copied))  # 空格差异也算
+    assert looks_like_repeat(f"「{copied}」")  # 多一层标点也算
+    assert not looks_like_repeat("喵，人家现在不太想理你")
+
 
 
 def test_looks_like_repeat_detects_own_recent_line():
@@ -668,18 +902,19 @@ def test_de_repeat_rewrites_copied_line():
     agent = QQBotAgent.__new__(QQBotAgent)
     agent._recent_replies = {}
     agent.llm = _FakeLLM("拿去拿去，看完了赶紧还我")
-    out = asyncio.run(
-        agent._de_repeat("g1", ["喏，看完就还我，别存下来。", "喵，人家不太想理你"])
-    )
+    copied = TEMPLATE_LINES[0]
+    out = asyncio.run(agent._de_repeat("g1", [copied, "喵，人家不太想理你"]))
     assert out == ["拿去拿去，看完了赶紧还我", "喵，人家不太想理你"]
 
 
 def test_de_repeat_keeps_original_when_rewrite_is_also_copied():
     agent = QQBotAgent.__new__(QQBotAgent)
     agent._recent_replies = {}
-    agent.llm = _FakeLLM("文明点啦，群里还有小孩子呢")  # 改写结果又在抄示例
-    out = asyncio.run(agent._de_repeat("g1", ["喏，看完就还我，别存下来。"]))
-    assert out == ["喏，看完就还我，别存下来。"]
+    # 改写结果又在抄另一句示例（模型常见行为）
+    agent.llm = _FakeLLM(TEMPLATE_LINES[-1])
+    copied = TEMPLATE_LINES[0]
+    out = asyncio.run(agent._de_repeat("g1", [copied]))
+    assert out == [copied]
 
 
 # ── 高频场景备选台词 ──────────────────────────────────────
@@ -702,15 +937,16 @@ def test_de_repeat_prefers_scene_pool_without_llm():
     # 场景池命中时不该再花一次 LLM 调用（agent 连 llm 都没有）
     agent = QQBotAgent.__new__(QQBotAgent)
     agent._recent_replies = {}
+    copied = TEMPLATE_LINES[0]
     out = asyncio.run(
         agent._de_repeat(
             "g1",
-            ["喏，看完就还我，别存下来。"],
+            [copied],
             user_message="{isDom:true}主人：看看女装",
             is_dom=True,
         )
     )
-    assert out and out[0] != "喏，看完就还我，别存下来。"
+    assert out and out[0] != copied
     assert out[0] in _SCENE_LINES[1][2]
 
 
@@ -762,3 +998,207 @@ def test_chat_adds_continue_hint_when_someone_replies_to_me():
     content = captured["content"]
     assert "<continuing>" in content
     assert "别重复自己说过的话" in content
+
+
+# ══════════════════════════════════════════════════════════
+# 多轮裁决：这段对话留不留
+# ══════════════════════════════════════════════════════════
+def _memory_agent(replies: list[str]):
+    """开关打开、裁决开启的 agent；``replies`` 按轮依次返回。"""
+    from agent.thread_turns import ThreadTurns
+
+    agent = _bare_agent("")
+    agent.thread_turns = ThreadTurns()
+    agent._thread_memory_enabled = True
+    agent._thread_memory_verdict = True
+    agent._thread_memory_new_after = 0  # 测试里不按时间判
+    agent._thread_memory_groups = set()
+
+    payloads: list[list] = []
+    queue = list(replies)
+
+    async def _invoke(payload):
+        payloads.append(list(payload["messages"]))
+        content = queue.pop(0) if queue else "<output><message>嗯</message></output>"
+        return {"messages": [{"role": "assistant", "content": content}]}
+
+    agent.agent = type("_A", (), {"ainvoke": staticmethod(_invoke)})()
+    return agent, payloads
+
+
+def _group_ctx(message_id: str, text: str):
+    from messaging.models import ChatContext, ChatMessage, Segment, Sender
+
+    return ChatContext(
+        chat_type="group",
+        group_id="20001",
+        self_id="10002",
+        master_ids=["10001"],
+        current=ChatMessage(
+            message_id=message_id,
+            sender=Sender(qq="10001", name="Pyrin", is_master=True),
+            segments=[Segment("text", text=text)],
+        ),
+    )
+
+
+def test_chat_new_topic_verdict_restarts_segment():
+    """模型写 <thread>新话题</thread>：下一轮从这条重建前缀，不再拖着旧的一段。
+
+    现场：聊完 1500 条聊天记录，主人转头发「对了你今天吃啥」—— 旧的那段
+    （翻历史的工具过程、几百字结论）对新话题毫无用处，还占着前缀的预算。
+    """
+    agent, payloads = _memory_agent(
+        [
+            "<output><message>嗯</message></output>",
+            "<output><message>嗯</message></output>",
+            "<thread>新话题</thread><output><message>哦</message></output>",
+            "<output><message>嗯</message></output>",
+        ]
+    )
+
+    event = {"message_type": "group", "group_id": 20001, "user_id": 10001}
+    for index in range(1, 5):
+        asyncio.run(
+            agent.chat(
+                context=_group_ctx(str(index), f"第{index}句"),
+                thread_id="group_20001",
+                event=event,
+            )
+        )
+
+    # 第 3 轮：回放 2 轮 + 增量
+    assert len(payloads[2]) == 5
+    # 第 4 轮：裁决生效，重开一段 —— 完整上下文 + 上一条回复 + 增量
+    assert len(payloads[3]) == 3
+    assert "<scene>" in payloads[3][0].content
+    assert "第3句" in payloads[3][0].content
+    assert "第1句" not in payloads[3][0].content
+
+    turns = agent.thread_turns.get("group_20001")
+    assert len(turns) == 2  # 新一段的第 3 轮 + 第 4 轮
+
+
+def test_chat_new_topic_verdict_clears_even_when_silent():
+    """裁决是新话题、但这轮没接话：旧的一段也该清掉。"""
+    agent, payloads = _memory_agent(
+        [
+            "<output><message>嗯</message></output>",
+            "<thread>新话题</thread><output><message></message></output>",
+            "<output><message>嗯</message></output>",
+        ]
+    )
+
+    event = {"message_type": "group", "group_id": 20001, "user_id": 10001}
+    assert asyncio.run(
+        agent.chat(
+            context=_group_ctx("1", "第一句"), thread_id="group_20001", event=event
+        )
+    ) == ["嗯"]
+    assert agent.thread_turns.get("group_20001")
+
+    assert asyncio.run(
+        agent.chat(
+            context=_group_ctx("2", "换个话题"), thread_id="group_20001", event=event
+        )
+    ) == []
+    assert agent.thread_turns.get("group_20001") == []
+
+    asyncio.run(
+        agent.chat(
+            context=_group_ctx("3", "新的第一句"),
+            thread_id="group_20001",
+            event=event,
+        )
+    )
+    assert len(payloads[2]) == 1  # 回到完整上下文
+
+
+def test_chat_thread_memory_respects_group_whitelist():
+    """灰度：groups 非空时只对这些群生效，其他群与旧版一致。"""
+    agent, payloads = _memory_agent(
+        [
+            "<output><message>嗯</message></output>",
+            "<output><message>嗯</message></output>",
+        ]
+    )
+    agent._thread_memory_groups = {"99999"}
+
+    event = {"message_type": "group", "group_id": 20001, "user_id": 10001}
+    for index in range(1, 3):
+        asyncio.run(
+            agent.chat(
+                context=_group_ctx(str(index), f"第{index}句"),
+                thread_id="group_20001",
+                event=event,
+            )
+        )
+
+    assert [len(item) for item in payloads] == [1, 1]
+
+
+def test_chat_skips_replay_on_control_day(monkeypatch):
+    """对照实验的「关」那一天：即使手上留着上一段，也只发完整上下文。
+
+    现场是奇数日开、偶数日关。11-16 是偶数日 —— 这一天所有群都应该退回旧行为，
+    否则两边样本混在一起，什么也测不出来。
+    """
+    import agent.runtime as rt
+    from datetime import date as real_date
+
+    class _FakeDate(real_date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 11, 16)
+
+    monkeypatch.setattr(rt, "date", _FakeDate)
+
+    agent, payloads = _memory_agent(
+        [
+            "<output><message>嗯</message></output>",
+            "<output><message>嗯</message></output>",
+        ]
+    )
+    agent._thread_memory_day_parity = 1  # 奇数日开
+
+    event = {"message_type": "group", "group_id": 20001, "user_id": 10001}
+    for index in range(1, 3):
+        asyncio.run(
+            agent.chat(
+                context=_group_ctx(str(index), f"第{index}句"),
+                thread_id="group_20001",
+                event=event,
+            )
+        )
+
+    assert [len(item) for item in payloads] == [1, 1]
+    assert agent.thread_turns.get("group_20001") == []
+
+
+def test_llm_log_line_carries_session_and_arm(caplog):
+    """LLM 那行日志要能直接看出「哪个会话、哪个实验臂」。
+
+    没有这两项时，统计命中率只能靠「离哪条 [会话] 行最近」去猜，judge（GLM）的
+    调用还会混进来 —— 上一次就是这么把 261 次判断器调用算进主模型的。
+    """
+    import logging
+    from types import SimpleNamespace
+
+    from agent.runtime import (
+        LLMCallbackHandler,
+        _llm_arm_var,
+        _llm_session_var,
+    )
+
+    _llm_session_var.set("group_583261953")
+    _llm_arm_var.set("on")
+    handler = LLMCallbackHandler()
+    response = SimpleNamespace(
+        llm_output={"token_usage": {"prompt_tokens": 100, "prompt_cache_hit_tokens": 80}}
+    )
+
+    with caplog.at_level(logging.INFO, logger="QQBotAgent"):
+        handler.on_llm_end(response)
+
+    assert "[group_583261953|on]" in caplog.text
+    assert "缓存命中 80（80%）" in caplog.text

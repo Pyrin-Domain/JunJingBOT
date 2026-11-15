@@ -74,12 +74,16 @@ class MessageCursor:
     :param message_id: 后端本地哈希；跨后端**不可比**。
     :param message_seq: 原始 ``message_seq``；含义随后端变化，不要直接用。
     :param real_seq: 归一化后的全局序号；跨后端可比，这是唯一可靠的跨后端身份。
+    :param real_id: NapCat 的 ``real_id``。它和 ``real_seq`` 不同：前者是服务端
+        消息 id、**重启后仍指向同一条**，后者是递增序号。断点恢复要靠它认出
+        「同一个断点在重启后换了新 ``message_id``」。
     :param time: 秒级时间戳，兜底用。
     """
 
     message_id: Any = None
     message_seq: Any = None
     real_seq: int | None = None
+    real_id: Any = None
     time: int | None = None
 
     # ── 构造 ──
@@ -91,8 +95,10 @@ class MessageCursor:
             return cls()
 
         message_id = message.get("message_id")
+        real_id = message.get("real_id")
         if message_id is None:
-            message_id = message.get("real_id")
+            # 有的后端只给 real_id：它同样是「这条消息」，可以当本地 id 用
+            message_id = real_id
         message_seq = message.get("message_seq")
 
         # 全局序号：NapCat 在 real_seq，SnowLuma 在 message_seq。
@@ -104,6 +110,7 @@ class MessageCursor:
             message_id=message_id,
             message_seq=message_seq,
             real_seq=real_seq,
+            real_id=real_id,
             time=as_int(message.get("time")),
         )
 
@@ -147,7 +154,8 @@ class MessageCursor:
     @property
     def has_identity(self) -> bool:
         return any(
-            value is not None for value in (self.real_seq, self.message_id, self.message_seq)
+            value is not None
+            for value in (self.real_seq, self.real_id, self.message_id, self.message_seq)
         )
 
     @property
@@ -178,12 +186,15 @@ class MessageCursor:
     def matches(self, other: Any) -> bool:
         """是否指向同一条消息。
 
-        顺序很关键：全局序号优先（跨后端唯一可靠），其次 ``message_id``
+        顺序很关键：全局序号优先（跨后端唯一可靠），其次 ``real_id``
+        （NapCat 重启后不变，断点恢复靠它），再次 ``message_id``
         （同后端唯一），最后 ``message_seq``。
         """
         other = self.from_message(other) if not isinstance(other, MessageCursor) else other
         if self.real_seq is not None and other.real_seq is not None:
             return self.real_seq == other.real_seq
+        if self.real_id is not None and other.real_id is not None:
+            return same_value(self.real_id, other.real_id)
         if self.message_id is not None and other.message_id is not None:
             return same_value(self.message_id, other.message_id)
         if self.message_seq is not None and other.message_seq is not None:

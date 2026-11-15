@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import re
 
+from core.logging import get_logger
+
 __all__ = ["fabric"]
+
+log = get_logger("bot.commands.fabric")
 
 
 async def fabric(handler, event):
@@ -20,20 +24,23 @@ async def fabric(handler, event):
         return
     if event.get("message_type") == "group":
         await handler.mp.ensure_connected()
-        await handler.api.send_group_forward_msg(
-            group_id=event.get("group_id"),
-            messages=[
-                {
-                    "type": "node",
-                    "data": {
-                        "uin": int(match.group(1)),
-                        "name": name_match.group(1) if name_match else "QQ用户",
-                        "content": [
-                            {"type": "text", "data": {"text": match.group(2)}}
-                        ],
-                    },
-                }
-            ],
-        )
+        try:
+            await handler.api.send_group_forward_msg(
+                group_id=event.get("group_id"),
+                messages=[
+                    {
+                        "type": "node",
+                        "data": {
+                            "uin": int(match.group(1)),
+                            "name": name_match.group(1) if name_match else "QQ用户",
+                            "content": [
+                                {"type": "text", "data": {"text": match.group(2)}}
+                            ],
+                        },
+                    }
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001 - 造假卡片失败只是没发出去，不该炸任务
+            log.warning("发送失败: %s", exc)
         return
     return

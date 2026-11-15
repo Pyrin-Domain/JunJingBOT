@@ -24,10 +24,12 @@ from .dedup import (
     SIM_ALGO,
     TEXT_PER_IMAGE,
     TOKEN_WEIGHT_CAP,
+    VIDEO_SIG_HEX_LEN,
     ForwardDedupStore,
     build_fingerprint,
     clean_group_ids,
     clean_image_hashes,
+    clean_video_sigs,
     dedup_log,
     empty_fingerprint,
     event_snapshot,
@@ -50,14 +52,18 @@ from .dedup import (
     tokenize,
 )
 from .forward import ForwardService
+from .image_dedup import ForwardImageStore
 from .interject import GroupState, InterjectService
+from .psychology import PsychologyService
 from .range_task import RangeTaskService
 
 __all__ = [
     "ForwardService",
+    "ForwardImageStore",
     "ForwardDedupStore",
     "RangeTaskService",
     "InterjectService",
+    "PsychologyService",
     "GroupState",
     # 指纹算法 / 常量
     "simhash",
@@ -73,6 +79,7 @@ __all__ = [
     "hamming_hex",
     "clean_group_ids",
     "clean_image_hashes",
+    "clean_video_sigs",
     "normalize_line",
     "forward_content_items",
     "forward_content_lines",
@@ -90,6 +97,7 @@ __all__ = [
     "BAND_COUNT",
     "HASH_HEX_LEN",
     "IMG_HASH_HEX_LEN",
+    "VIDEO_SIG_HEX_LEN",
     "TOKEN_WEIGHT_CAP",
     "SIM_ALGO",
     "CLAIM_FRESH_SECONDS",

@@ -52,10 +52,12 @@ class BotSettings:
         "dedup",
         "auto_img_forward_from_bot",
         "strip_tail_ads",
+        "forward_filter",
     )
     AUTO_FORWARD_ALIASES = {
         "user_id_list": "userid_list",
         "user_ids": "userid_list",
+        "filter": "forward_filter",
     }
 
     def __init__(
@@ -75,6 +77,10 @@ class BotSettings:
         self._env_overrides = dict(env_overrides or {})
         self._connection_overrides = dict(connection_overrides or {})
         self._load(auto_create=auto_create)
+        # 上一次「从磁盘读进来」的快照。热加载要靠它判断「这次保存到底改了什么」：
+        # 面板保存是先从 update() 改内存、再 save()、再调 reload_config()，那时
+        # self.data 已经是新值了，拿它做基准永远比不出差异 —— 热加载会静默失效。
+        self._loaded = deepcopy(self.data)
 
     # ════════════════════ 加载 ════════════════════
     def _load(self, *, auto_create: bool) -> None:
@@ -200,7 +206,13 @@ class BotSettings:
 
     def reload(self) -> "BotSettings":
         self._load(auto_create=False)
+        self._loaded = deepcopy(self.data)
         return self
+
+    def loaded(self) -> dict:
+        """上一次从磁盘读进来的配置（热加载的对比基准）。"""
+        snapshot = getattr(self, "_loaded", None)
+        return deepcopy(snapshot if isinstance(snapshot, dict) else self.data)
 
     def to_dict(self) -> dict:
         return deepcopy(self.data)
@@ -331,6 +343,23 @@ class BotSettings:
     @property
     def image_forward_auto_targets(self) -> list:
         return list(self.get("image_forward.auto_target_group_ids", []) or [])
+
+    @property
+    def export_auto_targets(self) -> list:
+        """``export -a`` 的默认目标群：本段留空则退回自动搬运的目标群。"""
+        def _ints(values) -> list:
+            out = []
+            for value in values or []:
+                try:
+                    out.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        value = _ints(self.get("export.auto_target_group_ids", []))
+        if value:
+            return value
+        return _ints(self.get("auto_forward.target_groupid", []))
 
     @property
     def keyword_actions(self) -> list:

@@ -208,13 +208,13 @@ class _FakeForward:
         )
 
 
-def _handlers():
+def _handlers(settings=None):
     mp = _FakeMP()
     nc = _FakeNC()
     forward = _FakeForward()
     service = RangeTaskService()
     handlers = CommandHandlers(
-        mp=mp, nc=nc, forward=forward, range_tasks=service
+        mp=mp, nc=nc, forward=forward, range_tasks=service, settings=settings
     )
     return handlers, service, mp, nc, forward
 
@@ -247,6 +247,102 @@ def test_export_collected_by_shared_range_service():
         assert (call["start_id"], call["end_id"]) == (10, 20)
         assert call["processor"] == forward.auto_forward
         assert call["params"]["target_groupid"] == [222]
+
+    _run(scenario())
+
+
+def test_export_auto_uses_configured_targets():
+    """export -a：目标群取 export.auto_target_group_ids，不用手写群号。"""
+
+    async def scenario():
+        handlers, service, mp, _nc, forward = _handlers(
+            settings={"export": {"auto_target_group_ids": [333, 444]}}
+        )
+        await handlers.export(
+            {
+                "group_id": 1,
+                "message_id": 100,
+                "reply_id": 10,
+                "raw_message": "export -a -b",
+            }
+        )
+        assert service.task_dict["1"]["data"]["target_groupid_list"] == [333, 444]
+
+        await handlers.export(
+            {
+                "group_id": 1,
+                "message_id": 101,
+                "reply_id": 20,
+                "raw_message": "export -e",
+            }
+        )
+        assert service.task_dict == {}
+        assert len(mp.history_calls) == 1
+        call = mp.history_calls[0]
+        assert call["processor"] == forward.auto_forward
+        assert call["params"]["target_groupid"] == [333, 444]
+
+    _run(scenario())
+
+
+def test_export_auto_falls_back_to_auto_forward_targets():
+    """export 段留空时，-a 沿用 auto_forward.target_groupid。"""
+
+    async def scenario():
+        handlers, _service, mp, _nc, _forward = _handlers(
+            settings={"export": {"auto_target_group_ids": []},
+                      "auto_forward": {"target_groupid": [20003, 20002]}}
+        )
+        await handlers.export(
+            {
+                "group_id": 1,
+                "message_id": 100,
+                "reply_id": 10,
+                "raw_message": "export -a",
+            }
+        )
+        assert len(mp.history_calls) == 1
+        assert mp.history_calls[0]["params"]["target_groupid"] == [20003, 20002]
+
+    _run(scenario())
+
+
+def test_export_group_wins_over_auto():
+    """同时写 -g 和 -a 时以 -g 为准。"""
+
+    async def scenario():
+        handlers, _service, mp, _nc, _forward = _handlers(
+            settings={"export": {"auto_target_group_ids": [333]}}
+        )
+        await handlers.export(
+            {
+                "group_id": 1,
+                "message_id": 100,
+                "reply_id": 10,
+                "raw_message": "export -a -g 555 -g 666",
+            }
+        )
+        assert mp.history_calls[0]["params"]["target_groupid"] == [555, 666]
+
+    _run(scenario())
+
+
+def test_export_auto_without_targets_does_nothing():
+    """-a 但没有任何默认目标群：不发、不登记，避免空搬。"""
+
+    async def scenario():
+        handlers, service, mp, _nc, _forward = _handlers(settings={})
+        result = await handlers.export(
+            {
+                "group_id": 1,
+                "message_id": 100,
+                "reply_id": 10,
+                "raw_message": "export -a",
+            }
+        )
+        assert result is False
+        assert service.task_dict == {}
+        assert not mp.history_calls
 
     _run(scenario())
 

@@ -10,6 +10,8 @@
     "enable": true,
     "persona_file": "agent/personas/junjing.md",
     "persona_core_file": "agent/personas/core_qq.md",
+    "catchphrase_file": "agent/catchphrases.json",
+    "catchphrase_limit": 0,
     "models": [
       {
         "name": "glm",
@@ -58,10 +60,24 @@
       "recent": true
     }
   },
+  "media": {
+    "send_timeout": 600,
+    "bili_history": true
+  },
   "meme": {
     "enable": true,
     "path": "data/memes.json",
     "prompt_limit": 0
+  },
+  "thread_memory": {
+    "stable_prefix": false,
+    "verdict": true,
+    "new_after_minutes": 15,
+    "groups": [],
+    "ttl_minutes": 30,
+    "max_turns": 8,
+    "max_chars": 12000,
+    "ab_day_parity": null
   },
   "emoji": {
     "collect_group_id": 20001
@@ -135,6 +151,7 @@
     "userid_list": [],
     "task_userid": [],
     "dedup": true,
+    "filter": [],
     "auto_img_forward_from_bot": {
       "enable": true,
       "bot_list": [
@@ -185,7 +202,22 @@
           }
         ]
       }
+    },
+    "forwarded_already_mface": {
+      "summary": "[此条news已被其他群友发布过]",
+      "emoji_id": "2d831a9731974a5bd0fa57e892bc0bd8",
+      "emoji_package_id": 233590,
+      "key": "fe89fd36de66bdc2"
     }
+  },
+  "forward_image_dedup": {
+    "enable": true,
+    "keep_days": 30,
+    "image_keep_days": 2,
+    "perceptual": true,
+    "perceptual_max_distance": 4,
+    "perceptual_keep_days": 0,
+    "perceptual_timeout": 8.0
   },
   "image_forward": {
     "auto_target_group_ids": [
@@ -194,9 +226,50 @@
       20005
     ]
   },
+  "export": {
+    "auto_target_group_ids": []
+  },
   "jm": {
     "enable": true,
     "note": "占位：返回本地占位图，不抓取；/jm 只在私聊回执，不发群"
+  },
+  "psychology": {
+    "enable": false,
+    "keywords": [
+      "分析心理",
+      "心理分析",
+      "心理侧写"
+    ],
+    "reply_mode": "forward",
+    "image_mode": "vision",
+    "model_id": "",
+    "base_url": "",
+    "api_key": "",
+    "api_key_env": "",
+    "model": "",
+    "temperature": 0.5,
+    "max_tokens": 900,
+    "vision": {
+      "model_id": "",
+      "base_url": "",
+      "api_key": "",
+      "api_key_env": "",
+      "model": ""
+    },
+    "prompt": "",
+    "vision_prompt": "",
+    "nodes_prompt": "",
+    "forward_max_tokens": 2000,
+    "forward_include_images": true,
+    "max_images": 6,
+    "image_max_bytes": 4194304,
+    "image_max_side": 1568,
+    "max_records": 60,
+    "use_image_filter": true,
+    "cooldown_seconds": 30,
+    "groups": [],
+    "blacklist_groups": [],
+    "allow_private": true
   },
   "prompts": {
     "group_context": "",
@@ -211,7 +284,8 @@
     "enable": true,
     "host": "127.0.0.1",
     "port": 8390,
-    "token": ""
+    "token": "",
+    "cors_origins": []
   },
   "keyword_actions": [
     {
@@ -344,6 +418,16 @@
           }
         ]
       }
+    },
+    {
+      "regex": "^\\s*/?bili_dl\\b",
+      "action": "try_send_reply_bili_card",
+      "params": {}
+    },
+    {
+      "regex": "^\\s*/?bili_dl\\b",
+      "action": "try_send_bili_video",
+      "params": {}
     }
   ]
 }

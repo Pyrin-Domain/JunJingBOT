@@ -7,8 +7,17 @@
 - 两者的事件里通常同时带 ``message_id`` / ``message_seq`` / ``real_id``。
 
 业务层不判断后端，只把 :class:`MessageAnchor` 里的两个值一起交给
-``transport.api``，由后端档案选择真正发出去的那个字段。比较断点 / 区间时则
-用 :func:`anchor_matches` 同时比对所有可用字段。
+``transport.api``，由后端档案选择真正发出去的那个字段。
+
+**范围说明（重要）**：本模块的比较是「任意字段相等就算同一条」的**宽松**语义，
+专门服务「用户给了一个 id，要把区间找回来」这类场景（``messaging.history``
+的区间召回、``context_builder`` 的引用定位）——那里我们不知道用户给的到底是
+``message_id`` 还是 ``message_seq``，只能都试。
+
+**不要拿它做断点比对**：NapCat 的 ``message_seq`` 是哈希、SnowLuma 的是 184
+这种小序号，两边混比会把不同消息判成同一条。断点 / 翻页的身份判断一律用
+:class:`AbstractionLayer.cursor.MessageCursor`（``real_seq → real_id →
+message_id → message_seq`` 依次严格比对）。
 """
 
 from __future__ import annotations
@@ -154,13 +163,10 @@ def anchor_matches(message: Any, value: Any) -> bool:
     return anchor_of(message).matches(value)
 
 
-def anchors_equal(left: Any, right: Any) -> bool:
-    """两条消息是否指向同一条（任意游标交集）。"""
-    return anchor_of(left).intersects(anchor_of(right))
-
-
-def anchor_value(message: Any, anchor: str | None = None) -> Any:
-    return anchor_of(message).preferred(anchor)
+# 曾经还有 ``anchors_equal`` / ``anchor_value``：前者是「两条消息任意游标有交集」，
+# 生产代码一处都没用过（唯一的调用点在断点恢复里，已改成
+# ``MessageCursor.matches`` 的严格比对），留着只会被人误用在断点上；后者只是
+# ``anchor.preferred()`` 的一行包装。两者都已删除。
 
 
 __all__ = [
@@ -168,7 +174,5 @@ __all__ = [
     "anchor_kwargs",
     "anchor_matches",
     "anchor_of",
-    "anchor_value",
-    "anchors_equal",
     "same_id",
 ]

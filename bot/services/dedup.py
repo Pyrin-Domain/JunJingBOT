@@ -62,6 +62,30 @@ db_path / log_path 只当文件名看，实际落在 data/ 目录：
         "img_match_ratio": 0.6,
         "img_max_count": 5,
         "img_timeout": 8.0,
+        "img_max_bytes": 16777216,
+        "clean_enable": true,          # 入库清洗总开关
+        "clean_scan_tail": 3,          # 末尾几条算广告区
+        "clean_drop_promo": true,      # 装扮/气泡分享卡片（不看位置）
+        "clean_drop_qr": true,         # 末尾二维码海报（要下载解码）
+        "clean_drop_group_card": true,
+        "clean_drop_link": true,
+        "clean_image_timeout": 3.0,
+        "img_max_bytes": 16 * 1024 * 1024,
+        # 入库清洗（见 _DEFAULTS 里的同名项）
+        "clean_enable": true,
+        "clean_scan_tail": 3,
+        "clean_drop_promo": true,
+        "clean_drop_qr": true,
+        "clean_drop_group_card": true,
+        "clean_drop_link": true,
+        "clean_image_timeout": 3.0,
+        # 视频指纹：封面帧 + 第10帧（64 hex），字节 SHA-256 只在文件不超过
+        # video_byte_max_bytes 时补算；视频被转码后字节会变，不能当唯一判据。
+        "video_hamming_threshold": 32,
+        "video_match_ratio": 0.6,
+        "video_max_count": 5,
+        "video_timeout": 15.0,
+        "video_byte_max_bytes": 8 * 1024 * 1024,
         "log_enabled": true,
         "log_path": "forward_dedup_log.jsonl"   # -> data/forward_dedup_log.jsonl
     }
@@ -76,10 +100,14 @@ import re
 import sqlite3
 import threading
 import time
+import zlib
 from collections import Counter
 from pathlib import Path
 
 from config.paths import AppPaths
+from core.logging import get_logger
+
+log = get_logger("bot.services.dedup")
 
 # 模块导入时的默认布局（不建目录、不读配置）；真正运行时由 settings.paths 决定。
 _PATHS = AppPaths.discover()
@@ -120,6 +148,8 @@ TOKEN_WEIGHT_CAP = 2
 SIM_ALGO = 2
 
 IMG_HASH_HEX_LEN = 32  # aHash(64bit) + dHash(64bit) -> 32 位 hex（见 image_hash.py）
+VIDEO_SIG_HEX_LEN = 64  # cover(32) + frame10(32)（见 video_hash.py）
+VIDEO_BYTE_HASH_HEX_LEN = 64  # sha256
 
 # 命中记录是这个时间窗内刚写进去的 → 极可能是同一份内容的两条来源消息几乎同时到达
 CLAIM_FRESH_SECONDS = 90
@@ -141,6 +171,25 @@ _DEFAULTS = {
     "img_match_ratio": 0.6,  # 两份转发里"对得上"的图片比例下限
     "img_max_count": 5,  # 一次最多下载几张图
     "img_timeout": 8.0,  # 单张图下载超时（秒）
+    # 单张图允许下载的最大字节数。原图/截图常常 4MB 以上，卡太小会让 weak 指纹
+    # 直接没有媒体锚点（线上：4.2MB 截图算不出双哈希 → 同一张图被搬两次）。
+    "img_max_bytes": 16 * 1024 * 1024,
+    # 入库清洗：拼指纹 / 算媒体哈希之前，把广告和占位卡片从转发内容里去掉。
+    # 只影响「判定」，不影响发出去的样子（发送侧另有 auto_forward.strip_tail_ads）。
+    "clean_enable": True,
+    "clean_scan_tail": 3,          # 末尾扫几条
+    "clean_drop_promo": True,      # 装扮/气泡分享卡片（任意位置都丢）
+    "clean_drop_qr": True,         # 末尾图片里的二维码海报（要下载解码，可关）
+    "clean_drop_group_card": True, # 末尾的群推荐卡片
+    "clean_drop_link": True,       # 末尾的纯链接 / 吆喝 + 链接
+    "clean_image_timeout": 3.0,    # 二维码检测的单图下载超时（秒）
+    "clean_qr_images": 3,          # 整条记录最多下载几张图做二维码检测
+    # 视频指纹（只在 weak 指纹上启用）：封面帧 + 第 10 帧，必要时补全量字节哈希
+    "video_hamming_threshold": 32,  # 256bit 合并帧指纹允许的差异位数
+    "video_match_ratio": 0.6,  # 两份转发里"对得上"的视频比例下限
+    "video_max_count": 5,  # 一次最多解几个视频
+    "video_timeout": 15.0,  # 单个视频解帧/下载超时（秒）
+    "video_byte_max_bytes": 8 * 1024 * 1024,  # 超过这个大小不算全量 SHA-256
     # 排查日志：一次判定写一行 JSON（含原始事件、指纹、图片 url 与下载失败原因）
     "log_enabled": True,
     "log_path": str(DEFAULT_LOG_PATH),
@@ -186,6 +235,45 @@ CREATE TABLE IF NOT EXISTS forward_image (
 );
 CREATE INDEX IF NOT EXISTS idx_fwdimg_hash ON forward_image(hash);
 CREATE INDEX IF NOT EXISTS idx_fwdimg_fp ON forward_image(fp_id);
+
+-- 视频指纹：sig = 封面帧 aHash+dHash + 第10帧 aHash+dHash（64 hex）
+-- byte_hash = 全量 SHA-256（只在文件不超过配置上限时写，可能为空）
+CREATE TABLE IF NOT EXISTS forward_video (
+    sig        TEXT    NOT NULL DEFAULT '',
+    byte_hash  TEXT    NOT NULL DEFAULT '',
+    fp_id      INTEGER NOT NULL,
+    group_ids  TEXT    NOT NULL DEFAULT '',
+    first_seen INTEGER NOT NULL DEFAULT 0,
+    bytes      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_fwdvideo_sig ON forward_video(sig);
+CREATE INDEX IF NOT EXISTS idx_fwdvideo_byte ON forward_video(byte_hash);
+CREATE INDEX IF NOT EXISTS idx_fwdvideo_fp ON forward_video(fp_id);
+
+-- 内容身份：同一份聊天记录被不同的人（或断点回放）从多个群重复转发时，
+-- 展开后的叶子消息 id / 卡片 id 是稳定的；而 weak 指纹（纯图 / 纯视频）在取不到
+-- 图片时只能靠「宁可多搬一次」，于是同一份内容会在多个群各发一遍。
+-- 这张表把「稳定的内容身份」单独记下来，查库时先按身份命中，再走文本 / 媒体判定。
+CREATE TABLE IF NOT EXISTS forward_content (
+    identity   TEXT    NOT NULL,
+    fp_id      INTEGER NOT NULL,
+    first_seen INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (identity)
+);
+CREATE INDEX IF NOT EXISTS idx_fwdcontent_fp ON forward_content(fp_id);
+
+-- 原始内容存档：入库时把「清洗前」的展开内容压一份存下来。
+-- 为什么要它：清洗规则是会长大的（今天加气泡卡片，明天可能加别的），规则一改
+-- content_hash 就变；只留指纹文本的话，旧内容永远对不上，只能重新爬一遍群。
+-- 表头一行 = 一份内容（按 content_hash 去重），payload 是 zlib 压缩的 messages JSON。
+CREATE TABLE IF NOT EXISTS forward_corpus (
+    content_hash TEXT PRIMARY KEY,
+    kind         TEXT    NOT NULL DEFAULT '',
+    payload      BLOB,
+    raw_size     INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_fwdc_created ON forward_corpus(created_at);
 """
 
 
@@ -287,6 +375,43 @@ def clean_image_hashes(images) -> list[str]:
     return result
 
 
+def clean_video_sigs(videos) -> list[dict]:
+    """只留合法的视频指纹（sig 64 hex / byte_hash 64 hex，至少有一个）。"""
+    result: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in videos or []:
+        if not isinstance(item, dict):
+            continue
+        sig = str(item.get("sig") or "").strip().lower()
+        byte_hash = str(item.get("byte_hash") or "").strip().lower()
+        if sig and not _is_hex(sig, VIDEO_SIG_HEX_LEN):
+            sig = ""
+        if byte_hash and not _is_hex(byte_hash, VIDEO_BYTE_HASH_HEX_LEN):
+            byte_hash = ""
+        if not sig and not byte_hash:
+            continue
+        key = (sig, byte_hash)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            size = int(item.get("bytes") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        result.append({"sig": sig, "byte_hash": byte_hash, "bytes": max(0, size)})
+    return result
+
+
+def _is_hex(value: str, length: int) -> bool:
+    if len(value) != length:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def clean_group_ids(values) -> list[str]:
     """只留纯数字的群号（去重、保序），传 list / 单个值 / 逗号串都行。
 
@@ -305,6 +430,122 @@ def clean_group_ids(values) -> list[str]:
         if text.isascii() and text.isdigit() and text not in result:
             result.append(text)
     return result
+
+
+#: 内容身份前缀。都来自「展开后的内容本身」，不是本次转发的消息 id：
+#: ``leaf:`` = 叶子消息在服务端的稳定 id（real_id 优先），``fwd:`` = 嵌套转发 id，
+#: ``media:`` = 文件名里像哈希的那一段（单图 / 单视频转发唯一的稳定锚点）。
+_IDENTITY_PREFIXES = ("leaf:", "fwd:", "media:")
+
+
+def clean_identities(values) -> list[str]:
+    """整理内容身份：只留已知前缀、去重保序（传 list / 单个值都行）。"""
+    if values is None:
+        items: list = []
+    elif isinstance(values, (list, tuple, set)):
+        items = list(values)
+    else:
+        items = [values]
+    result: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or not text.startswith(_IDENTITY_PREFIXES):
+            continue
+        if text not in result:
+            result.append(text)
+    return result
+
+
+def _stable_media_name(file_name: str) -> str:
+    """从媒体文件名里取「像哈希」的那一段，做内容锚点。
+
+    实测 SnowLuma 的图片 ``data.file`` 就是内容哈希（``AE6DA8E8....jpg``），
+    NapCat / 视频则可能是手机本地路径（``/storage/.../2848404867628177778517373192.mp4``），
+    路径里的最后一段同样是稳定的。太短或太普通的名字（``image.jpg``）不能当锚点，
+    否则所有图片都会互相撞。
+    """
+    name = str(file_name or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    if not name:
+        return ""
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    lowered = stem.lower()
+    hex_like = sum(1 for ch in lowered if ch in "0123456789abcdef") >= 16
+    if hex_like or len(stem) >= 16:
+        return stem
+    return ""
+
+
+def content_identities(event: dict, messages: list | None = None) -> list[str]:
+    """一条聊天记录卡片的**内容身份**（跨消息 id、跨来源群稳定）。
+
+    为什么需要它：weak 指纹（纯图 / 纯视频）在图片下载失败、或后端只给本地视频路径时
+    算不出媒体锚点，文本又只剩 ``昵称: [图片]``，判定只能退回「没搬过」——同一份内容
+    被不同的人从多个群转发，就会每个群各搬一遍（线上 17:14 的三张卡）。这里用展开
+    内容的稳定 id 做锚点：同一份转发不管从哪个群、换了几次卡片 id 进来，叶子消息 id /
+    嵌套转发 id / 媒体文件名都不变。
+
+    只认强锚点：叶子消息 id、嵌套转发 id、像哈希的媒体文件名。昵称 / 文本 / 数量都
+    不进身份（它们区分不了「同一份」和「模板一样的两份」）。
+    """
+    identities: list[str] = []
+
+    def add(value: str) -> None:
+        text = str(value or "").strip()
+        if not text or text in ("0", "None"):
+            return
+        if text not in identities:
+            identities.append(text)
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            message_id = node.get("message_id")
+            real_id = node.get("real_id")
+            anchor = real_id if real_id not in (None, "", 0, "0") else message_id
+            if anchor not in (None, "", 0, "0"):
+                add(f"leaf:{anchor}")
+            segs = node.get("message") or node.get("content") or []
+            if isinstance(segs, list):
+                for seg in segs:
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_type = seg.get("type")
+                    data = seg.get("data") or {}
+                    if not isinstance(data, dict):
+                        continue
+                    if seg_type == "forward":
+                        add(f"fwd:{data.get('id') or data.get('resid') or ''}")
+                    elif seg_type in ("image", "video"):
+                        name = _stable_media_name(data.get("file") or "")
+                        if name:
+                            add(f"media:{name}")
+                    # 转发段里的内联 content 也要往下走（NapCat 内联嵌套）
+                    inline = data.get("content")
+                    if isinstance(inline, list):
+                        for item in inline:
+                            walk(item)
+            for key in ("content", "messages", "news"):
+                value = node.get(key)
+                if isinstance(value, list):
+                    for item in value:
+                        walk(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(messages or [])
+    if not messages:
+        walk((event or {}).get("message") or [])
+    return identities[:8]
+
+
+def identity_text(identities: list[str]) -> str:
+    """没有正文指纹时，用身份算一行稳定的合成文本（保证一行一份内容）。"""
+    joined = "|".join(sorted(clean_identities(identities)))
+    if not joined:
+        return ""
+    return "content_id|" + hashlib.blake2b(
+        joined.encode("utf-8"), digest_size=8
+    ).hexdigest()
 
 
 def fingerprint_of(tokens: list[str]) -> dict:
@@ -426,21 +667,26 @@ def _xml_attr(xml: str, name: str) -> str:
 _NAME_PREFIX_RE = re.compile(r"^\s*[^:：]{1,24}[:：]\s*")
 # 媒体占位：[图片] [动画表情] [视频] [文件] ...
 _MEDIA_RE = re.compile(r"\[[^\[\]]{0,10}\]")
+# 视频必须保留自己的占位：它要走视频指纹，不能和图片混成 [图片]
+_VIDEO_PLACEHOLDER = "[视频]"
+_VIDEO_SENTINEL = "\x00video\x00"
 # 有正文的转发里，昵称一律隐成这个常量（见 mask_senders）
 _MASK_NAME = "user"
 
 
 def normalize_body(body: str) -> str:
-    """规整一条消息的**正文**（不含昵称）：合并空白、媒体占位统一成 [图片]、连续占位并
-    成一个。
+    """规整一条消息的**正文**（不含昵称）：合并空白、图片类占位统一成 [图片]、
+    连续占位并成一个；``[视频]`` 单独保留，交给视频指纹。
 
     与 normalize_line 里对正文的处理是同一套写法，只是不走「拼成 `昵称: 正文` 再用
     正则切回来」那一步 —— get_forward_msg 的 sender 与 raw_message 本来就是分开的两个
     字段，没必要拼起来再猜边界（猜错的原因见 forward_content_items）。
     """
     text = re.sub(r"\s+", " ", (body or "").strip())
+    text = text.replace(_VIDEO_PLACEHOLDER, _VIDEO_SENTINEL)
     text = _MEDIA_RE.sub("[图片]", text)
-    return re.sub(r"(?:\[图片\])+", "[图片]", text).strip()
+    text = re.sub(r"(?:\[图片\])+", "[图片]", text)
+    return text.replace(_VIDEO_SENTINEL, _VIDEO_PLACEHOLDER).strip()
 
 
 def body_text(body: str) -> str:
@@ -508,7 +754,7 @@ def is_text_sparse(lines, media_cnt: int | None = None) -> bool:
     命中、不做模糊相似，而且**必须**过图片双哈希（见 _image_ok 的 required）。
     没有图片（图片数 0）时恒为 False，一律按正常文本处理。
 
-    :param media_cnt: 真实图片张数。传了就用它；不传则按行里的占位符数
+    param media_cnt: 真实媒体段数（图片/视频）。传了就用它；不传则按行里的占位符数
         （`[图片][图片]` -> 2）。行是 normalize_line 出来的，连续占位符会被它并
         成一个占位符，所以数得到真实张数的地方（forward_content_items）会传进来。
 
@@ -557,7 +803,7 @@ _CQ_PLACEHOLDER = {
     "sface": "[图片]",
     "rps": "[图片]",
     "dice": "[图片]",
-    "video": "[图片]",
+    "video": "[视频]",
     "record": "[图片]",
     "file": "[文件]",
     "json": "[分享]",
@@ -595,7 +841,179 @@ def segments_placeholder(segments) -> str:
     return "".join(parts)
 
 
-def forward_content_items(messages) -> tuple[list[tuple[str, str]], int, int]:
+# ══════════════════════════════════════════════════════════
+# 指纹清洗：把「广告 / 占位卡片 / 纯链接」从入库内容里去掉
+# ══════════════════════════════════════════════════════════
+# 只影响指纹，不影响发出去的内容 —— 发送侧另有 forward_filter.clean_forward_messages。
+_JUNK_URL_RE = re.compile(r"https?://[^\s\u4e00-\u9fff]+")
+# 不带协议的「裸域名 + 路径」：QQ 里的薅羊毛广告经常这么写
+# （`零食✨好物🐑毛薅不停😋↓ qm.qq.com/q/VcCFoWscQU`）。必须有路径，避免
+# 把「我们聊 qq.com 吧」这种正常文字当成链接。
+_BARE_URL_RE = re.compile(
+    r"(?<![\w/])(?:[\w-]+\.)+(?:com|cn|net|org|xyz|top|cc|me|tv|info|link|shop|vip|site|online)"
+    r"/[^\s\u4e00-\u9fff]*",
+    re.IGNORECASE,
+)
+# 去掉链接后剩这么多字以内，就当「这条消息只是链接 / 吆喝 + 链接」。
+# 宽松值只对**末尾几条**生效（和发送侧 clean_forward_messages 同一个口径）：
+# 正文中间的正常聊天里带链接不该被删。
+_JUNK_LINK_REST = 6
+_JUNK_LINK_REST_LOOSE = 20
+#: 每条聊天记录默认检查末尾几条
+JUNK_SCAN_TAIL = 3
+# 装扮 / 气泡类分享的固定话术（与 forward_filter.PROMO_TEXT_HINTS 同源，这里不 import
+# 是为了 dedup 保持零外部依赖）
+_JUNK_TEXT_HINTS = (
+    "免费气泡",
+    "个性装扮",
+    "聊天气泡",
+    "超好看的装扮",
+    "气泡装扮",
+)
+# 段占位符：json/xml 卡片本身不是内容
+_JUNK_PLACEHOLDERS = frozenset({"", "[分享]"})
+
+
+def _promo_reason(msg) -> str | None:
+    """转发记录里的单条消息是不是装扮/气泡分享卡片（懒加载，缺依赖就跳过）。"""
+    try:
+        from messaging.forward_filter import promo_card_reason
+    except Exception:  # pragma: no cover - 依赖缺失时不影响指纹
+        return None
+    try:
+        return promo_card_reason(msg)
+    except Exception:  # pragma: no cover - 脏数据不该打断入库
+        return None
+
+
+def is_noise_body(body: str, *, loose: bool = False) -> bool:
+    """一段正文是不是纯噪声：空 / 纯链接 / 装扮话术。
+
+    :param loose: 末尾几条用的宽松链接规则（去掉链接后 ≤ 30 字也算广告）
+
+    注意**不**把 ``[分享]`` 算进来：真正的内容卡片（公众号文章、B 站分享）在
+    指纹里就是 ``[分享]``，只有发送侧能按 json 内容区分，入库这边只能保守。
+    """
+    text = re.sub(r"\s+", " ", (body or "").strip())
+    if not text:
+        return True
+    if any(hint in text for hint in _JUNK_TEXT_HINTS):
+        return True
+    limit = _JUNK_LINK_REST_LOOSE if loose else _JUNK_LINK_REST
+    for pattern in (_JUNK_URL_RE, _BARE_URL_RE):
+        if pattern.search(text):
+            rest = pattern.sub("", text).strip()
+            if len(rest) <= limit:
+                return True
+    return False
+
+
+def _message_is_junk(msg, *, loose: bool = False) -> bool:
+    """整条消息都不该进指纹：装扮/气泡卡片，或正文只剩链接/吆喝。"""
+    if not isinstance(msg, dict):
+        return True
+    if _promo_reason(msg):
+        return True
+    raw = msg.get("raw_message")
+    if isinstance(raw, str) and raw.strip():
+        body = cq_to_placeholder(raw)
+    else:
+        body = segments_placeholder(msg.get("message") or msg.get("content") or [])
+    return is_noise_body(normalize_body(body), loose=loose)
+
+
+def _looks_like_fingerprint_line(part: str) -> bool:
+    """指纹文本里的一段是不是「一条消息的行」（而不是 kind / tsum / source 这些头）。"""
+    if not part:
+        return False
+    if part.startswith("[") and part.endswith("]") and len(part) <= 8:
+        return True
+    return bool(_NAME_PREFIX_RE.match(part))
+
+
+def clean_fingerprint_text(text: str) -> str:
+    """把指纹文本里噪声行去掉，并重算 ``tsum``（重建老库用，见 dedup_rebuild）。
+
+    老行只有拼好的文本，没有段结构，所以这里只能按行清：
+
+    * ``名字: [分享]`` —— 卡片占位，老数据里的气泡广告就长这样；
+    * 纯链接 / 「吆喝 + 链接」（去掉链接后 ≤ 30 字）；
+    * 装扮话术。
+
+    全被判成噪声时**原样返回**：宁可不清，也不要把一条记录清成空指纹。
+    """
+    raw = str(text or "")
+    if not raw:
+        return raw
+    parts = raw.split("|")
+    kind = parts[0] if parts else ""
+    if kind != "old_forward":
+        # 小程序卡片是固定字段（appid|标题|描述|预览图），multimsg 的头也说不清
+        # 哪段是 source —— 这两种没有「末尾广告」问题，原样返回最安全。
+        return raw
+    idx = 1
+    tsum: int | None = None
+    if idx < len(parts) and re.fullmatch(r"tsum\d+", parts[idx] or ""):
+        tsum = int(parts[idx][4:])
+        idx += 1
+    source = ""
+    lines: list[str] = []
+    for part in parts[idx:]:
+        if _looks_like_fingerprint_line(part):
+            lines.append(part)
+        elif not source and part:
+            source = part
+        else:
+            lines.append(part)
+
+    kept: list[str] = []
+    tail_from = max(0, len(lines) - JUNK_SCAN_TAIL)
+    for index, line in enumerate(lines):
+        body = _line_body(line)
+        if line == "[分享]" or line.endswith(": [分享]") or body == "[分享]":
+            continue
+        if is_noise_body(body, loose=index >= tail_from):
+            continue
+        kept.append(line)
+    if not kept or len(kept) == len(lines):
+        return raw
+    # 清洗过头的保护：一条链接就把整条记录清成一句「这个真的好玩兄弟」时，
+    # 指纹会变得毫无区分度（线上 id=1187）。这种情况原样保留。
+    has_media = any(re.search(r"\[(?:图片|视频|文件)\]", line) for line in kept)
+    plain_chars = sum(len(re.sub(r"\[(?:图片|视频|文件|分享)\]", "", _line_body(line)).strip())
+                      for line in kept)
+    if not has_media and len(kept) <= 1 and plain_chars < 10:
+        return raw
+
+    head = [kind]
+    if tsum is not None:
+        head.append(f"tsum{len(kept)}")
+    if source:
+        head.append(source)
+    return "|".join([p for p in head if p] + kept)
+
+
+def _line_body(line: str) -> str:
+    """``名字: 正文`` → 正文；没有名字前缀就原样返回。"""
+    match = _NAME_PREFIX_RE.match(line or "")
+    return line[match.end():] if match else (line or "")
+
+
+def clean_fingerprint_lines(lines, tail_n: int = JUNK_SCAN_TAIL) -> list[str]:
+    """摘要行列表版的清洗（multimsg / xml 这两条只有文本的路走它）。"""
+    items = [str(line or "") for line in lines or []]
+    tail_from = max(0, len(items) - max(0, tail_n)) if tail_n else len(items)
+    kept: list[str] = []
+    for index, text in enumerate(items):
+        if is_noise_body(_line_body(text), loose=index >= tail_from):
+            continue
+        kept.append(text)
+    return kept or items
+
+
+def forward_content_items(
+    messages, drop_junk: bool = True, tail_n: int = JUNK_SCAN_TAIL
+) -> tuple[list[tuple[str, str]], int, int]:
     """把 get_forward_msg 取回的转发内容拆成 [(昵称, 正文)]（写法与卡片摘要保持一致）。
 
     get_forward_msg 的每条都是一整个消息事件（有 sender / raw_message / message），
@@ -610,17 +1028,23 @@ def forward_content_items(messages) -> tuple[list[tuple[str, str]], int, int]:
     同一条转发两次回查就会算成两份不同的指纹（content_hash 不同、SimHash 距离 12 >
     阈值 8、又不是 weak 所以压根没下图片），表现就是"明明很像却判 miss"又搬一遍。
 
-    顺手数出**真实图片张数**：normalize_body 会把一条消息里的 `[图片][图片]`
-    并成一个占位符，只看行里的占位符就会把图片数看少（weak 判据就漏了），所以在
+    顺手数出**真实媒体段数（图片/视频）**：normalize_body 会把一条消息里的 `[图片][图片]`
+    并成一个占位符，只看行里的占位符就会把媒体数看少（weak 判据就漏了），所以在
     合并之前数。
 
-    :return: ([(昵称, 规整后的正文)], 记录条数, 媒体占位符张数)
+    return: ([(昵称, 规整后的正文)], 记录条数, 媒体占位符张数（图片+视频）)
     """
     items: list[tuple[str, str]] = []
     total = 0
     media = 0
-    for msg in messages or []:
+    all_messages = list(messages or [])
+    tail_from = max(0, len(all_messages) - max(0, tail_n)) if tail_n else len(all_messages)
+    for index, msg in enumerate(all_messages):
         if not isinstance(msg, dict):
+            continue
+        # 噪声（装扮/气泡卡片、纯链接、纯吆喝）不进指纹：同一份内容换个人转发，
+        # 末尾挂的广告条数常常不一样，留着就会拼出两份指纹（线上 1132313813）。
+        if drop_junk and _message_is_junk(msg, loose=index >= tail_from):
             continue
         total += 1
         sender = msg.get("sender") or {}
@@ -727,9 +1151,18 @@ def fingerprint_items(items, media_cnt: int | None = None) -> tuple[list[str], b
     return [mask_item(name, body) for name, body in pairs], False
 
 
-def empty_fingerprint(kind: str, images: list[str]) -> dict:
+def empty_fingerprint(
+    kind: str, images: list[str], videos: list[dict] | None = None
+) -> dict:
     """摘要一个字都解析不出来时的空指纹（不生成指纹，否则会互相撞车）"""
-    return {"text": "", "weak": True, "kind": kind, "preview": "", "images": images}
+    return {
+        "text": "",
+        "weak": True,
+        "kind": kind,
+        "preview": "",
+        "images": images,
+        "videos": clean_video_sigs(videos),
+    }
 
 
 def _iter_dicts(node, max_nodes: int = 300):
@@ -862,21 +1295,29 @@ def build_fingerprint(
     kind: str,
     miniapp_info: dict | None = None,
     image_hashes: list[str] | None = None,
+    video_hashes: list[dict] | None = None,
     forward_messages: list | None = None,
+    clean: bool = True,
 ) -> dict:
     """生成转发指纹。
 
+    :param clean: 是否做「入库清洗」（丢装扮卡片 / 末尾广告）。传 False 复现清洗
+        之前的拼法 —— 用来给清洗上线**前**入库的老行做别名查询（见
+        :meth:`ForwardDedupStore.find` 的 ``alt_text``）。
     :param kind: "miniapp" / "multimsg" / "old_forward"
     :param image_hashes: 仅 weak（文本过少）时算出来的图片双哈希列表
+    :param video_hashes: 仅 weak 时算出来的视频指纹（封面帧 + 第10帧 + 可选字节哈希）
     :param forward_messages: get_forward_msg 取回的转发内容（旧版转发专用），
         传了就优先用它拼指纹——raw / xmlContent 时有时无，不能当依赖
-    :return: {"text": 指纹文本(与转发者无关), "weak": 文本区分度是否不足,
-              "kind": kind, "preview": 前 120 字, "images": 图片双哈希列表}
+    :return: {"text": 指纹文本(与转发者无关), "weak": ...,
+              "kind": kind, "preview": 前 120 字,
+              "images": 图片双哈希列表, "videos": 视频指纹列表}
 
     三类卡片各自拼成一行 `kind|...`（每段先过 normalize_line，空段丢掉）；
-    `weak`（文本过少）、`images`（图片双哈希）的用法见模块说明。
+    `weak`（文本过少）、`images`（图片双哈希）、`videos`（视频指纹）的用法见模块说明。
     """
     images = clean_image_hashes(image_hashes)
+    videos = clean_video_sigs(video_hashes)
     weak = False
     if kind == "miniapp":
         info = miniapp_info or get_miniapp_info(event)
@@ -891,6 +1332,8 @@ def build_fingerprint(
         detail = get_multimsg_detail(event)
         lines = [str(n.get("text", "")) for n in (detail.get("news") or [])
                  if isinstance(n, dict)]
+        if clean:
+            lines = clean_fingerprint_lines(lines)
         # 文本够多时隐去昵称，文本过少时保留（见 fingerprint_lines）
         lines, weak = fingerprint_lines(lines)
         # 不含 resid / uniseq / filename —— 这些每次转发都会变，转发者无关才有意义
@@ -902,9 +1345,13 @@ def build_fingerprint(
         ]
     elif kind == "old_forward" and forward_messages is not None:
         # 有真实内容就用它：与卡片摘要同一套写法，且不受 raw 有无影响
-        items, total, media = forward_content_items(forward_messages)
+        items, total, media = forward_content_items(
+            forward_messages,
+            drop_junk=clean,
+            tail_n=JUNK_SCAN_TAIL if clean else 0,
+        )
         if not items:
-            return empty_fingerprint(kind, images)
+            return empty_fingerprint(kind, images, videos)
         # 文本够多时把昵称隐成 user，详见 fingerprint_items / mask_item；media 是合并
         # 前的真实张数，weak 判据只数正文（不含昵称，见 is_text_sparse_bodies）
         lines, weak = fingerprint_items(items, media)
@@ -912,11 +1359,15 @@ def build_fingerprint(
     elif kind == "old_forward":
         info = get_old_forward_xml_info(event)
         # 第一行通常是卡片抬头（与 <source> 同名，如"群聊的聊天记录"），不算内容
-        titles = [t for t in info["titles"] if t.strip() != info["source"].strip()]
+        titles = [
+            t for t in info["titles"] if t.strip() != info["source"].strip()
+        ]
+        if clean:
+            titles = clean_fingerprint_lines(titles)
         if not any(is_informative_line(t) for t in titles) and not info["source"]:
             # 摘要一个字都没解析出来（消息结构变了）：不生成指纹，
             # 否则所有这类转发都会拼成 "old_forward" 而互相撞车
-            return empty_fingerprint(kind, images)
+            return empty_fingerprint(kind, images, videos)
         lines, weak = fingerprint_lines(titles)
         parts = [
             "old_forward",
@@ -933,6 +1384,7 @@ def build_fingerprint(
         "kind": kind,
         "preview": text[:120],
         "images": images,
+        "videos": videos,
     }
 
 
@@ -1007,7 +1459,7 @@ def dedup_log(action: str, event=None, fingerprint: dict | None = None, **fields
             with LOG_PATH.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     except Exception as exc:  # 日志绝不能影响转发主流程
-        print(f"[转发去重] 写日志失败: {exc}")
+        log.warning("[转发去重] 写日志失败: %s", exc)
 
 
 # ---------------------------------------------------------------- 存储 --------
@@ -1048,10 +1500,39 @@ class ForwardDedupStore:
         self.img_match_ratio = float(config["img_match_ratio"])
         self.img_max_count = int(config["img_max_count"])
         self.img_timeout = float(config["img_timeout"])
+        self.img_max_bytes = int(config["img_max_bytes"])
+        self.clean_enable = bool(config.get("clean_enable", True))
+        self.clean_scan_tail = int(config.get("clean_scan_tail", 3))
+        self.clean_drop_promo = bool(config.get("clean_drop_promo", True))
+        self.clean_drop_qr = bool(config.get("clean_drop_qr", True))
+        self.clean_drop_group_card = bool(config.get("clean_drop_group_card", True))
+        self.clean_drop_link = bool(config.get("clean_drop_link", True))
+        self.clean_image_timeout = float(config.get("clean_image_timeout", 3.0))
+        self.clean_qr_images = int(config.get("clean_qr_images", 3))
+        self.video_hamming_threshold = int(config["video_hamming_threshold"])
+        self.video_match_ratio = float(config["video_match_ratio"])
+        self.video_max_count = int(config["video_max_count"])
+        self.video_timeout = float(config["video_timeout"])
+        self.video_byte_max_bytes = int(config["video_byte_max_bytes"])
         self._conn: sqlite3.Connection | None = None
         self._thread_lock = threading.Lock()
         self._async_lock = asyncio.Lock()
         self._last_prune = 0.0
+
+    @property
+    def clean_options(self) -> dict:
+        """给 :func:`messaging.forward_filter.clean_forward_messages` 的参数。"""
+        return {
+            "enable": self.clean_enable,
+            "scan_tail": self.clean_scan_tail,
+            "drop_promo": self.clean_drop_promo,
+            "drop_qr": self.clean_drop_qr,
+            "drop_group_card": self.clean_drop_group_card,
+            "drop_link": self.clean_drop_link,
+            "loose_link": True,  # 入库判定可以比发送更狠：只影响指纹
+            "image_timeout": self.clean_image_timeout,
+            "max_qr_images": self.clean_qr_images,
+        }
 
     # ---------------- 连接 ----------------
     def _ensure_conn(self) -> sqlite3.Connection:
@@ -1081,6 +1562,44 @@ class ForwardDedupStore:
         if a <= 0 or b <= 0:
             return False
         return min(a, b) >= max(a, b) * self.token_ratio
+
+    def _promote_locked(
+        self, conn: sqlite3.Connection, row: sqlite3.Row, fp: dict, preview: str
+    ) -> bool:
+        """把一条「清洗前」的老指纹就地升级成清洗后的哈希。
+
+        只在别名命中时调用，此时清洗后的 content_hash 已经查过、库里没有这一行，
+        所以不会升级出重复行。`weak` / `kind` / 群标记 / 命中次数一概不动 ——
+        清洗只改变哈希和预览，判定语义（weak 要不要图片确认）属于当初入库时的规则，
+        不能拿今天的规则去改历史结论。
+        """
+        try:
+            conn.execute(
+                "UPDATE forward_fingerprint SET simhash = ?, b0 = ?, b1 = ?, b2 = ?, "
+                "b3 = ?, content_hash = ?, token_cnt = ?, preview = ?, sim_algo = ? "
+                "WHERE id = ?",
+                (
+                    fp["simhash"],
+                    fp["b0"],
+                    fp["b1"],
+                    fp["b2"],
+                    fp["b3"],
+                    fp["content_hash"],
+                    fp["token_cnt"],
+                    (preview or "")[:120],
+                    SIM_ALGO,
+                    int(row["id"]),
+                ),
+            )
+            conn.commit()
+            return True
+        except Exception as exc:  # noqa: BLE001 - 升级失败不影响这次判定
+            log.warning("[转发去重] 老指纹升级失败（id=%s）: %s", row["id"], exc)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
 
     def _rows_by_content_hash(
         self, conn: sqlite3.Connection, content_hash: str
@@ -1142,6 +1661,75 @@ class ForwardDedupStore:
             return not required
         return ratio >= self.img_match_ratio
 
+    # ---- 视频指纹（只在 weak 指纹上有数据）----
+    def _video_rows(self, conn: sqlite3.Connection, fp_id: int) -> list[dict]:
+        rows = conn.execute(
+            "SELECT sig, byte_hash, bytes FROM forward_video WHERE fp_id = ?",
+            (int(fp_id),),
+        ).fetchall()
+        return [
+            {
+                "sig": str(row["sig"] or ""),
+                "byte_hash": str(row["byte_hash"] or ""),
+                "bytes": int(row["bytes"] or 0),
+            }
+            for row in rows
+        ]
+
+    def _video_same(self, one: dict, other: dict) -> bool:
+        """两个视频指纹是否同一段视频。
+
+        全量 SHA-256 相同 → 直接算同一段（最可靠）。
+        否则比 256bit 的帧指纹：封面帧 + 第 10 帧各 128bit。视频被 QQ 转码后
+        字节会变，但画面通常只差几位，所以帧指纹是主判据。
+        """
+        a_byte = str(one.get("byte_hash") or "")
+        b_byte = str(other.get("byte_hash") or "")
+        if a_byte and b_byte and a_byte == b_byte:
+            return True
+        a_sig = str(one.get("sig") or "")
+        b_sig = str(other.get("sig") or "")
+        if not a_sig or not b_sig:
+            return False
+        try:
+            return hamming_hex(a_sig, b_sig) <= self.video_hamming_threshold
+        except (TypeError, ValueError):
+            return False
+
+    def _video_match_ratio(self, a: list[dict], b: list[dict]) -> float | None:
+        """当前这批视频（b）有几成能在候选行（a）里找到配对的；没视频返回 None。"""
+        if not a or not b:
+            return None
+        used: set[int] = set()
+        matched = 0
+        for one in b:
+            for index, other in enumerate(a):
+                if index in used:
+                    continue
+                if self._video_same(one, other):
+                    used.add(index)
+                    matched += 1
+                    break
+        return matched / len(b)
+
+    def _video_ok(
+        self,
+        conn: sqlite3.Connection,
+        fp_id: int,
+        videos: list[dict],
+        required: bool = False,
+    ) -> bool:
+        """候选指纹的视频集合是否和当前这条对得上。
+
+        required=True 用在 video-only 的 weak 指纹上：文本只剩 `昵称: [视频]`，
+        视频对不上就不算搬过；两边任何一边没指纹都返回 False（宁可多搬一次）。
+        """
+        cand_videos = self._video_rows(conn, fp_id)
+        ratio = self._video_match_ratio(cand_videos, videos)
+        if ratio is None:
+            return not required
+        return ratio >= self.video_match_ratio
+
     def _groups_locked(self, conn: sqlite3.Connection, fp_id: int) -> list[str]:
         """读回一行指纹的标记群集合（`group_ids`）。"""
         row = conn.execute(
@@ -1155,13 +1743,14 @@ class ForwardDedupStore:
         """把群并入指纹的标记集合，返回合并后的集合；不 commit（调用方决定事务）。
 
         用单条 UPDATE 读出当前值并追加，避免两个进程同时补记不同群时发生
-        read-modify-write 覆盖；图片行同步标记，保持 group_ids 一致。
+        read-modify-write 覆盖；图片/视频行同步标记，保持 group_ids 一致。
         """
         groups = clean_group_ids([group_id])
         if groups:
             target = groups[0]
             for table, key in (("forward_fingerprint", "id"),
-                               ("forward_image", "fp_id")):
+                               ("forward_image", "fp_id"),
+                               ("forward_video", "fp_id")):
                 conn.execute(
                     f"UPDATE {table} SET group_ids = CASE "
                     "WHEN group_ids = '' THEN ? "
@@ -1177,23 +1766,36 @@ class ForwardDedupStore:
         conn: sqlite3.Connection,
         rows: list[sqlite3.Row],
         images: list[str],
-        cur_group: str,
-        required: bool = False,
+        videos: list[dict] | None = None,
+        cur_group: str = "",
+        image_required: bool = False,
+        video_required: bool = False,
     ) -> sqlite3.Row | None:
-        """文本命中的多个候选里挑一个：先过图片那一关，再优先挑「该群有记录」的。
+        """文本命中的多个候选里挑一个：先过媒体指纹那一关，再优先挑「该群有记录」的。
 
-        required（本次是 weak 指纹）或候选自己就是 weak 行时，图片那一关是强制
-        的（见 _image_ok）：文本一字不差也只是"可能"，图对不上就不算搬过。
+        image_required / video_required（本次 weak 且确实有该类媒体）或候选自己
+        就是 weak 行时，对应那一关是强制的：文本一字不差也只是"可能"，媒体对不上
+        就不算搬过。候选 weak 但只有视频时，不能拿图片去卡它。
         优先该群有记录，是为了同一份内容散成多行时不漏（正常情况下只有一行）；
         真挑不出来就退回第一行，由调用方按「该群没记录」处理。
         """
-        usable = [
-            cand
-            for cand in rows
-            if self._image_ok(
-                conn, cand["id"], images, required=required or bool(cand["weak"])
-            )
-        ]
+        videos = videos or []
+        usable: list[sqlite3.Row] = []
+        for cand in rows:
+            cand_images = self._image_rows(conn, cand["id"])
+            cand_videos = self._video_rows(conn, cand["id"])
+            cand_weak = bool(cand["weak"])
+            image_need = image_required or (cand_weak and bool(cand_images))
+            video_need = video_required or (cand_weak and bool(cand_videos))
+            # 老记录 weak 但图片/视频都没落库（当时下载失败）：保守地仍按图片校验，
+            # 避免它只靠相同文本吞掉新内容。
+            if cand_weak and not cand_images and not cand_videos:
+                image_need = True
+            if not self._image_ok(conn, cand["id"], images, required=image_need):
+                continue
+            if not self._video_ok(conn, cand["id"], videos, required=video_need):
+                continue
+            usable.append(cand)
         for cand in usable:
             if self._group_seen(cand["group_ids"], cur_group):
                 return cand
@@ -1276,6 +1878,138 @@ class ForwardDedupStore:
         ).fetchall()
         return self._best_image_candidate(conn, rows, images, cur_group)
 
+    def _find_by_identities(
+        self,
+        conn: sqlite3.Connection,
+        identities: list[str],
+        cur_group: str,
+        content_hash: str = "",
+    ) -> sqlite3.Row | None:
+        """按「内容身份」查历史：同一份聊天记录换了卡片 id / 来源群也能认出来。
+
+        两类身份强度不同：
+
+        * ``leaf:`` / ``fwd:`` —— 展开后的叶子消息 id、嵌套转发 id，是**同一份内容**
+          的直接证据，命中即算搬过；
+        * ``media:`` —— 媒体文件名哈希。两份不同记录可能含同一张图，所以只在
+          **正文指纹完全相同**（``content_hash`` 相等）时才认，用来补「纯图 / 纯视频
+          取不到双哈希」那一档。
+
+        只放宽到这一步：身份必须在入库时真的见过（``forward_content``），不做猜测。
+        """
+        wanted = clean_identities(identities)
+        if not wanted:
+            return None
+        strong = {one for one in wanted if not one.startswith("media:")}
+        media = [one for one in wanted if one.startswith("media:")]
+        query_ids = list(strong) + media
+        marks = ",".join("?" * len(query_ids))
+        fp_ids = [
+            int(row["fp_id"])
+            for row in conn.execute(
+                f"SELECT DISTINCT fp_id FROM forward_content WHERE identity IN ({marks})",
+                tuple(query_ids),
+            )
+        ]
+        if not fp_ids:
+            return None
+        id_marks = ",".join("?" * len(fp_ids))
+        rows = conn.execute(
+            f"{self._SELECT} WHERE id IN ({id_marks})", tuple(fp_ids)
+        ).fetchall()
+        usable: list[sqlite3.Row] = []
+        for cand in rows:
+            seen = {
+                str(row["identity"])
+                for row in conn.execute(
+                    "SELECT identity FROM forward_content WHERE fp_id = ?",
+                    (int(cand["id"]),),
+                )
+            }
+            if seen & strong:
+                usable.append(cand)
+            elif cand["content_hash"] == content_hash and seen & set(media):
+                usable.append(cand)
+        if not usable:
+            return None
+        for cand in usable:
+            if self._group_seen(cand["group_ids"], cur_group):
+                return cand
+        return usable[0]
+
+    def _best_video_candidate(
+        self,
+        conn: sqlite3.Connection,
+        rows: list[sqlite3.Row],
+        videos: list[dict],
+        cur_group: str,
+    ) -> sqlite3.Row | None:
+        """从候选行里挑视频匹配度最高的一行；同分时优先本次所在群已标记过的。"""
+        best: sqlite3.Row | None = None
+        best_key: tuple[int, float] | None = None
+        for cand in rows:
+            cand_videos = self._video_rows(conn, cand["id"])
+            ratio = self._video_match_ratio(cand_videos, videos)
+            if ratio is None or ratio < self.video_match_ratio:
+                continue
+            seen = self._group_seen(cand["group_ids"], cur_group)
+            key = (0 if seen else 1, -ratio)
+            if best_key is None or key < best_key:
+                best, best_key = cand, key
+        return best
+
+    def _find_by_videos(
+        self,
+        conn: sqlite3.Connection,
+        videos: list[dict],
+        cur_group: str,
+    ) -> sqlite3.Row | None:
+        """视频指纹兜底检索：文本漂移但视频对得上时也算搬过。
+
+        先走 sig / byte_hash 的索引精确查；精确查不到再做一次模糊扫描（QQ 转码
+        可能让帧指纹差几位）。视频表规模有限（一次转发最多 video_max_count 个）。
+        """
+        if not videos:
+            return None
+        sigs = [v["sig"] for v in videos if v.get("sig")]
+        byte_hashes = [v["byte_hash"] for v in videos if v.get("byte_hash")]
+        clauses: list[str] = []
+        params: list[str] = []
+        if sigs:
+            clauses.append(f"sig IN ({','.join('?' * len(sigs))})")
+            params.extend(sigs)
+        if byte_hashes:
+            clauses.append(f"byte_hash IN ({','.join('?' * len(byte_hashes))})")
+            params.extend(byte_hashes)
+        rows: list[sqlite3.Row] = []
+        if clauses:
+            rows = conn.execute(
+                f"{self._SELECT} WHERE id IN ("
+                f"SELECT fp_id FROM forward_video WHERE {' OR '.join(clauses)}"
+                ")",
+                tuple(params),
+            ).fetchall()
+        best = self._best_video_candidate(conn, rows, videos, cur_group)
+        if best is not None:
+            return best
+
+        candidate_ids: set[int] = set()
+        for row in conn.execute("SELECT fp_id, sig, byte_hash FROM forward_video"):
+            cand = {
+                "sig": str(row["sig"] or ""),
+                "byte_hash": str(row["byte_hash"] or ""),
+            }
+            if any(self._video_same(one, cand) for one in videos):
+                candidate_ids.add(int(row["fp_id"]))
+        if not candidate_ids:
+            return None
+        marks = ",".join("?" * len(candidate_ids))
+        rows = conn.execute(
+            f"{self._SELECT} WHERE id IN ({marks})",
+            tuple(candidate_ids),
+        ).fetchall()
+        return self._best_video_candidate(conn, rows, videos, cur_group)
+
     def _mark_seen_locked(
         self, conn: sqlite3.Connection, row: sqlite3.Row, cur_group: str
     ) -> tuple[list[str], bool]:
@@ -1297,8 +2031,11 @@ class ForwardDedupStore:
         fp: dict,
         token_cnt: int,
         images: list[str],
+        videos: list[dict],
         cur_group: str,
         weak: bool,
+        image_required: bool = False,
+        video_required: bool = False,
     ) -> tuple[sqlite3.Row | None, int]:
         """SimHash 模糊相似度：分桶取候选，返回 (最合适的一行, 汉明距离)。
 
@@ -1324,10 +2061,18 @@ class ForwardDedupStore:
         for cand in candidates:
             if not self._token_count_ok(token_cnt, cand["token_cnt"]):
                 continue
-            # weak（本次或候选）必须过图片这一关，见 _image_ok 的 required
-            if not self._image_ok(
-                conn, cand["id"], images, required=bool(weak or cand["weak"])
-            ):
+            # weak（本次或候选）必须过媒体指纹这一关。候选 weak 但只有视频时，
+            # 不能拿图片去卡它。
+            cand_weak = bool(cand["weak"])
+            cand_images = self._image_rows(conn, cand["id"])
+            cand_videos = self._video_rows(conn, cand["id"])
+            image_need = bool(weak or cand_weak)
+            if not image_required and not cand_images and cand_videos:
+                image_need = False
+            video_need = video_required or (cand_weak and bool(cand_videos))
+            if not self._image_ok(conn, cand["id"], images, required=image_need):
+                continue
+            if not self._video_ok(conn, cand["id"], videos, required=video_need):
                 continue
             dist = hamming_hex(fp["simhash"], cand["simhash"])
             if dist > (0 if (weak or cand["weak"]) else self.hamming_threshold):
@@ -1342,19 +2087,30 @@ class ForwardDedupStore:
         text: str,
         weak: bool = False,
         images: list[str] | None = None,
+        videos: list[dict] | None = None,
         group_ids: list[str] | None = None,
         cur_group: str = "",
         reserve: bool = False,
         kind: str = "",
         preview: str = "",
+        image_required: bool | None = None,
+        video_required: bool | None = None,
+        alt_text: str = "",
+        identities: list[str] | None = None,
     ) -> dict | None:
-        """按 整串指纹 → SimHash 相似度 → 图片双哈希 的顺序查历史。
+        """按 整串指纹 → 内容身份 → 清洗前指纹（别名）→ SimHash 相似度 → 图片双哈希 的顺序查历史。
 
         命中即刷新 last_seen、hit_count +1（"这份东西被搬过几次"），返回结果的
         `seen_here` = 本次事件所在群在不在标记集合里（True 去发【发过了喵】，
         False 直接结束），两种都不返回"要搬"；`group_ids` 是这次要一起标记进库的群
         （目标群 + 来源群），`images` 是本次这批图的双哈希（见模块说明），weak 指纹
         必须靠它确认（拿不到图就不算搬过）。
+
+        `alt_text` 是同一份内容在**清洗之前**拼出来的指纹文本。清洗（丢装扮卡片 /
+        末尾广告）是后加的，之前入库的行存的是清洗前的 content_hash；只查清洗后的
+        文本，这些老行永远匹配不上，同一份内容每重发一次就搬一次。命中别名时会把
+        那一行就地升级成清洗后的哈希（下次再出现就能直接命中，换个马甲也认）。
+        别名是**更严格**的比对（连广告都一样），所以不会带来新的误判。
 
         reserve=True 把"查 + 认领"合成一次原子操作：判定为"没搬过、要搬"时立刻把
         group_ids 写进库，让几乎同时到达的第二条来源消息（a 群、b 群各发一次）能
@@ -1363,33 +2119,87 @@ class ForwardDedupStore:
         """
         tokens = tokenize(text)
         images = clean_image_hashes(images)
+        videos = clean_video_sigs(videos)
+        image_required = weak if image_required is None else bool(image_required)
+        video_required = False if video_required is None else bool(video_required)
         marked = clean_group_ids(group_ids)
         cur_group = str(cur_group or "")
         if not tokens:
             return None
+        identities = clean_identities(identities)
         fp = fingerprint_of(tokens)
         now = int(time.time())
         with self._thread_lock:
             conn = self._ensure_conn()
             # 整串指纹完全一致（含 tSum/全部行）就算搬运过；weak 不例外，但必须由
-            # 图片确认：少图模板聊天记录文本一字不差太常见了。
+            # 图片/视频确认：少图模板聊天记录文本一字不差太常见了。
             rows = self._rows_by_content_hash(conn, fp["content_hash"])
-            row = self._pick_candidate(conn, rows, images, cur_group, required=weak)
+            row = self._pick_candidate(
+                conn,
+                rows,
+                images,
+                videos,
+                cur_group,
+                image_required=image_required,
+                video_required=video_required,
+            )
             reason = "content_hash" if row is not None else ""
             similarity = 1.0
+            # 内容身份：同一份记录换了卡片 id / 来源群，叶子消息 id 不变。
+            # 排在别名和 SimHash 之前 —— 它是直接证据，且能救「weak 取不到媒体锚点」
+            # 那一档（文本只剩 `昵称: [图片]` 时，文本判定会一直说"没搬过"）。
+            if row is None and identities:
+                row = self._find_by_identities(
+                    conn, identities, cur_group, content_hash=fp["content_hash"]
+                )
+                if row is not None:
+                    reason = "identity"
+            # 清洗之前的指纹（别名）：命中说明这是清洗上线前入过库的老内容。
+            # 顺序放在 SimHash 之前 —— 整串相等比近似更准，而且是一次索引查询。
+            if row is None and alt_text and alt_text != text:
+                alt_tokens = tokenize(alt_text)
+                alt_fp = fingerprint_of(alt_tokens) if alt_tokens else None
+                if alt_fp and alt_fp["content_hash"] != fp["content_hash"]:
+                    alt_rows = self._rows_by_content_hash(
+                        conn, alt_fp["content_hash"]
+                    )
+                    row = self._pick_candidate(
+                        conn,
+                        alt_rows,
+                        images,
+                        videos,
+                        cur_group,
+                        image_required=image_required,
+                        video_required=video_required,
+                    )
+                    if row is not None:
+                        reason = "content_hash_legacy"
+                        self._promote_locked(conn, row, fp, preview or text)
             # 模糊相似度（候选怎么挑见 _simhash_row）
             if row is None and len(tokens) >= self.min_tokens:
                 row, dist = self._simhash_row(
-                    conn, fp, len(tokens), images, cur_group, weak
+                    conn,
+                    fp,
+                    len(tokens),
+                    images,
+                    videos,
+                    cur_group,
+                    weak,
+                    image_required=image_required,
+                    video_required=video_required,
                 )
                 if row is not None:
                     reason = "simhash"
                     similarity = 1 - dist / SIMHASH_BITS
-            # 图片双哈希兜底：文本（条数/抬头）漂了但图片完全一致，仍是同一份
+            # 媒体指纹兜底：文本（条数/抬头）漂了但图片/视频完全一致，仍是同一份
             if row is None and images:
                 row = self._find_by_images(conn, images, cur_group)
                 if row is not None:
                     reason = "image"
+            if row is None and videos:
+                row = self._find_by_videos(conn, videos, cur_group)
+                if row is not None:
+                    reason = "video"
             if row is None:
                 # 查不到 = 这次真的要搬 → 先把标记的群认领下来（见 _claim_locked）
                 if reserve and marked:
@@ -1403,6 +2213,9 @@ class ForwardDedupStore:
                         text=text,
                         weak=weak,
                         images=images,
+                        videos=videos,
+                        image_required=image_required,
+                        video_required=video_required,
                         now=now,
                     )
                     if conflict is not None:
@@ -1470,7 +2283,11 @@ class ForwardDedupStore:
         text: str,
         weak: bool,
         images: list[str],
+        videos: list[dict],
+        image_required: bool,
+        video_required: bool,
         now: int,
+        identities: list[str] | None = None,
     ) -> dict | None:
         """原子"认领"：判定为"要搬"时立刻把这次要标记的群写进库。返回 None = 认领成功。
 
@@ -1484,9 +2301,23 @@ class ForwardDedupStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             rows = self._rows_by_content_hash(conn, fp["content_hash"])
-            # 同一个内容哈希下面可能躺着多行（摘要一样但图片不是同一批），
-            # 所以要按和外面一样的规矩挑候选，不能只看第一行（weak 同样要图确认）
-            row = self._pick_candidate(conn, rows, images, cur_group, required=weak)
+            # 同一个内容哈希下面可能躺着多行（摘要一样但图片/视频不是同一批），
+            # 所以要按和外面一样的规矩挑候选，不能只看第一行（weak 同样要媒体确认）
+            row = self._pick_candidate(
+                conn,
+                rows,
+                images,
+                videos,
+                cur_group,
+                image_required=image_required,
+                video_required=video_required,
+            )
+            if row is None and identities:
+                # 认领事务里也要看内容身份：否则「A 群刚认领，B 群的同一份内容
+                # 同时进来」仍会各认领一次、各搬一遍（weak 取不到媒体锚点时必现）。
+                row = self._find_by_identities(
+                    conn, identities, cur_group, content_hash=fp["content_hash"]
+                )
             if row is not None:
                 # 别人抢先认领/登记了这份内容 → 这条不再搬（群照样补进标记）
                 row_groups, seen_here = self._mark_seen_locked(conn, row, cur_group)
@@ -1509,11 +2340,13 @@ class ForwardDedupStore:
                 text=text,
                 weak=weak,
                 images=images,
+                videos=videos,
                 now=now,
+                identities=identities,
             )
             conn.commit()
         except sqlite3.Error as exc:
-            print(f"[转发去重] 认领指纹失败，按未认领继续: {exc}")
+            log.warning("[转发去重] 认领指纹失败，按未认领继续: %s", exc)
             try:
                 conn.rollback()
             except sqlite3.Error:
@@ -1530,15 +2363,20 @@ class ForwardDedupStore:
         text: str = "",
         weak: bool = False,
         images: list[str] | None = None,
+        videos: list[dict] | None = None,
         now: int = 0,
+        identities: list[str] | None = None,
     ) -> int:
         """在已持锁的连接上"插入或合并"一行指纹（调用方自己 commit / prune）。
 
         同一份内容（content_hash 一致）只留一行：重复登记时把群并进原记录，所以标记
-        的群聊一直累积，不会散成多行互相看不见；图片哈希也挂在这一行的 fp_id 下。
+        的群聊一直累积，不会散成多行互相看不见；图片/视频指纹也挂在这一行的 fp_id 下。
+        内容身份（``forward_content``）同样并进这一行，供后续的跨卡片 id 判定。
         """
         groups = clean_group_ids(groups)
         images = clean_image_hashes(images)
+        videos = clean_video_sigs(videos)
+        identities = clean_identities(identities)
         if not now:
             now = int(time.time())
         found = self._rows_by_content_hash(conn, fp["content_hash"])
@@ -1595,6 +2433,46 @@ class ForwardDedupStore:
                     ") VALUES (?,?,?,?)",
                     [(one, fp_id, ",".join(groups), now) for one in fresh],
                 )
+        if fp_id and videos:
+            known_videos = {
+                (one["sig"], one["byte_hash"]) for one in self._video_rows(conn, fp_id)
+            }
+            fresh_videos = [
+                one
+                for one in videos
+                if (one["sig"], one["byte_hash"]) not in known_videos
+            ]
+            if fresh_videos:
+                conn.executemany(
+                    "INSERT INTO forward_video ("
+                    "sig, byte_hash, fp_id, group_ids, first_seen, bytes"
+                    ") VALUES (?,?,?,?,?,?)",
+                    [
+                        (
+                            one["sig"],
+                            one["byte_hash"],
+                            fp_id,
+                            ",".join(groups),
+                            now,
+                            int(one.get("bytes") or 0),
+                        )
+                        for one in fresh_videos
+                    ],
+                )
+        if fp_id and identities:
+            known_ids = {
+                str(row["identity"])
+                for row in conn.execute(
+                    "SELECT identity FROM forward_content WHERE fp_id = ?", (fp_id,)
+                )
+            }
+            fresh_ids = [one for one in identities if one not in known_ids]
+            if fresh_ids:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO forward_content "
+                    "(identity, fp_id, first_seen) VALUES (?,?,?)",
+                    [(one, fp_id, now) for one in fresh_ids],
+                )
         return fp_id
 
     def _record_sync(
@@ -1605,6 +2483,9 @@ class ForwardDedupStore:
         preview: str = "",
         weak: bool = False,
         images: list[str] | None = None,
+        videos: list[dict] | None = None,
+        at: int | None = None,
+        identities: list[str] | None = None,
     ) -> int:
         """登记一次搬运（同一份内容只留一行、群并进原记录，见 _upsert_locked）。"""
         tokens = tokenize(text)
@@ -1612,7 +2493,7 @@ class ForwardDedupStore:
             # 没有正文的指纹没有检索价值，不入库
             return 0
         fp = fingerprint_of(tokens)
-        now = int(time.time())
+        now = int(at or time.time())
         with self._thread_lock:
             conn = self._ensure_conn()
             fp_id = self._upsert_locked(
@@ -1624,7 +2505,9 @@ class ForwardDedupStore:
                 text=text,
                 weak=weak,
                 images=images,
+                videos=videos,
                 now=now,
+                identities=identities,
             )
             conn.commit()
             self._maybe_prune(conn, now)
@@ -1648,14 +2531,22 @@ class ForwardDedupStore:
                     ")",
                     (int(self.max_rows),),
                 )
-            # 图片双哈希跟着指纹走，指纹没了就删掉（否则表会无限膨胀）
+            # 图片/视频/内容身份跟着指纹走，指纹没了就删掉（否则表会无限膨胀）
             conn.execute(
                 "DELETE FROM forward_image WHERE fp_id NOT IN ("
                 "SELECT id FROM forward_fingerprint)"
             )
+            conn.execute(
+                "DELETE FROM forward_video WHERE fp_id NOT IN ("
+                "SELECT id FROM forward_fingerprint)"
+            )
+            conn.execute(
+                "DELETE FROM forward_content WHERE fp_id NOT IN ("
+                "SELECT id FROM forward_fingerprint)"
+            )
             conn.commit()
         except Exception as exc:  # 清理失败不影响主流程
-            print(f"[转发去重] 清理旧指纹失败: {exc}")
+            log.warning("[转发去重] 清理旧指纹失败: %s", exc)
 
     def _stats_sync(self) -> dict:
         with self._thread_lock:
@@ -1665,11 +2556,13 @@ class ForwardDedupStore:
                 "FROM forward_fingerprint"
             ).fetchone()
             images = conn.execute("SELECT COUNT(*) AS total FROM forward_image").fetchone()
+            videos = conn.execute("SELECT COUNT(*) AS total FROM forward_video").fetchone()
             return {
                 "db": str(self.db_path),
                 "total": row["total"],
                 "latest": row["latest"],
                 "images": images["total"],
+                "videos": videos["total"],
             }
 
     # ---------------- 异步包装 ----------------
@@ -1678,15 +2571,25 @@ class ForwardDedupStore:
         text: str,
         weak: bool = False,
         images: list[str] | None = None,
+        videos: list[dict] | None = None,
         group_ids: list[str] | None = None,
         cur_group: str = "",
         reserve: bool = False,
         kind: str = "",
         preview: str = "",
+        image_required: bool | None = None,
+        video_required: bool | None = None,
+        alt_text: str = "",
+        identities: list[str] | None = None,
     ) -> dict | None:
         """查历史指纹（判定语义与参数说明见 _find_sync）。
 
         :param kind / preview: 认领时新建指纹行要用的类型和预览
+        :param alt_text: 同一份内容的**清洗前**指纹文本（别名）。清洗上线之前入库的
+            老行存的是清洗前的哈希，只按清洗后的文本查永远对不上 —— 每次重发都会被
+            当成新内容再搬一遍。命中后会把那一行就地升级成清洗后的哈希。
+        :param identities: 内容身份（见 :func:`content_identities`）。同一份聊天记录换
+            卡片 id / 来源群时，文本和媒体指纹都可能对不上，靠它认出来。
         :return: None = 没搬过（调用方搬运 + 记录）；否则"搬过了"，按结果里的
             `seen_here` 决定去发【发过了喵】还是什么都不做
         """
@@ -1696,11 +2599,16 @@ class ForwardDedupStore:
                 text,
                 weak=weak,
                 images=images,
+                videos=videos,
                 group_ids=group_ids,
                 cur_group=cur_group,
                 reserve=reserve,
                 kind=kind,
                 preview=preview,
+                image_required=image_required,
+                video_required=video_required,
+                alt_text=alt_text,
+                identities=identities,
             )
 
     async def record(
@@ -1711,10 +2619,16 @@ class ForwardDedupStore:
         preview: str = "",
         weak: bool = False,
         images: list[str] | None = None,
+        videos: list[dict] | None = None,
+        at: int | None = None,
+        identities: list[str] | None = None,
     ) -> int:
         """登记一次搬运。
 
         :param group_ids: 这次要标记的群（目标群 + 来源群），与 find 保持一致
+        :param identities: 内容身份（见 :func:`content_identities`），与 find 保持一致
+        :param at: 这次搬运/这条消息发生的时间（时间戳）。默认取当前时间；
+            历史入库要传消息自己的时间，否则整库的 first_seen 全是「刚导入」
         """
         async with self._async_lock:
             return await asyncio.to_thread(
@@ -1725,12 +2639,104 @@ class ForwardDedupStore:
                 preview=preview,
                 weak=weak,
                 images=images,
+                videos=videos,
+                at=at,
+                identities=identities,
             )
 
     async def stats(self) -> dict:
         """库里现在有多少条指纹（含图片双哈希条数）"""
         async with self._async_lock:
             return await asyncio.to_thread(self._stats_sync)
+
+    # ── 原始内容存档 ────────────────────────────────────────────
+    # 存的是**清洗之前**的展开内容，所以任何时候都能按新规则重算一次指纹。
+    # 按 content_hash 去重：同一份内容被搬十次也只占一份空间。
+    async def save_corpus(
+        self, text: str, kind: str, messages: list, *, at: int | None = None
+    ) -> bool:
+        """把一条转发的原始内容存进存档（按 content_hash 去重）。
+
+        :param text: 已经拼好的指纹文本（从这里取 content_hash 作主键）
+        :param messages: **清洗之前**的展开内容（``_expand_forward_for_dedup`` 的返回）
+        :param at: 这条消息自己的时间；不传就用当前时间
+        :return: True = 新增了一份，False = 已经有了 / 内容不可用
+        """
+        async with self._async_lock:
+            return await asyncio.to_thread(
+                self._save_corpus_sync, text, kind, messages, at=at
+            )
+
+    def _save_corpus_sync(
+        self, text: str, kind: str, messages: list, *, at: int | None = None
+    ) -> bool:
+        if not messages:
+            return False
+        tokens = tokenize(text)
+        if not tokens:
+            return False
+        content_hash = fingerprint_of(tokens)["content_hash"]
+        try:
+            raw = json.dumps(messages, ensure_ascii=False, default=str).encode("utf-8")
+        except Exception:
+            return False
+        packed = zlib.compress(raw, 6)
+        conn = self._ensure_conn()
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO forward_corpus "
+            "(content_hash, kind, payload, raw_size, created_at) VALUES (?, ?, ?, ?, ?)",
+            (content_hash, kind or "", packed, len(raw), int(at or time.time())),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    def load_corpus(self, content_hash: str) -> list | None:
+        """按 content_hash 取出存档的原始内容（没有就返回 None）。"""
+        row = (
+            self._ensure_conn()
+            .execute(
+                "SELECT payload FROM forward_corpus WHERE content_hash = ?",
+                (content_hash,),
+            )
+            .fetchone()
+        )
+        if not row or not row[0]:
+            return None
+        try:
+            return json.loads(zlib.decompress(row[0]).decode("utf-8"))
+        except Exception:
+            return None
+
+    def iter_corpus(self, limit: int | None = None):
+        """遍历存档：(content_hash, kind, messages)。坏行跳过。"""
+        sql = "SELECT content_hash, kind, payload FROM forward_corpus ORDER BY rowid"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        for content_hash, kind, payload in self._ensure_conn().execute(sql):
+            if not payload:
+                continue
+            try:
+                yield content_hash, str(kind or ""), json.loads(
+                    zlib.decompress(payload).decode("utf-8")
+                )
+            except Exception:
+                continue
+
+    def corpus_stats(self) -> dict:
+        """存档规模：行数 / 原始字节 / 压缩后字节。"""
+        row = (
+            self._ensure_conn()
+            .execute(
+                "SELECT COUNT(*), COALESCE(SUM(raw_size), 0), "
+                "COALESCE(SUM(LENGTH(payload)), 0) FROM forward_corpus"
+            )
+            .fetchone()
+        )
+        return {
+            "rows": int(row[0] or 0),
+            "raw_bytes": int(row[1] or 0),
+            "packed_bytes": int(row[2] or 0),
+        }
 
 
 # ------------------------------------------------- 与 messaging 的边界 --------

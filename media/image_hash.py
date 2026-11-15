@@ -39,7 +39,14 @@ IMAGE_HASH_HEX_LEN = 32  # aHash 高 16 位 hex + dHash 低 16 位 hex
 DEFAULT_TIMEOUT = 8.0
 DEFAULT_MAX_COUNT = 5
 DEFAULT_CONCURRENCY = 4
-MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 超过 4MB 的图不下载（大概率不是表情/截图）
+# 超过这个大小的图不下载。原来卡 4MB，线上直接踩了：一张 4.2MB 的截图（转发的
+# 单图聊天记录）算不出指纹 → weak 指纹没有媒体锚点 → 同一张图 71 秒内被搬了两次，
+# 判定还写了句「照常搬运」。双哈希只要 8x8 灰度，没必要因为原图大就放弃，
+# 上限放到 16MB；再大就当它不是普通图片（多半是原图/长图，不值得为去重拉一遍）。
+MAX_IMAGE_BYTES = 16 * 1024 * 1024
+# 超过这个大小才启用 JPEG「draft」缩放解码：只为算 8x8 灰度，没必要解全图。
+# 小图仍走完整解码，保证和库里已有的指纹算法完全一致（draft 会差几个 bit）。
+DRAFT_DECODE_BYTES = 4 * 1024 * 1024
 
 _CACHE_MAXSIZE = 512
 _MISS = object()
@@ -56,7 +63,15 @@ def _resample():
 def _gray(source):
     """bytes / PIL.Image -> 灰度图（顺便按 EXIF 摆正方向）。"""
     if isinstance(source, (bytes, bytearray, memoryview)):
-        image = Image.open(io.BytesIO(bytes(source)))
+        raw = bytes(source)
+        image = Image.open(io.BytesIO(raw))
+        # 大 JPEG 先让解码器按 1/8 缩放解（draft），峰值内存能省一个数量级；
+        # 结果只有 8x8/9x8，画质差异对双哈希的影响在阈值（20/128）之内。
+        if len(raw) > DRAFT_DECODE_BYTES and image.format == "JPEG":
+            try:
+                image.draft("L", (64, 64))
+            except Exception:  # 老 Pillow / 异常模式：退回完整解码
+                pass
     else:
         image = source
     return ImageOps.grayscale(ImageOps.exif_transpose(image))
@@ -132,7 +147,9 @@ def clear_cache() -> None:
     _CACHE.clear()
 
 
-async def _download(session, url: str, timeout: float) -> tuple[bytes | None, str, dict]:
+async def _download(
+    session, url: str, timeout: float, max_bytes: int = MAX_IMAGE_BYTES
+) -> tuple[bytes | None, str, dict]:
     """下载单张图，返回 (数据, 结果说明, 附加信息)。"""
     info: dict = {}
     try:
@@ -152,14 +169,14 @@ async def _download(session, url: str, timeout: float) -> tuple[bytes | None, st
             async for chunk in response.content.iter_chunked(64 * 1024):
                 chunks.append(chunk)
                 total += len(chunk)
-                if total > MAX_IMAGE_BYTES:
+                if total > max_bytes:
                     break
             data = b"".join(chunks)
             info["bytes"] = len(data)
             if not data:
                 return None, "empty_body", info
-            if len(data) > MAX_IMAGE_BYTES:
-                return None, f"too_large>{MAX_IMAGE_BYTES}", info
+            if len(data) > max_bytes:
+                return None, f"too_large>{max_bytes}", info
             return data, "ok", info
     except asyncio.TimeoutError:
         return None, "timeout", info
@@ -184,9 +201,11 @@ async def hash_remote_images_report(
     timeout: float = DEFAULT_TIMEOUT,
     max_count: int = DEFAULT_MAX_COUNT,
     concurrency: int = DEFAULT_CONCURRENCY,
+    max_bytes: int = MAX_IMAGE_BYTES,
 ) -> tuple[list[str], dict]:
     """批量下载并计算图片双哈希，失败的图直接跳过（带逐张诊断信息）。
 
+    :param max_bytes: 单张图允许的最大字节数（超过就不下，免得为去重拉整张原图）
     :return: (成功算出来的 32 位 hex 列表, 报告)
     """
     report: dict = {"urls": [], "url_cnt": 0, "items": [], "hashed": 0}
@@ -220,7 +239,9 @@ async def hash_remote_images_report(
 
         async def worker(session, url: str) -> None:
             async with semaphore:
-                data, why, info = await _download(session, url, timeout)
+                data, why, info = await _download(
+                    session, url, timeout, max_bytes=max_bytes
+                )
             value = image_hash(data) if data else ""
             if data and not value:
                 why = "decode_failed"
@@ -255,13 +276,18 @@ async def hash_remote_images(
     timeout: float = DEFAULT_TIMEOUT,
     max_count: int = DEFAULT_MAX_COUNT,
     concurrency: int = DEFAULT_CONCURRENCY,
+    max_bytes: int = MAX_IMAGE_BYTES,
 ) -> list[str]:
     """批量下载并计算图片双哈希，失败的图直接跳过。
 
     :return: 成功算出来的 32 位 hex 列表（去重，顺序与入参一致）
     """
     hashes, _report = await hash_remote_images_report(
-        urls, timeout=timeout, max_count=max_count, concurrency=concurrency
+        urls,
+        timeout=timeout,
+        max_count=max_count,
+        concurrency=concurrency,
+        max_bytes=max_bytes,
     )
     return hashes
 
@@ -282,6 +308,7 @@ __all__ = [
     "DEFAULT_MAX_COUNT",
     "DEFAULT_CONCURRENCY",
     "MAX_IMAGE_BYTES",
+    "DRAFT_DECODE_BYTES",
     "ahash64",
     "dhash64",
     "image_hash",

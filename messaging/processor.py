@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import random
 import re
 from datetime import datetime
@@ -32,7 +31,10 @@ from pathlib import Path
 
 import jieba
 
+from AbstractionLayer.segments import has_photo
 from config.paths import AppPaths
+from core.jsonstore import read_json, write_json
+from core.logging import get_logger
 
 from . import forward as forward_mod
 from . import history as history_mod
@@ -40,6 +42,8 @@ from .context_builder import build_chat_context, collect_message
 from .meme import to_segments
 from .models import ChatMessage, Segment, Sender, parse_event
 from .thread_history import ThreadHistoryStore
+
+log = get_logger("messaging.processor")
 
 # 关键字（bot_config.json）里的图片占位符由 images.ImageResolver.expand 处理，
 # 这里不再缓存目录（旧 _IMGS_DIR 是导入期缓存，改配置不生效）。
@@ -79,8 +83,52 @@ class MessageProcessor:
         self._connect_lock = asyncio.Lock()  # 防止并发重复建连
         self.check_point: dict = {}
         self._checkpoint_save_task: asyncio.Task | None = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._closed = False
         # 临时的会话历史缓存（按群 / 私聊一份，TTL 到期自动销毁）
         self._thread_history = thread_history
+
+    # ════════════════════ 生命周期 ════════════════════
+    def _background_task_done(self, task: asyncio.Task) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error(
+                "[后台任务] %s 失败",
+                task.get_name(),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    def _spawn_background(self, coro, *, name: str) -> asyncio.Task | None:
+        """跟踪消息层后台任务，停机时可统一取消。"""
+        if self._closed:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+        return task
+
+    async def close(self) -> None:
+        """拒绝新任务并取消所有后台协程；可重复调用。"""
+        if self._closed:
+            return
+        self._closed = True
+        tasks = set(self._background_tasks)
+        if self._checkpoint_save_task is not None:
+            tasks.add(self._checkpoint_save_task)
+        current = asyncio.current_task()
+        tasks.discard(current)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self._checkpoint_save_task = None
 
     # ════════════════════ OCR ════════════════════
     async def ocr_text(self, url, re_ocr: bool = False) -> str:
@@ -99,7 +147,7 @@ class MessageProcessor:
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            print(f"[OCR] 识别失败: {exc!r}")
+            log.warning("[OCR] 识别失败: %s", exc)
             return ""
         if isinstance(result, dict):
             return str(result.get("text") or "")
@@ -123,8 +171,11 @@ class MessageProcessor:
 
         url_list = self.get_url(msg_event)
 
-        for url in url_list:
-            asyncio.create_task(self.ocr_and_send(group_id=event["group_id"], url=url))
+        for index, url in enumerate(url_list):
+            self._spawn_background(
+                self.ocr_and_send(group_id=event["group_id"], url=url),
+                name=f"ocr-{event.get('message_id', '?')}-{index}",
+            )
         return
 
     # ════════════════════ 消息内容 ════════════════════
@@ -141,11 +192,18 @@ class MessageProcessor:
         return res
 
     def is_contain_image(self, msg_event) -> bool:
-        for item in (msg_event or {}).get("message", []) or []:
-            item_type = item.get("type", "")
-            if item_type == "image" and not item.get("data", {}).get("summary"):
-                return True
-        return False
+        """消息里有没有**普通图片**（表情 / 表情包不算）。
+
+        判据本身在 :mod:`AbstractionLayer.segments` 里 —— 图片与表情的区分在
+        NapCat / SnowLuma 上不一样（最典型：NapCat 的商城表情**没有
+        ``sub_type``**，只能靠 ``emoji_id`` / ``key`` 认），这类「两端语义不同」
+        的事归抽象层管，业务层不该各自实现一份。
+
+        这里只保留一条历史教训：判据既不能太松（表情被当图片搬走），
+        也不能太严（早期用「``summary`` 为空」导致判据恒为假，功能从未触发）。
+        详见该模块的文档与 ``tests/test_segments.py``。
+        """
+        return has_photo(msg_event)
 
     def is_contain_video(self, msg_event) -> bool:
         for item in (msg_event or {}).get("message", []) or []:
@@ -176,7 +234,6 @@ class MessageProcessor:
 
     def get_clean_context(self, event, keepAt: bool = False) -> str:
         """纯文本视图：CQ 码清洗、图片留 summary、可选保留 @。"""
-        DEBUG = True
         context = ""
         for item in event.get("message", []) or []:
             msg_type = item.get("type", "")
@@ -190,7 +247,6 @@ class MessageProcessor:
             if keepAt and msg_type == "at":
                 qq_id = (item.get("data") or {}).get("qq", "all")
                 context += f"[CQ:at,qq={qq_id}]"
-        DEBUG and print(context)
         return context
 
     # ════════════════════ 发送 ════════════════════
@@ -236,7 +292,10 @@ class MessageProcessor:
             result = await self.nc.send_group_message(
                 group_id=event["group_id"], message=payload
             )
-            asyncio.create_task(self.check_point_active_get(event["group_id"]))
+            self._spawn_background(
+                self.check_point_active_get(event["group_id"]),
+                name=f"checkpoint-after-send-group-{event['group_id']}",
+            )
         elif event["message_type"] == "private":
             result = await self.nc.send_private_message(
                 user_id=event["user_id"], message=payload
@@ -266,7 +325,10 @@ class MessageProcessor:
             await self.nc.send_group_img(
                 group_id=event["group_id"], img_addr=napcat_path, summary=summary
             )
-            asyncio.create_task(self.check_point_active_get(event["group_id"]))
+            self._spawn_background(
+                self.check_point_active_get(event["group_id"]),
+                name=f"checkpoint-after-image-group-{event['group_id']}",
+            )
         elif event["message_type"] == "private":
             await self.nc.send_private_img(
                 user_id=event["user_id"], img_addr=napcat_path, summary=summary
@@ -301,9 +363,13 @@ class MessageProcessor:
                 # 自动检测 solution 是否需要 event 参数
                 sig = inspect.signature(solution)
                 if "event" in sig.parameters:
-                    asyncio.create_task(solution(event=event, **params))
+                    coro = solution(event=event, **params)
                 else:
-                    asyncio.create_task(solution(**params))
+                    coro = solution(**params)
+                self._spawn_background(
+                    coro,
+                    name=f"keyword-{event.get('message_id', '?')}",
+                )
                 ret = True
                 continue
         return ret
@@ -336,34 +402,19 @@ class MessageProcessor:
 
     async def read_check_point(self, user_id):
         file_name = str(self.checkpoint_dir / f"{user_id}.json")
-        try:
-            with open(file_name, mode="r", encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            print("FileNotFoundError")
-            dir_path = Path(file_name).parent
-            dir_path.mkdir(parents=True, exist_ok=True)
-            with open(file_name, mode="w", encoding="utf-8") as f:
-                json.dump({}, f, ensure_ascii=False, indent=4)
-                return {}
-        except Exception:
-            print("error")
-        return {}
+        data = read_json(file_name, None)
+        if data is None:
+            write_json(file_name, {}, indent=4)
+            return {}
+        return data if isinstance(data, dict) else {}
 
     async def _save_check_point(self):
         """将当前断点写入磁盘（JSON 形状：``{group_id: event}``）。"""
-        DEBUG = False
         try:
             file_name = self.checkpoint_dir / f"{self.user_id}.json"
-            file_name.parent.mkdir(parents=True, exist_ok=True)
-            with open(file_name, "w", encoding="utf-8") as f:
-                json.dump(self.check_point, f, ensure_ascii=False, indent=4)
-            if self.check_point:
-                DEBUG and print(
-                    f"[断点保存] 已写入 {len(self.check_point)} 条断点到 {file_name}"
-                )
+            write_json(file_name, self.check_point, indent=4)
         except Exception as e:
-            print(f"[断点保存] 异常: {e}")
+            log.warning("[断点保存] 异常: %s", e)
 
     async def _checkpoint_save_loop(self):
         """后台每 10 秒将内存中的断点刷入磁盘。"""
@@ -372,13 +423,16 @@ class MessageProcessor:
             try:
                 await self._save_check_point()
             except Exception as e:
-                print(f"[断点保存] 写入失败: {e}")
+                log.warning("[断点保存] 写入失败: %s", e)
 
     def start_checkpoint_save(self):
         """启动断点定时保存任务（需在事件循环中调用）。"""
+        if self._closed:
+            return
         if self._checkpoint_save_task is None or self._checkpoint_save_task.done():
             self._checkpoint_save_task = asyncio.create_task(
-                self._checkpoint_save_loop()
+                self._checkpoint_save_loop(),
+                name="checkpoint-save",
             )
 
     # ════════════════════ 历史（委托 messaging.history） ════════════════════
@@ -539,7 +593,7 @@ class MessageProcessor:
                 master_ids=master_ids,
             )
         except Exception as exc:  # 缓存失败不能影响主流程
-            print(f"[历史缓存] 解析消息失败: {exc}")
+            log.warning("[历史缓存] 解析消息失败: %s", exc)
             return None
         # 自己发的消息由 remember_sent_message 负责，这里跳过，避免重复
         if message.sender.is_self:
@@ -602,8 +656,8 @@ class MessageProcessor:
             return True
         match = re.search(r"False", raw_message)
         if match:
-            await self.send_message(event=event, message="set tokenizer True")
             self.extraconfig["tokenizer"] = False
+            await self.send_message(event=event, message="set tokenizer False")
             return True
         return False
 
@@ -642,7 +696,7 @@ class MessageProcessor:
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            print(f"[B站卡片] media.{name} 失败: {exc!r}")
+            log.warning("[B站卡片] media.%s 失败: %s", name, exc)
             return None
         return result
 
@@ -664,13 +718,20 @@ class MessageProcessor:
             return False
 
         miniapp = self.check_is_miniapp(replied_event)
-        if not miniapp:
-            return False
-
-        link = miniapp.get("link") or miniapp.get("url") or miniapp.get("qqdocurl")
+        link = ""
+        if miniapp:
+            link = miniapp.get("link") or miniapp.get("url") or miniapp.get("qqdocurl") or ""
         if not link:
+            # 普通 B 站分享卡片走 ``com.tencent.structmsg``，不在 miniapp 里；
+            # 用户「回复卡片 + 关键词」的诉求是一样的，这里再兜一次。
+            link = forward_mod.get_bili_card_link(replied_event)
+        if not link:
+            log.info("[B站卡片] 被回复的消息里没有 B 站链接")
+            await self.send_message(
+                event=event, message="没识别到 B 站卡片，直接发链接也行"
+            )
             return False
-        print(f"[B站卡片] 检测到回复的 B 站小程序链接: {link}")
+        log.info("[B站卡片] 检测到回复的 B 站卡片链接: %s", link)
 
         resolved_link = link
         try:
@@ -684,14 +745,14 @@ class MessageProcessor:
         if not resolved_link:
             return False
 
-        print(f"[B站卡片] 最终发送源: {resolved_link}")
+        log.info("[B站卡片] 最终发送源: %s", resolved_link)
         await self._media_call("send_bili_video", event, resolved_link)
         return True
 
     async def try_send_bili_video(self, event) -> bool:
         """文本中含 B 站视频链接时，下载并发送带音频的视频（旧行为）。"""
         text = self.get_clean_context(event)
-        print(f"[B站卡片] 检测文本: {text}")
+        log.debug("[B站卡片] 检测文本: %s", text)
         if not text:
             return False
         cleaned = text.strip()
@@ -708,11 +769,11 @@ class MessageProcessor:
             resolved = await asyncio.to_thread(
                 BilibiliProvider.resolve_video_url, urls[0]
             )
-            print(f"[B站卡片] 解析文本来源: {urls[0]} -> {resolved}")
+            log.info("[B站卡片] 解析文本来源: %s -> %s", urls[0], resolved)
             await self._media_call("send_bili_video", event, resolved)
             return True
         except Exception as exc:
-            print(f"[B站卡片] 文本 URL 解析发送失败: {exc}")
+            log.warning("[B站卡片] 文本 URL 解析发送失败: %s", exc)
             return False
 
     async def try_send_bili_card(self, event) -> bool:
@@ -739,7 +800,7 @@ class MessageProcessor:
     async def get_bili_ark_from_event(self, event):
         text = self.get_clean_context(event)
         info = await self.get_bili_ark_from_text(text)
-        print(f"[B站卡片] 解析结果: {info}")
+        log.info("[B站卡片] 解析结果: %s", info)
         return info
 
     async def get_bili_video_download_url(self, text: str) -> str | None:

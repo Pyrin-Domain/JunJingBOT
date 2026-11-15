@@ -347,6 +347,41 @@ async def cmd_call(args) -> int:
     return 0 if result.ok else 1
 
 
+async def cmd_face(args) -> int:
+    """列出收藏表情，或按备注名发一个。"""
+    kernel = build_kernel(args)
+    from .face import CustomFaceService
+
+    service = CustomFaceService(kernel)
+    library = await service.refresh()
+    if not library:
+        print(f"[{kernel.label}] 没抓到收藏表情")
+        return 1
+
+    print(f"[{kernel.label}] 抓到 {len(library)} 个收藏表情：")
+    for face in library.faces:
+        print(
+            f"  {face.key!r:26} md5={face.md5[:12]:14} "
+            f"emoji_id={face.emoji_id[:34]:36} {face.url}"
+        )
+
+    if not args.send:
+        return 0
+
+    face = library.find(args.send)
+    if face is None:
+        print(f"[{kernel.label}] 没有叫 {args.send!r} 的收藏表情")
+        return 1
+    result = await service.send(
+        args.send, group_id=args.group or None, user_id=args.user or None
+    )
+    print(
+        f"[{kernel.label}] 发送 {face.key!r}：ok={result.ok} "
+        f"action={result.action} data={result.data} error={result.error!r}"
+    )
+    return 0 if result.ok else 1
+
+
 # ══════════════════════════════════════════════════════════
 # 入口
 # ══════════════════════════════════════════════════════════
@@ -413,6 +448,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--params", default="", help="JSON")
     sp.add_argument("--limit", type=int, default=4000)
     sp.set_defaults(func=cmd_call)
+
+    sp = sub.add_parser("face", help="列出收藏表情 / 按备注名发一个")
+    add_common(sp)
+    sp.add_argument("--send", default="", help="按备注（desc）名发一个")
+    sp.add_argument("--user", type=int, default=0, help="私聊目标 QQ 号")
+    sp.set_defaults(func=cmd_face)
 
     return parser
 

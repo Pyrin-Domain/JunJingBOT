@@ -23,8 +23,11 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import inspect
 import json
+import os
+import subprocess
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -71,6 +74,63 @@ def _extract_token(ws) -> str:
         if auth:
             return auth
     return ""
+
+
+def _port_holder_hint(port: int) -> str:
+    """端口被占用时，给一句「谁占着」的人话提示。
+
+    查不到也不影响启动流程——只是个 hint，不该反过来把启动搞挂。
+    """
+    if os.name != "nt":
+        return ""
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            errors="ignore",
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+    pids: list[str] = []
+    for line in out.splitlines():
+        parts = line.split()
+        # TCP  127.0.0.1:8085  0.0.0.0:0  LISTENING  12180
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        local = parts[1]
+        if not local.rsplit(":", 1)[-1] == str(port):
+            continue
+        if parts[3].upper() not in ("LISTENING", "ESTABLISHED"):
+            continue
+        pid = parts[4]
+        if pid not in pids:
+            pids.append(pid)
+    if not pids:
+        return ""
+
+    # 把 PID 翻成进程名，光给数字用户还是得自己去查
+    names: list[str] = []
+    for pid in pids:
+        name = ""
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                errors="ignore",
+            ).stdout.strip()
+            if r:
+                fields = next(csv.reader([r]))
+                if fields and fields[0] and fields[0] != "INFO:":
+                    name = fields[0]
+        except (OSError, subprocess.SubprocessError, StopIteration):
+            name = ""
+        names.append(f"{name} (PID {pid})" if name else f"PID {pid}")
+    return "、".join(names)
 
 
 class OneBotConnection:
@@ -149,13 +209,30 @@ class OneBotConnection:
         self._closing = False
         if self.is_reverse:
             host, port = self.config.ws_reverse_host, self.config.ws_reverse_port
-            self._server = await websockets.serve(
-                self._on_client,
-                host,
-                port,
-                ping_interval=PING_INTERVAL,
-                ping_timeout=PING_TIMEOUT,
-            )
+            try:
+                self._server = await websockets.serve(
+                    self._on_client,
+                    host,
+                    port,
+                    ping_interval=PING_INTERVAL,
+                    ping_timeout=PING_TIMEOUT,
+                )
+            except OSError as exc:
+                # 端口被占 = 大概率已经有一个 Bot 实例在跑了。
+                # 直接把 winerror 抛出去没人看得懂，这里换成能照着做的提示。
+                if exc.errno == 10048 or getattr(exc, "winerror", None) == 10048:
+                    holder = _port_holder_hint(port)
+                    detail = f"（占用者：{holder}）" if holder else ""
+                    self._started = False
+                    raise OSError(
+                        10048,
+                        f"反向 WS 端口 {host}:{port} 已被占用{detail}。"
+                        f"通常说明已经有一个 Bot 实例在运行；"
+                        f"先把它关掉（任务管理器里结束 python.exe，"
+                        f"或 taskkill /PID <PID> /T /F），"
+                        f"再重新启动。也可以改 config 里的 ws_reverse_port 换端口。",
+                    ) from exc
+                raise
             print(
                 f"[WS] 反向服务器已启动 ws://{host}:{port}{self._label}，"
                 f"等待 {self.backend_label} 连接…"

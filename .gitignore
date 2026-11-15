@@ -46,11 +46,26 @@ imgs/dress/
 *.7z
 *.rar
 
-# ── 个人角色卡：仓库里只放 junjing.example.md ──
+# ── 个人角色卡 / 口头禅：仓库里只放 example ──
 agent/personas/junjing.md
+agent/catchphrases.json
 
 # ── 第三方 vendored 项目的下载产物（内容不入库）──
 Extension/jm_crawer/download/
+
+# ── 调试/审计报告产物（含真实群号、uid、message_id，只在本机看）──
+dup_*.txt
+gate_skip_report.txt
+img_delivery_report.txt
+worker_stderr.txt
+
+# ── 本机环境笔记（含测试端口 token）──
+测试端口.txt
+
+# ── 缓存 / 备份残留 ──
+jieba.cache
+*.bak-*
+pytest-of-*/
 
 # 临时
 *.tmp

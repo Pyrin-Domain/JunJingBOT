@@ -50,10 +50,42 @@ __all__ = [
     "NAPCAT",
     "OneBotKernel",
     "SNOWLUMA",
+    "MUTATING_ACTIONS",
     "Transport",
     "capabilities_for",
     "default_token",
 ]
+
+
+#: 有副作用、且失败必须让调用方知道的动作。
+#:
+#: 这些动作的共同点：**失败不会自己重来，也不会有人补发**。发出去就是发出去了，
+#: 失败就是没发。反过来 ``get_*`` 的失败大多是正常业务（消息撤回了、查不到人），
+#: 那些不该抛异常。
+#:
+#: 实测教训：SnowLuma 群文件上传失败返回 ``{"status":"ok","retcode":-134}``，
+#: 旧代码不校验，于是「发送成功」是假的，既没重试也没回退成下载链接。
+MUTATING_ACTIONS: frozenset[str] = frozenset(
+    {
+        "send_group_msg",
+        "send_private_msg",
+        "send_group_forward_msg",
+        "send_private_forward_msg",
+        "forward_group_single_msg",
+        "forward_friend_single_msg",
+        # 闪传：create 会真正上传文件，send 会发一张卡片消息，失败都不能当成功
+        "create_flash_task",
+        "send_flash_msg",
+        # 戳一戳在 OneBot 里按会话分成两个 action，不是 send_poke
+        "group_poke",
+        "friend_poke",
+        "delete_msg",
+        "set_group_ban",
+        "set_msg_emoji_like",
+        # 收藏表情：SnowLuma 的专用动作，发出去就是一条消息，失败不能当成功
+        "send_custom_face",
+    }
+)
 
 
 # ══════════════════════════════════════════════════════════
@@ -85,6 +117,13 @@ class BackendCapabilities:
     history_accepts_is_reserve: bool = False
     #: 返回条数可能少于请求（后端过滤了撤回/系统消息），不代表没有更早的消息。
     history_may_return_fewer: bool = True
+    #: 不带游标取「最新一条」时，返回的**是不是服务端**最新消息。
+    #:
+    #: - True：可以「先取最新、再往回翻到断点」，而且游标是现取的，不受
+    #:   重启后 id 变化影响（NapCat 用这个）。
+    #: - False：返回值可能只是后端**本地观测过**的最新消息，断点之后的新消息
+    #:   它根本没见过（SnowLuma 关闭登录历史同步时）。这时必须从断点**往后**翻。
+    history_latest_is_authoritative: bool = True
 
     # ── 转发展开 ──
     #: get_forward_msg 是否把下一层 content 直接内联返回。
@@ -103,6 +142,73 @@ class BackendCapabilities:
     #: ``send_group_forward_msg`` 的 node.content 能否放 ``{"type":"forward"}`` 段。
     relay_accepts_forward_segment: bool = True
 
+    # ── 媒体发送（本地视频 / 文件）──
+    #: 发送通道的尝试顺序。每个值对应一种消息段：
+    #:
+    #: - ``"file"``：群文件（走文件上传通道，有独立配额）；
+    #: - ``"video"``：视频消息（NTV2 群视频通道，与群文件配额互不影响）。
+    #:
+    #: 实测：群文件通道失败时，改发视频消息（NTV2 独立通道）通常还能成功；
+    #: NapCat 同一文件通常直接成功。顺序放这里，业务层不再写死。
+    media_send_order: tuple[str, ...] = ("file", "video")
+    #: 某个通道失败后重试几次（不包括第一次）。瞬时风控/限频靠它兜。
+    media_retry_times: int = 1
+    #: 每次重试前的等待秒数。
+    media_retry_delay: float = 1.0
+    #: 视频消息段的体积上限；超过就不再尝试该通道（QQ 侧直接拒收）。
+    #: ``0`` 表示不限制。
+    video_max_bytes: int = 100 * 1024 * 1024
+
+    # ── 普通文件发送（PDF / ZIP 等，没有视频段可退）──
+    #: 发送通道的尝试顺序。每个值对应一条链路：
+    #:
+    #: - ``"file"``：群文件 / 私聊文件（与 :meth:`media_send_order` 的 ``file`` 同一条）；
+    #: - ``"flash"``：闪传（``create_flash_task`` + ``send_flash_msg``，独立上传服务，
+    #:   与群文件配额互不影响，失败时只剩这一条路）。
+    #:
+    #: 文件通道失败时（明确拒绝 / 配额 / 网络），闪传通常还能用；未知后端
+    #: 保守地只走 ``file``。``-134`` 的直接原因（file 段缺 name）已由
+    #: :func:`AbstractionLayer.segments.normalize_outgoing` 统一补上。
+    file_send_order: tuple[str, ...] = ("file", "flash")
+    #: ``create_flash_task`` 返回里 fileset id 的点分路径。
+    #:
+    #: SnowLuma 直接回 ``{"fileset_id": ...}``；NapCat 透传内核结构
+    #: （``createFlashTransferResult.fileSetId``），所以要按后端取。
+    flash_fileset_path: str = "fileset_id"
+
+    # ── 收藏表情（账号自定义表情）──
+    #: 发送收藏表情的**专用动作名**；None 表示后端没有专用动作，走 image 段兜底。
+    #:
+    #: 实测（2026-11-01）：SnowLuma 有 ``send_custom_face(emoji_id, group_id|user_id)``；
+    #: NapCat 没有（调用返回 ``retcode=200「不支持的Api send_custom_face」``）。
+    custom_face_send_action: str | None = None
+    #: 专用动作里承载「表情标识」的参数名。
+    custom_face_send_id_param: str = "emoji_id"
+    #: ``fetch_custom_face_detail`` 里承载「账号内表情标识」的字段名。
+    #:
+    #: SnowLuma 给的是 ``emoji_id``（等于 resId）；NapCat **没有** ``emoji_id``，
+    #: 只有 ``resId``（外加账号内序号 ``emoId`` 和本地路径 ``emoPath``）。
+    custom_face_id_field: str = "emoji_id"
+    #: 兜底 image 段的 ``sub_type``。**1 = 收藏表情**，0 会退化成普通图片。
+    #:
+    #: 实测：同一个 QQ 表情 URL，带 ``sub_type=1`` 发出去回读是
+    #: ``sub_type=1 / summary="[动画表情]"``（收藏表情）；不带就是
+    #: ``sub_type=0 / summary="[图片]"``（普通图片）。
+    custom_face_sub_type: int = 1
+    #: 兜底 image 段的 ``summary``：收藏表情的显示摘要。
+    custom_face_summary: str = "[动画表情]"
+    #: 抓收藏表情时的 ``count`` 上限（两个后端默认都是 48）。
+    custom_face_max_count: int = 200
+
+    # ── 失败可见性 ──
+    #: 这些动作的 ``retcode != 0`` 必须当**失败**抛错，不能当成功返回。
+    #:
+    #: 为什么需要这张表：OneBot 的响应是 ``{"status":"ok","retcode":-134}`` 这种
+    #: 形状也会出现（SnowLuma 的群文件失败就是），不校验就等于「静默丢消息」。
+    #: 但 ``get_*`` 类接口的失败是**正常业务**（消息被撤回了、查不到陌生人），
+    #: 一刀切会让上层到处 try/except，所以按动作列表来。
+    strict_actions: frozenset[str] = field(default_factory=lambda: MUTATING_ACTIONS)
+
     notes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -116,12 +222,26 @@ class BackendCapabilities:
             "history_anchor_at_end": self.history_anchor_at_end,
             "history_accepts_is_reserve": self.history_accepts_is_reserve,
             "history_may_return_fewer": self.history_may_return_fewer,
+            "history_latest_is_authoritative": self.history_latest_is_authoritative,
             "forward_inline_nested": self.forward_inline_nested,
             "forward_inner_id_fetchable": self.forward_inner_id_fetchable,
             "forward_id_style": self.forward_id_style,
             "relay_single_preserves_nested": self.relay_single_preserves_nested,
             "relay_accepts_nested_node": self.relay_accepts_nested_node,
             "relay_accepts_forward_segment": self.relay_accepts_forward_segment,
+            "media_send_order": list(self.media_send_order),
+            "media_retry_times": self.media_retry_times,
+            "media_retry_delay": self.media_retry_delay,
+            "video_max_bytes": self.video_max_bytes,
+            "file_send_order": list(self.file_send_order),
+            "flash_fileset_path": self.flash_fileset_path,
+            "custom_face_send_action": self.custom_face_send_action,
+            "custom_face_send_id_param": self.custom_face_send_id_param,
+            "custom_face_id_field": self.custom_face_id_field,
+            "custom_face_sub_type": self.custom_face_sub_type,
+            "custom_face_summary": self.custom_face_summary,
+            "custom_face_max_count": self.custom_face_max_count,
+            "strict_actions": sorted(self.strict_actions),
         }
 
 
@@ -135,12 +255,23 @@ NAPCAT = BackendCapabilities(
     history_anchor_at_end=True,
     history_accepts_is_reserve=False,
     history_may_return_fewer=True,
+    # 无游标时查的是服务端，拿到的才是真·最新；而它的 message_id / message_seq
+    # 每次重启都会重新分配，断点里存的旧 id 不能当游标。所以只能用「先取最新、
+    # 再往回翻到断点」。
+    history_latest_is_authoritative=True,
     forward_inline_nested=True,  # 实测：嵌套层 content 直接内联
     forward_inner_id_fetchable=False,  # 实测：内层 id 报「消息已过期或者为内层消息」
     forward_id_style="numeric",
     relay_single_preserves_nested=True,  # 实测：整卡搬运后内层仍是可展开的聊天记录
     relay_accepts_nested_node=False,  # 实测：node 套 node 会降级成「[卡片消息]」
     relay_accepts_forward_segment=True,  # 实测：node.content 放 forward 段正常
+    # NapCat 的 create_flash_task 透传内核结果，fileset id 不在顶层。
+    flash_fileset_path="createFlashTransferResult.fileSetId",
+    # NapCat 没有 send_custom_face：实测调用返回 retcode=200
+    # 「不支持的Api send_custom_face」。走 image 段兜底即可保住收藏表情外观。
+    custom_face_send_action=None,
+    # NapCat 的 fetch_custom_face_detail 里没有 emoji_id，只有 resId。
+    custom_face_id_field="resId",
     notes=(
         "message_seq == message_id == 哈希；全局序号在 real_seq（字符串）。",
         "用 message_id 当历史游标不报错，但返回以它为中心的窗口且忽略 reverse_order。",
@@ -148,6 +279,8 @@ NAPCAT = BackendCapabilities(
         "count 超过约 300 后响应极慢，500 会直接超时空返回。",
         "整卡搬运（forward_group_single_msg）会把嵌套聊天记录保留成 json multimsg。",
         "send_group_forward_msg 的 node 里再嵌 node 会退化成「[卡片消息]」，别用。",
+        "没有 send_custom_face；收藏表情只能靠 image 段（file=表情URL + sub_type=1）发。",
+        "fetch_custom_face_detail 没有 emoji_id 字段，只有 resId / emoId / emoPath。",
     ),
 )
 
@@ -161,6 +294,10 @@ SNOWLUMA = BackendCapabilities(
     history_anchor_at_end=True,
     history_accepts_is_reserve=False,
     history_may_return_fewer=False,
+    # 关闭登录历史同步后，无游标只返回它**本地观测过**的最新消息；断点之后的
+    # 消息它可能完全没见过，必须从断点往后翻。message_id 是
+    # SHA1(sequence:group_id:event) 的 int32，重启后依然指向同一条消息。
+    history_latest_is_authoritative=False,
     forward_inline_nested=False,  # 实测：只给 id，不给 content
     forward_inner_id_fetchable=True,  # 实测：能继续用内层 id 展开
     forward_id_style="opaque",  # 长 base64 串，含 + / =
@@ -170,6 +307,11 @@ SNOWLUMA = BackendCapabilities(
     relay_single_preserves_nested=True,
     relay_accepts_nested_node=True,  # 实测：node 套 node 会生成真正的双层聊天记录
     relay_accepts_forward_segment=True,  # 实测：node.content 放 forward 段也保留
+    # SnowLuma 有专用动作 send_custom_face，内部就是发一个 image 段
+    # {file: 表情URL, sub_type: 1, summary: "[动画表情]"}。
+    custom_face_send_action="send_custom_face",
+    custom_face_send_id_param="emoji_id",
+    custom_face_id_field="emoji_id",
     notes=(
         "message_seq 是全局序号（int），与 NapCat 的 real_seq 完全一致。",
         "message_id 是自己的哈希，与 NapCat 的 message_id 不同，不能跨后端比较。",
@@ -177,6 +319,7 @@ SNOWLUMA = BackendCapabilities(
         "入群时间之前的历史没有，断点早于入群时间时无法回放到锚点。",
         "整卡搬运含嵌套聊天记录时会把内层转成 xml(viewMultiMsg)，跨群后打不开；"
         "必须改走 send_group_forward_msg，并把内层包成嵌套 node。",
+        "send_custom_face 的 emoji_id 可以传完整 ID，也可以传 32 位 MD5。",
     ),
 )
 
@@ -194,7 +337,14 @@ GENERIC = BackendCapabilities(
     forward_inline_nested=True,
     forward_inner_id_fetchable=True,
     forward_id_style="unknown",
-    notes=("未探测到后端特征，按最保守参数工作。",),
+    # 未知后端不保证有闪传扩展，只走最稳的文件通道。
+    file_send_order=("file",),
+    # 未知后端不假设有专用动作：image 段兜底在两个已知后端上都验证过能用。
+    custom_face_send_action=None,
+    notes=(
+        "未探测到后端特征，按最保守参数工作。",
+        "收藏表情走 image 段兜底（file=表情URL + sub_type=1）。",
+    ),
 )
 
 BACKEND_PRESETS: dict[str, BackendCapabilities] = {

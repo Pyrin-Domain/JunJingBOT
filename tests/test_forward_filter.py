@@ -120,8 +120,17 @@ def test_is_enabled():
     assert ff.is_enabled(ff.normalize_settings({"enable": False})) is False
     # 只开追加也算启用
     assert ff.is_enabled(ff.normalize_settings({"append": {"enable": True, "items": [{"content": "x"}]}}))
-    # 追加开着但列表空、又不裁尾巴 → 没有可做的
+    # 追加开着但列表空、又不裁尾巴 → 只剩「装扮卡片」这一条（默认开）可做
     opts = ff.normalize_settings({"scan_tail": 0, "append": {"enable": True, "items": []}})
+    assert ff.is_enabled(opts) is True
+    # 连装扮卡片也关掉 → 真的没事可做了
+    opts = ff.normalize_settings(
+        {
+            "scan_tail": 0,
+            "drop_promo": False,
+            "append": {"enable": True, "items": []},
+        }
+    )
     assert ff.is_enabled(opts) is False
 
 
@@ -316,3 +325,36 @@ def test_build_forward_nodes_append_disabled(qr_urls):
     nodes, report = ff.build_forward_nodes(messages, opts)
     assert report["appended"] == 0
     assert report["rebuilt"] is False
+
+# ══════════════════ 按来源群 + 发送者过滤 ══════════════════
+def test_normalize_sender_filter_merges_groups_and_accepts_aliases():
+    filters = ff.normalize_sender_filter(
+        [
+            {"group_id": 20002, "user_id": [10001, "10002", 10001]},
+            {"group_id": "20002", "user_id": 10003},
+            {"group_id": "20004", "user_id": []},
+            {"group_id": 20005, "user_id": "10005"},
+            "bad",
+            {"user_id": [10006]},
+        ]
+    )
+    assert filters["20002"] == frozenset({"10001", "10002", "10003"})
+    assert filters["20005"] == frozenset({"10005"})
+    assert "20004" not in filters
+    assert ff.normalize_sender_filter(None) == {}
+    assert ff.normalize_sender_filter(False) == {}
+    assert ff.normalize_sender_filter({"qgroup_id": 1, "user_id": [2]}) == {
+        "1": frozenset({"2"})
+    }
+    assert ff.normalize_sender_filter({"group_id": 1, "user_id": [2]}) == {
+        "1": frozenset({"2"})
+    }
+
+
+def test_is_sender_filtered_matches_group_and_sender_only():
+    raw = [{"group_id": 20002, "user_id": [10003]}]
+    event = {"message_type": "group", "group_id": 20002, "user_id": 10003}
+    assert ff.is_sender_filtered(event, raw) is True
+    assert ff.is_sender_filtered({**event, "group_id": 20003}, raw) is False
+    assert ff.is_sender_filtered({**event, "user_id": 10004}, raw) is False
+    assert ff.is_sender_filtered(event, []) is False

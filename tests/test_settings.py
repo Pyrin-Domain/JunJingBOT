@@ -69,3 +69,45 @@ def test_invalid_env_value_falls_back_to_detected(tmp_path):
         root=tmp_path, env_overrides={"bot_env": "not-a-real-env"}, auto_create=False
     )
     assert settings.env.bot_env in (EnvKind.WINDOWS, EnvKind.WSL, EnvKind.LINUX)
+
+
+def test_export_auto_targets_falls_back_to_auto_forward(tmp_path):
+    # export -a 没单独配目标群时，沿用自动搬运的目标群，避免要配两份
+    settings = BotSettings(
+        root=tmp_path,
+        overrides={"export": {"auto_target_group_ids": []},
+                   "auto_forward": {"target_groupid": [20003, 20002]}},
+        auto_create=False,
+    )
+    assert settings.export_auto_targets == [20003, 20002]
+
+
+def test_export_auto_targets_prefers_own_section(tmp_path):
+    settings = BotSettings(
+        root=tmp_path,
+        overrides={"export": {"auto_target_group_ids": ["333", 444]},
+                   "auto_forward": {"target_groupid": [20003]}},
+        auto_create=False,
+    )
+    assert settings.export_auto_targets == [333, 444]
+
+
+def test_export_auto_targets_falls_back_to_auto_forward(tmp_path):
+    # export -a 没单独配目标群时，沿用自动搬运的目标群，避免要配两份
+    settings = BotSettings(
+        root=tmp_path,
+        overrides={"export": {"auto_target_group_ids": []},
+                   "auto_forward": {"target_groupid": [20003, 20002]}},
+        auto_create=False,
+    )
+    assert settings.export_auto_targets == [20003, 20002]
+
+
+def test_export_auto_targets_prefers_own_section(tmp_path):
+    settings = BotSettings(
+        root=tmp_path,
+        overrides={"export": {"auto_target_group_ids": ["333", 444]},
+                   "auto_forward": {"target_groupid": [20003]}},
+        auto_create=False,
+    )
+    assert settings.export_auto_targets == [333, 444]

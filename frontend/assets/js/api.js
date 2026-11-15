@@ -35,11 +35,23 @@ function normalizeBase(value) {
   return raw.replace(/\/+$/, '');
 }
 
-/* 只在第一次加载时读；页面内不会改 token。 */
+/* 只在第一次加载时读；token 不进地址栏和 localStorage。 */
 export const token = (() => {
   const fromQuery = params.get('token');
-  const value = fromQuery || readStorage(TOKEN_KEY);
-  if (fromQuery) writeStorage(TOKEN_KEY, fromQuery);
+  let value = fromQuery || readStorage(TOKEN_KEY);
+  if (value) {
+    try { window.sessionStorage.setItem(TOKEN_KEY, value); } catch (ignored) { /* 隐私模式 */ }
+  }
+  try { window.localStorage.removeItem(TOKEN_KEY); } catch (ignored) { /* 隐私模式 */ }
+  if (fromQuery) {
+    params.delete('token');
+    const next = params.toString();
+    window.history.replaceState(
+      {},
+      '',
+      window.location.pathname + (next ? `?${next}` : '') + window.location.hash,
+    );
+  }
   return value;
 })();
 

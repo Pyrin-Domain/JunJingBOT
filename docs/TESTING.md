@@ -18,6 +18,7 @@ pytest -q
 | `test_agent_config.py` | LLM 配置解析 / 面板校验 / BotConfig | `agent.config`, `config.BotSettings`, `web.validation` |
 | `test_bili_info_processor.py` | B 站信息解析 | `download_system.providers.bilibili` |
 | `test_chat_context.py` | 上下文结构 / 渲染 | `messaging.models`（已复制） |
+| `test_dialogue.py` | 对话关系：行尾「→谁」、`<dialogue>`、引用缺失占位 | `messaging.dialogue`, `messaging.models` |
 | `test_forward_dedup_gate.py` | 搬运去重闸门 | `bot.services.forward.ForwardService` |
 | `test_interject.py` | 插话判定 / 阈值 | `bot.services.interject.InterjectService`, `agent.prompts` |
 | `test_language_module.py` | Agent 输出协议 / 工具 / 续说 | `agent.runtime`, `agent.output`, `agent.hints` |
@@ -127,7 +128,10 @@ await pipeline.process_message(event)
 | `tests/test_backends.py` | NapCat / SnowLuma 档案、别名、默认端口、连接配置 |
 | `tests/test_anchors.py` | `message_seq` / `message_id` / `real_id` 双游标比较 |
 | `tests/test_history_anchors.py` | 历史接口按后端选游标、双游标区间翻页 |
-| `tests/test_checkpoint_anchors.py` | 断点恢复认 SnowLuma `message_id` |
+| `tests/test_checkpoint_anchors.py` | 断点恢复：SnowLuma 从断点往后翻、NapCat 用最新 id 往前翻 |
+| `tests/test_event_dispatcher.py` | 同会话 FIFO、跨会话并发、全局上限、满载拒绝、异常与停机取消 |
+| `tests/test_listener_dispatch.py` | 监听器过滤事件、会话顺序、容量参数和取消传播 |
+| `tests/test_processor_lifecycle.py` | 消息层后台协程的异常记录、任务回收和停机取消 |
 
 ## 迁移时实际遇到的改法
 

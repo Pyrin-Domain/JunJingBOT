@@ -87,14 +87,26 @@ def test_manual_json_with_only_description_is_still_loaded(tmp_path):
     root = tmp_path / "data" / "relations" / "users"
     root.mkdir(parents=True)
     (root / "20002.json").write_text(
-        json.dumps({"qq": "20002", "description": "只会写描述的人"}, ensure_ascii=False),
+        json.dumps(
+            {
+                "qq": "20002",
+                "description": "只会写描述的人",
+                "tags": ["猫", "游戏"],
+                "boundaries": ["不要问成绩"],
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
 
     store = _store(tmp_path)
     profile = store.user("20002")
     assert profile["description"] == "只会写描述的人"
-    assert "只会写描述的人" in store.render(_ctx(qq="20002"))
+
+    rendered = store.render(_ctx(qq="20002"))
+    assert "只会写描述的人" in rendered
+    assert "常聊：猫、游戏" in rendered
+    assert "雷区：不要问成绩" in rendered
 
 
 def test_manual_labels_are_protected_from_auto_removal(tmp_path):
@@ -115,6 +127,14 @@ def test_labels_are_capped(tmp_path):
     for label in ("甲", "乙", "丙"):
         store.update_person("20001", label_add=label)
     assert _labels(store.user("20001")) == ["乙", "丙"]
+
+
+def test_seed_label_survives_label_cap(tmp_path):
+    store = _store(tmp_path, max_labels=2)
+    store.observe_context(_ctx(qq="20001"))  # 给主人种上 seed 标签
+    for label in ("朋友", "同学", "同事"):
+        store.update_person("10001", label_add=label)
+    assert _labels(store.user("10001")) == ["主人", "同事"]
 
 
 def test_long_or_multiline_labels_are_rejected(tmp_path):
@@ -144,6 +164,37 @@ def test_state_renders_then_expires(tmp_path):
     rendered = store.render(ctx)
     assert "最近很难过" not in rendered
     assert "近期状态" not in rendered
+
+
+def test_timezone_aware_state_times_are_normalized(tmp_path):
+    root = tmp_path / "data" / "relations" / "users"
+    root.mkdir(parents=True)
+    now = datetime.now().astimezone()
+    (root / "20003.json").write_text(
+        json.dumps(
+            {
+                "qq": "20003",
+                "states": [
+                    {
+                        "text": "刚下飞机",
+                        "at": now.isoformat(),
+                        "expires_at": (now + timedelta(hours=1)).isoformat(),
+                    },
+                    {
+                        "text": "早就过期",
+                        "at": (now - timedelta(days=3)).isoformat(),
+                        "expires_at": (now - timedelta(days=2)).isoformat(),
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    rendered = _store(tmp_path).render(_ctx(qq="20003"))
+    assert "刚下飞机" in rendered
+    assert "早就过期" not in rendered
 
 
 def test_state_hours_cannot_exceed_max(tmp_path):
@@ -319,7 +370,6 @@ def test_render_respects_people_budget(tmp_path):
     store = _store(tmp_path, max_people=1)
     store.update_person("20001", name="小明", label_add="朋友")
     store.update_person("20002", name="小红", label_add="朋友")
-
     history = [
         ChatMessage(
             message_id="h1",
@@ -337,6 +387,64 @@ def test_disabled_store_is_a_noop(tmp_path):
     assert store.user("20001") == {}
     assert store.render(_ctx()) == ""
     assert store.update_person("20001", label_add="朋友")["ok"] is False
+
+
+# ── 注入预算：空的也要少说几句 ──────────────────────────────
+def test_render_does_not_repeat_group_name_from_scene(tmp_path):
+    """群名 / 群号已经在 <scene> 里，<relations> 再写一遍是纯重复。"""
+    store = _store(tmp_path)
+    store.update_group("20009", name="测试群", description="晚上比较活跃")
+    rendered = store.render(_ctx(group_name="测试群"))
+    assert "群：测试群" not in rendered
+    assert "简介：晚上比较活跃" in rendered
+
+
+def test_render_skips_common_users_without_profiles(tmp_path):
+    """没有档案的人只有昵称，注入进来占字数却不提供任何可用信息。"""
+    store = _store(tmp_path)
+    group = store.group("20009", create=True)
+    group["common_users"] = ["20001", "20002", "20003"]
+    store._save_group(group)
+    rendered = store.render(_ctx(qq="99999", name="路人"))
+    assert "常出现" not in rendered
+    assert "20002" not in rendered
+
+
+def test_render_strips_template_artifacts(tmp_path):
+    """手写档案里残留的 <qq>/<name> 伪标签必须清理，不能原样喂给模型。"""
+    store = _store(tmp_path)
+    store.update_person(
+        "20001",
+        name="小明",
+        description="妈妈是<qq>1341538478<qq><name>地板<name>",
+    )
+    rendered = store.render(_ctx(qq="20001", name="小明"))
+    assert "<qq>" not in rendered and "<name>" not in rendered
+    assert "地板(1341538478)" in rendered
+
+
+def test_render_does_not_repeat_similar_descriptions(tmp_path):
+    """画像 / 关系 / 描述写的是同一件事时只留一条。"""
+    store = _store(tmp_path)
+    profile = store.user("20001", create=True)
+    profile["relation"] = "认识很久的朋友"
+    profile["persona"] = "认识很久的朋友"
+    profile["description"] = "认识很久的朋友，平时经常一起玩"
+    store._save_user(profile)
+    rendered = store.render(_ctx(qq="20001", name="小明"))
+    assert rendered.count("认识很久的朋友") == 1
+
+
+def test_render_keeps_block_short_for_empty_profiles(tmp_path):
+    """档案基本是空的：只让真正有内容的人成行，总字数要压下来。"""
+    store = _store(tmp_path)
+    group = store.group("20009", create=True)
+    group["common_users"] = [f"2000{i}" for i in range(9)]
+    store._save_group(group)
+    store.update_person("20001", name="小明", label_add="朋友")
+    rendered = store.render(_ctx(qq="20001", name="小明"))
+    assert len(rendered) < 200
+    assert "小明(20001)" in rendered
 
 
 # ── 工具 ────────────────────────────────────────────────────

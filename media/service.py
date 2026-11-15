@@ -21,17 +21,51 @@ from download_system.providers.bilibili import BilibiliProvider
 # images 模块级函数仅作为兜底；正常路径走注入的 resolver。
 from images import to_napcat as _module_to_napcat
 
+from AbstractionLayer.kernal import GENERIC, BackendCapabilities
+
 from . import image_hash as image_hash_module
+from .bili_history import DEFAULT_KEEP, BiliHistory, video_key
 from .ocr import OCR, get_default_ocr
+
+#: 发文件 / 视频段时等协议端回执的秒数。
+#:
+#: 协议端要等**整个上传结束**才回包，30 秒的全局默认值必然不够：
+#: ``bot/commands/jm.py`` 实测 8MB≈32s、10MB≈66s、36MB≈149s，B 站视频（几十到
+#: 上百 MB）更慢。这里给足 10 分钟，可用 ``bot_config.json`` 的
+#: ``media.send_timeout`` 覆盖。
+DEFAULT_SEND_TIMEOUT = 600.0
 
 
 class MediaService:
-    def __init__(self, api, images, downloads, settings, *, ocr: OCR | None = None):
+    def __init__(
+        self,
+        api,
+        images,
+        downloads,
+        settings,
+        *,
+        ocr: OCR | None = None,
+        capabilities: BackendCapabilities | None = None,
+    ):
         self.api = api
         self.images = images
         self.downloads = downloads
         self.settings = settings
         self._ocr = ocr or get_default_ocr()
+        self._caps = capabilities
+        self._history: BiliHistory | None = None
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        """发送通道策略来自协议内核**实测**出来的能力，不在这里写死后端名字。
+
+        优先用注入的（测试 / 精简调用）；否则向 ``api.kernel`` 要；都没有就按
+        最保守的通用档案走。
+        """
+        if self._caps is not None:
+            return self._caps
+        caps = getattr(getattr(self.api, "kernel", None), "capabilities", None)
+        return caps if caps is not None else GENERIC
 
     # ── OCR ──────────────────────────────────────────────────────
     async def ocr(self, url: str, re_ocr: bool = False) -> dict:
@@ -71,53 +105,195 @@ class MediaService:
             return converter(str(path))
         return _module_to_napcat(str(path))
 
-    async def _send_message(self, event, message) -> bool:
+    def _send_timeout(self) -> float:
+        """发文件 / 视频等回执的秒数（配置 ``media.send_timeout``，默认 600）。"""
+        getter = getattr(self.settings, "get", None)
+        raw = getter("media.send_timeout", None) if callable(getter) else None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_SEND_TIMEOUT
+        return value if value > 0 else DEFAULT_SEND_TIMEOUT
+
+    @staticmethod
+    def _is_timeout(exc) -> bool:
+        """超时 vs 「协议端明确拒绝」：两者处理方式相反。
+
+        超时说明**上传还在进行**（回执慢），重试只会多传一份；``-134`` 之类
+        是明确拒绝，可以退避重试。
+        """
+        return isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+
+    async def _send_message(self, event, message, *, timeout: float | None = None) -> bool:
         if not event:
             return False
+        extra = {} if timeout is None else {"timeout": timeout}
         message_type = event.get("message_type")
         if message_type == "group":
             await self.api.send_group_message(
-                group_id=event.get("group_id"), message=message
+                group_id=event.get("group_id"), message=message, **extra
             )
             return True
         if message_type == "private":
             await self.api.send_private_message(
-                user_id=event.get("user_id"), message=message
+                user_id=event.get("user_id"), message=message, **extra
             )
             return True
         return False
 
     async def send_video_file(self, event, path, *, summary: str = "") -> bool:
-        """发送本地视频文件；路径必须先经过 images 转成 NapCat 可读形式。"""
+        """发送本地视频文件；路径必须先经过 images 转成协议端可读形式。
+
+        为什么不是「发一次 file 段就完事」：QQ 的**群文件**上传会偶发
+        ``retcode=-134 文件上传失败``（同一文件过几秒重发就成功）。旧代码不校验
+        ``retcode``，把失败当成功，于是用户什么也收不到，也不会走到发链接的兜底。
+
+        通道顺序、重试次数、重试间隔、视频段体积上限**全部来自
+        :class:`BackendCapabilities`**（``media_send_order`` / ``media_retry_times``
+        / ``media_retry_delay`` / ``video_max_bytes``）。默认顺序是
+        ``file → video``：群文件走文件上传通道，视频消息走 NTV2 群视频通道，
+        两套配额互不影响，一套被禁时另一套通常还能用。
+
+        超时（:meth:`_send_timeout`，默认 600 秒）**既不重试也不换通道**：回执慢
+        通常意味着协议端还在传，再发一份就是重复。全失败则抛异常，调用方
+        :meth:`send_bili_video` 只打日志、不回复任何文案。
+        """
         if not path:
             return False
+
+        caps = self.capabilities
         napcat_path = self._to_napcat(path)
-        data: dict[str, Any] = {"file": napcat_path}
+        file_data: dict[str, Any] = {"file": napcat_path}
         if summary:
-            data["summary"] = summary
-        return await self._send_message(
-            event, [{"type": "file", "data": data}]
-        )
+            file_data["summary"] = summary
+        size = self._file_size(path)
+
+        last_error: Exception | None = None
+        for channel in caps.media_send_order or ():
+            if channel == "file":
+                ok, last_error = await self._send_file_channel(event, file_data, caps)
+            elif channel == "video":
+                if size and caps.video_max_bytes and size > caps.video_max_bytes:
+                    print(
+                        f"[视频] 文件 {size / 1024 / 1024:.1f}MB 超过视频消息上限"
+                        f"（{caps.video_max_bytes / 1024 / 1024:.0f}MB），跳过该通道"
+                    )
+                    continue
+                print("[视频] 改发视频消息（群视频通道）")
+                ok, last_error = await self._send_segment(
+                    event, "video", {"file": napcat_path}, label="视频消息"
+                )
+            else:
+                continue
+            if ok:
+                return True
+            if self._is_timeout(last_error):
+                print(
+                    f"[视频] {self._send_timeout():g} 秒没回执，按「可能已发出」收工："
+                    "不重试、不换通道（再发一份就是重复）"
+                )
+                return False
+
+        if last_error is not None:
+            raise last_error
+        return False
+
+    async def _send_file_channel(self, event, data, caps):
+        """``file`` 段：按能力表重试（-134 多为瞬时风控）。"""
+        attempts = max(1, int(caps.media_retry_times) + 1)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            ok, last_error = await self._send_segment(
+                event, "file", data, label=f"群文件（第 {attempt}/{attempts} 次）"
+            )
+            if ok:
+                return True, None
+            if self._is_timeout(last_error):
+                # 上传还没回执，重试会重复上传
+                return False, last_error
+            if attempt < attempts and caps.media_retry_delay:
+                await asyncio.sleep(caps.media_retry_delay)
+        return False, last_error
+
+    async def _send_segment(self, event, seg_type: str, data: dict, *, label: str):
+        """发一个段；不抛异常，返回 ``(是否成功, 最后一个错误)``。"""
+        try:
+            await self._send_message(
+                event,
+                [{"type": seg_type, "data": data}],
+                timeout=self._send_timeout(),
+            )
+            return True, None
+        except Exception as exc:  # noqa: BLE001 - 失败要换通道，不在这里中断
+            print(f"[视频] {label}失败: {exc}")
+            return False, exc
+
+    @staticmethod
+    def _file_size(path) -> int:
+        try:
+            return Path(path).stat().st_size
+        except OSError:
+            return 0
 
     # ── B 站 ─────────────────────────────────────────────────────
+    def _bili_history(self) -> BiliHistory | None:
+        """下载历史表（``data/bili_history.json``）。
+
+        关掉（``media.bili_history=false``）或拿不到数据目录（精简调用 / 测试）时
+        返回 ``None``，调用方按「没有历史」走，不影响发送。
+        """
+        if self._history is not None:
+            return self._history
+        getter = getattr(self.settings, "get", None)
+        if callable(getter) and not getter("media.bili_history", True):
+            return None
+        paths = getattr(self.settings, "paths", None)
+        data_dir = getattr(paths, "data_dir", None)
+        if data_dir is None:
+            return None
+        self._history = BiliHistory(
+            Path(data_dir) / "bili_history.json", keep=DEFAULT_KEEP
+        )
+        return self._history
+
     async def send_bili_video(self, event, url: str) -> bool:
-        """下载 B 站视频并发送；失败时回退发送下载地址文本（旧行为）。"""
+        """下载 B 站视频并发送；同一条视频（BV 号）只下载一次。
+
+        下载历史见 :class:`media.bili_history.BiliHistory`：命中就直接发本地
+        文件，跳过 ``download_bilibili``（同一个视频会被不同群 / 回复卡片反复
+        触发，重下既慢又占盘）。**先落库再发送**，发送超时也不算白下。
+
+        失败**只打日志、不回复任何文案**：旧版超时后会把解析出来的直链当
+        「下载地址」发出去，那条链接带时效签名 / 常是分段地址，用户看到的基本
+        都是错的，所以整条回退分支已删除（用户要求「超时就什么都不做」）。
+        """
         if not url:
             return False
+
+        key = video_key(url)
+        history = self._bili_history()
+        cached = history.get(key) if history is not None else None
+        if cached is not None:
+            print(f"[B站卡片] 命中下载历史 {key}，跳过下载: {cached.name}")
+            try:
+                return await self.send_video_file(event, cached)
+            except Exception as exc:  # noqa: BLE001 - 与下面同：失败静默
+                kind = "发送超时" if self._is_timeout(exc) else "视频发送失败"
+                print(f"[B站卡片] {kind}（历史文件 {key}），不做回复: {exc}")
+                return False
+
         try:
             result = await self.downloads.download_bilibili(url)
             path = self._result_attr(result, "path")
             if not path:
                 raise RuntimeError("下载结果没有本地文件")
-            if await self.send_video_file(event, path):
-                return True
-            raise RuntimeError("发送本地视频失败")
-        except Exception as exc:
-            print(f"[B站卡片] 视频发送失败，回退下载地址: {exc}")
-            try:
-                await self._send_message(event, f"下载地址：{url}")
-            except Exception:
-                pass
+            if history is not None:
+                meta = self._result_attr(result, "meta", None) or {}
+                history.remember(key, path, title=str(meta.get("title") or ""))
+            return await self.send_video_file(event, path)
+        except Exception as exc:  # noqa: BLE001 - 失败静默，不回复文案
+            kind = "发送超时" if self._is_timeout(exc) else "视频发送失败"
+            print(f"[B站卡片] {kind}，不做回复: {exc}")
             return False
 
     async def send_bili_card(self, event, ark_data: dict) -> bool:
@@ -207,4 +383,4 @@ class MediaService:
             return False
 
 
-__all__ = ["MediaService"]
+__all__ = ["MediaService", "DEFAULT_SEND_TIMEOUT"]

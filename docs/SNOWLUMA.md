@@ -140,6 +140,40 @@ SnowLuma 的转发节点同时接受 `user_id` / `nickname` 和 `uin` / `name`�
 确认 `backend` 是 `snowluma`。如果仍写成 `napcat`，历史接口会发
 `message_seq`，SnowLuma 不认这个游标。
 
+**Q：重启后每个群都显示「断点之后没有新消息」，但群里明明有新消息？**
+
+先看 SnowLuma 日志里的这一行：
+
+```text
+group history anchor selected: group=… source=latest_authoritative anchorSeq=…
+```
+
+不带游标调用 `get_group_msg_history` 时，SnowLuma 取的是它**本地观测过**的最新一条
+（`findLatestAuthoritativeSequence`），不是服务端的最新消息。如果 SnowLuma 重启过、
+且 `historySync.enabled=false`，这个值就是重启前最后看到的那条——通常正好等于 Bot
+的断点，于是判成「最新 == 断点」，整段积压被跳过。
+
+所以 SnowLuma 的断点恢复不先问「最新一条」，而是拿断点自己的 `message_id` 往后翻
+（`reverse_order=false`）：SnowLuma 会走服务端 `SsoGetGroupMsg`，能拿到它从未观测过
+的消息。限制是断点那条消息必须还在 SnowLuma 的 message store 里，否则游标解析不出来。
+
+这个方向只对 SnowLuma 生效。NapCat 的 `message_id` 每次重启都会变，反而必须用
+「现取的最新 id」当游标从后往前翻；两者由
+`BackendCapabilities.history_latest_is_authoritative` 区分，见
+[ABSTRACTION.md](ABSTRACTION.md) 1.9。
+
+**Q：断点恢复报 `get_group_msg_history 在 30 秒内没有响应`？**
+
+SnowLuma 的群历史服务端拉取走一条串行节流通道（实测约 4 秒/次）。启动时十几个群
+同时恢复，后面的请求会排在默认 30 秒超时之后。Bot 现在会：
+
+1. 启动恢复前只探测一次历史游标（不是每个群各探一遍）；
+2. 用信号量把并发的群恢复限制在 3 个以内。
+
+这样单条请求最多排队约 8 秒。如果后端整体变慢仍然超时，可以再调小
+`bot/app.py` 的 `_RECOVERY_CONCURRENCY`，或放宽 `transport/config.py` 的
+`DEFAULT_CALL_TIMEOUT`。
+
 **Q：面板保存后没变化？**
 
 连接在 Bot 启动时建立，保存只改文件；需要重启 Bot。

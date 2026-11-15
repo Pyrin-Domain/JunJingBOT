@@ -111,6 +111,38 @@ await api.get_group_msg_history(
 2. `download_system/service.py` 注册。
 3. 业务层只调 `downloads.download_xxx(...)`。
 
+如果某个源已经有成熟的开源实现，先看下一节，不要重写解析逻辑。
+
+### 接入一个 GitHub 开源仓库（`Extension/`）
+
+`Extension/<仓库名>/` 用来放**原样内嵌**的第三方仓库；外面只包一层无界面
+桥接。已经接入的有 `jm_crawer`、`bilibilidownloadtool`。
+
+三步：
+
+1. **放代码**：按上游目录原样放进来。GUI、随包二进制、遥测模块该裁就裁，
+   但**不要改写上游源码**，否则以后没法按 commit 升级。
+2. **写桥接**：在仓库目录下加 `api.py`（唯一入口）和 `__init__.py`（轻量再导出）。
+   所有脏活——`sys.path` 调整、私有模块加载、上游 bug 的绕行——都只写在这里。
+3. **写 `VENDOR.md`**：上游 commit、许可证、裁掉了什么、为什么裁、踩到哪些
+   上游行为、升级步骤。以后接手的人只看这一个文件就能升级。
+
+硬规则（违反会坑到运行中的 Bot）：
+
+- **`sys.path` 只能 `append`，不能 `insert(0)`**。项目自己的 `config` /
+  `core` 包必须永远优先，否则会被上游同名模块顶掉。
+- **同名模块用私有名加载**。上游 `core/config.py` 就叫 `config`，桥接层用
+  `importlib` 以 `_bdt_upstream_config` 装载，绝不占用 `sys.modules["config"]`。
+- **主进程不引入 GUI 依赖**。上游顶层 `import PyQt5` 的模块要么裁掉，要么
+  自己写无 Qt 的替代（`bilibilidownloadtool/utils.py` 就是这种）。
+- **不要静默吞掉上游异常**。桥接层把错误包成自己的异常类型（`BiliError` 等），
+  让上面那层能区分「能力缺失」和「这个资源下不了」。
+- `Extension/` 里的代码**不许 import 项目内的任何模块**，保持可整体替换。
+- 桥接层里绕行上游 bug 的地方，注释要写明**为什么**，并同步记到 `VENDOR.md`。
+
+例子见 `Extension/bilibilidownloadtool/api.py` 的模块文档：它写清了三个坑
+（扁平导入、`config` 同名、分片下载不回填路径）。
+
 ### 加 Agent 工具
 
 1. `agent/tools/` 对应文件写 `@tool`。

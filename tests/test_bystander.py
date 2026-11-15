@@ -70,6 +70,18 @@ def test_pulse_question_answered_is_not_dangling():
     assert read_pulse(messages, now=NOW).has_question is False
 
 
+def test_pulse_ignores_rhetorical_complaint():
+    """「话怎么这么多」是吐槽，不是提问。
+
+    以前它被算成提问 → 判成「悬空提问没人接」→ 模型去 answer，
+    于是群友吐槽机器人话多，机器人真的接了一句。
+    """
+    messages = [
+        _msg(1, FRIEND, "机器人b话怎么这么多", minutes_ago=2),
+    ]
+    assert read_pulse(messages, now=NOW).has_question is False
+
+
 def test_pulse_ignores_own_messages_when_counting_speakers():
     messages = [
         _msg(1, MASTER, "在吗"),
@@ -97,6 +109,20 @@ def test_self_position_when_never_spoke():
     position = read_self_position(messages, now=NOW)
     assert position.last_minutes is None
     assert "还没在这个群说过话" in "\n".join(position.render())
+
+
+def test_self_position_does_not_nudge_when_question_is_dangling():
+    """刚说完 ≠ 不能答问题：有人提问没人接时，不该压着自己不开口。"""
+    messages = [
+        _msg(1, MASTER, "在吗", minutes_ago=10),
+        _msg(2, SELF, "在群里挂着水群呢", minutes_ago=2, is_self=True),
+    ]
+    position = read_self_position(messages, now=NOW)
+    rendered = "\n".join(position.render(has_dangling_question=True))
+    assert "别再添一句" not in rendered
+    assert "答问题不算添一句" in rendered
+    # 没有悬空提问时，照旧压一句
+    assert "别再添一句" in "\n".join(position.render())
 
 
 # ── 兴趣 ────────────────────────────────────────────────
@@ -200,6 +226,48 @@ def test_verdict_keeps_real_reason():
         "<verdict><act>nod</act><why>他们在聊，我没内容但想露个面</why></verdict>"
     )
     assert plan.why == "他们在聊，我没内容但想露个面"
+
+
+# ── 动作没被认出来 → 白丢一次开口机会（真踩过的坑）──────────
+def test_verdict_accepts_act_tag_with_extra_words():
+    """模型在动作标签里多说了几个字，动作照样要认出来。"""
+    plan = parse_interject_verdict(
+        "<verdict><act>answer（因为主人在提问）</act><why>主人在提问，我可以回答</why></verdict>"
+    )
+    assert plan.act == "answer"
+
+
+def test_verdict_skips_copied_template_act():
+    """模型先抄了一段格式模板再给判断——认不出来的那个标签直接跳过。"""
+    plan = parse_interject_verdict(
+        "<verdict><act>这里填动作</act><why>这里填具体理由</why></verdict>"
+        "<verdict><act>answer</act><why>有人提问没人接</why></verdict>"
+    )
+    assert plan.act == "answer"
+    assert plan.why == "有人提问没人接"
+
+
+def test_verdict_accepts_chinese_act():
+    assert parse_interject_verdict("<act>回答</act><why>x</why>").act == "answer"
+    assert parse_interject_verdict("<act>沉默</act><why>x</why>").act == "silent"
+
+
+def test_verdict_recovers_act_from_free_text():
+    plan = parse_interject_verdict("我觉得应该 answer，因为有人在提问")
+    assert plan.act == "answer"
+
+
+def test_verdict_free_text_negation_stays_silent():
+    assert parse_interject_verdict("这里我选择 not answer，问题轮不到我").act == "silent"
+
+
+def test_verdict_reason_alone_does_not_become_act():
+    """理由里写「我可以回答」不代表动作是回答——只有正文里的动作词算数。"""
+    plan = parse_interject_verdict(
+        "<verdict><act>silent</act><why>我可以回答但这次先不说</why></verdict>"
+    )
+    assert plan.act == "silent"
+    assert plan.why == "我可以回答但这次先不说"
 
 
 # ── nod：只说「我在」，不打字 ─────────────────────────────

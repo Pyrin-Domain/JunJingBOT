@@ -11,7 +11,7 @@
 正向 ``ws`` / 反向 ``ws_re`` 两种模式对外接口一致；事件监听见 :mod:`transport.listener`。
 """
 
-from .api import NapCatAPI, NapCatAPIInterface, OneBotAPI
+from .api import NapCatAPI, NapCatAPIInterface, OneBotAPI, OneBotAPIError
 from .config import (
     DEFAULT_BACKEND,
     DEFAULT_CALL_TIMEOUT,
@@ -36,10 +36,16 @@ from .config import (
     settings_from_any,
 )
 from .connection import NapCatConnection, NapCatReverseWS, OneBotConnection
+from .event_dispatcher import (
+    DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_PENDING,
+    EventDispatcher,
+)
 from .listener import listen, listen_msg
 
 __all__ = [
     "OneBotAPI",
+    "OneBotAPIError",
     "OneBotConnection",
     "NapCatAPI",
     "NapCatAPIInterface",
@@ -48,8 +54,11 @@ __all__ = [
     "BackendProfile",
     "ConnectionConfig",
     "ConnectionSettings",
+    "EventDispatcher",
     "DEFAULT_BACKEND",
     "DEFAULT_CALL_TIMEOUT",
+    "DEFAULT_MAX_CONCURRENCY",
+    "DEFAULT_MAX_PENDING",
     "DEFAULT_MODE",
     "DEFAULT_RETRY_SECONDS",
     "MODE_FORWARD",

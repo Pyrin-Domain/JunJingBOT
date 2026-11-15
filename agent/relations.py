@@ -117,16 +117,21 @@ def _parse_time(value: Any) -> Optional[datetime]:
     if not text:
         return None
     if text.endswith("Z"):
-        text = text[:-1]
+        # 保留时区语义：Z 是 UTC，不能直接当本地时间。
+        text = text[:-1] + "+00:00"
     for fmt in _TS_FORMATS:
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
     try:
-        return datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
+    # 统一成 naive 本地时间：手写 JSON 可能带 +08:00 / Z，不能和 datetime.now() 直接比。
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
 
 
 def _age_label(at: Optional[datetime], now: Optional[datetime] = None) -> str:
@@ -153,6 +158,47 @@ def _clean_label(value: Any) -> str:
     if not text or len(text) > 10:
         return ""
     return text
+
+
+# 手写 / 旧版模板残留在正文里的伪标签，如 `<qq>1341538478<qq><name>地板<name>`。
+# 原样渲染出去会让模型把它当成"要输出的格式"，也会白白占字数。
+_QQ_PAIR_RE = re.compile(r"<qq>\s*(\d{4,20})\s*<qq>\s*<name>\s*(.*?)\s*<name>", re.I)
+_NAMED_PAIR_RE = re.compile(r"<name>\s*(.*?)\s*<name>\s*<qq>\s*(\d{4,20})\s*<qq>", re.I)
+_TAG_ARTIFACT_RE = re.compile(r"<\s*(qq|name|at|id|user)\s*>(.*?)<\s*\1\s*>", re.I)
+_BARE_TAG_RE = re.compile(r"<\s*/?\s*(qq|name|at|id|user)\s*>", re.I)
+
+
+def _clean_text(value: Any, limit: int = 0) -> str:
+    """去掉伪标签残留，压掉多余空白；``limit`` > 0 时截断。"""
+    text = _text(value)
+    if not text:
+        return ""
+    # 「号 + 名字」成对出现时还原成「名字(号)」，比直接丢掉号更有用
+    text = _QQ_PAIR_RE.sub(lambda m: f"{_text(m.group(2))}({m.group(1)})", text)
+    text = _NAMED_PAIR_RE.sub(lambda m: f"{_text(m.group(1))}({m.group(2)})", text)
+    text = _TAG_ARTIFACT_RE.sub(lambda m: _text(m.group(2)), text)
+    text = _BARE_TAG_RE.sub(" ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    return _clip(text, limit) if limit else text
+
+
+def _join_sentence(sentence: str) -> str:
+    """句末去掉「。」再拼「；」，避免出现「……在意。；下一个」这种双重标点。"""
+    return sentence.strip().rstrip("。.；;，,")
+
+
+def _overlaps(a: str, b: str, *, threshold: float = 0.7) -> bool:
+    """两段描述是否高度重复（一段基本包含另一段）。"""
+    left, right = _text(a), _text(b)
+    if not left or not right:
+        return False
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    if shorter in longer:
+        return True
+    # 逐字符二元组覆盖率：同一件事被两种说法写了两遍
+    grams = {shorter[i : i + 2] for i in range(len(shorter) - 1)} or {shorter}
+    hit = sum(1 for gram in grams if gram in longer)
+    return hit / len(grams) >= threshold
 
 
 def _dedupe_states(states: Any) -> list[dict]:
@@ -507,8 +553,13 @@ class RelationStore:
                             group["name"] = name
                             dirty = True
                     current = getattr(context, "current", None)
-                    qq = _text(getattr(getattr(current, "sender", None), "qq", ""))
-                    if qq and qq not in group["common_users"]:
+                    sender = getattr(current, "sender", None)
+                    qq = _text(getattr(sender, "qq", ""))
+                    if (
+                        qq
+                        and not getattr(sender, "is_self", False)
+                        and qq not in group["common_users"]
+                    ):
                         group["common_users"] = (group["common_users"] + [qq])[-30:]
                         dirty = True
                     if dirty:
@@ -596,7 +647,13 @@ class RelationStore:
             if _text(item.get("text")) == label:
                 return False
         labels.append({"text": label, "at": _iso(_now()), "source": source})
-        profile["labels"] = labels[-self.max_labels:]
+        if len(labels) > self.max_labels:
+            # 截断时优先保留 seed（主人）标签：它们只补不删，不能被后来的标签挤掉。
+            seeds = [item for item in labels if _text(item.get("source")) == "seed"]
+            others = [item for item in labels if _text(item.get("source")) != "seed"]
+            room = max(0, self.max_labels - len(seeds))
+            labels = seeds + (others[-room:] if room else [])
+        profile["labels"] = labels
         return True
 
     def _remove_label(self, profile: dict, label: str, *, only_auto: bool = False) -> bool:
@@ -946,19 +1003,34 @@ class RelationStore:
             parts.append("标签：" + "、".join(labels[: self.max_labels]))
         if aliases:
             parts.append("别名：" + "/".join(aliases[:3]))
-        if _text(data.get("persona")):
-            parts.append("画像：" + _text(data.get("persona")))
-        if _text(data.get("relation")):
-            parts.append("关系：" + _text(data.get("relation")))
-        if _text(data.get("description")):
-            parts.append("描述：" + _text(data.get("description")))
+
+        # 画像 / 关系 / 描述经常是同一件事的三种说法（人工填的和模型记的会重复），
+        # 逐条去重：后来的若与已写的重叠就跳过，宁可少写也不要一份档案说三遍。
+        described: list[str] = []
+        for label, key, limit in (
+            ("关系", "relation", 80),
+            ("画像", "persona", 100),
+            ("描述", "description", 100),
+        ):
+            value = _clean_text(data.get(key), limit)
+            if not value or any(_overlaps(value, old) for old in described):
+                continue
+            described.append(value)
+            parts.append(f"{label}：{_join_sentence(value)}")
+
+        tags = _split_items(data.get("tags"))
+        if tags:
+            parts.append("常聊：" + "、".join(tags[:5]))
+        boundaries = _split_items(data.get("boundaries"))
+        if boundaries:
+            parts.append("雷区：" + "、".join(boundaries[:5]))
         states = self._fresh_states(data)
         if states:
             now = _now()
             parts.append(
                 "近期状态："
                 + "；".join(
-                    f"{_text(item.get('text'))}（{_age_label(_parse_time(item.get('at')), now)}）"
+                    f"{_clean_text(item.get('text'), 40)}（{_age_label(_parse_time(item.get('at')), now)}）"
                     for item in states
                 )
             )
@@ -978,12 +1050,12 @@ class RelationStore:
             parts.append(
                 "重要记忆："
                 + "；".join(
-                    f"{_clip(item.get('text'), 60)}"
+                    f"{_clean_text(item.get('text'), 60)}"
                     + (f"（{_text(item.get('at'))[:10]}）" if item.get("at") else "")
                     for item in memories[:4]
                 )
             )
-        local = _text((data.get("group_notes") or {}).get(group_id))
+        local = _clean_text((data.get("group_notes") or {}).get(group_id), 60)
         if local:
             parts.append("本群：" + local)
         head = f"- {name}({qq})"
@@ -991,29 +1063,31 @@ class RelationStore:
             return ""
         return _clip(head + "：" + "；".join(parts), self.max_person_chars)
 
-    def _render_group(self, group_id: str) -> str:
+    def _render_group(self, group_id: str, *, scene_name: str = "") -> str:
+        """群档案：只写``<scene>``里没有的东西。
+
+        群名 / 群号 ``<scene>`` 里已经有；只有事件没带群名（``scene_name`` 为空）
+        而档案里有时，才补一行。``common_users`` 只是一串昵称、没有档案信息，
+        真正有档案的人会各自成行 —— 不再单独渲染。
+        """
         data = self.group(group_id) if group_id else {}
         if not data:
             return ""
         lines: list[str] = []
-        name = _text(data.get("name")) or group_id
-        lines.append(f"- 群：{name}（{group_id}）")
-        for label, key in (("简介", "description"), ("备注", "notes")):
-            value = _text(data.get(key))
+        name = _clean_text(data.get("name"), 40)
+        if name and not _text(scene_name):
+            lines.append(f"- 群：{name}（{group_id}）")
+        for label, key, limit in (
+            ("简介", "description", 120),
+            ("备注", "notes", 150),
+        ):
+            value = _clean_text(data.get(key), limit)
             if value:
                 lines.append(f"- {label}：{value}")
         for label, key in (("常聊", "topics"), ("群梗", "lore"), ("口头禅", "catchphrases")):
-            values = _split_items(data.get(key))
+            values = [item for item in _split_items(data.get(key)) if _text(item)]
             if values:
-                lines.append(f"- {label}：{'；'.join(values[:8])}")
-        common = _split_items(data.get("common_users"))
-        if common:
-            names = []
-            for qq in common[:12]:
-                profile = self.user(qq)
-                shown = _text(profile.get("name")) or qq
-                names.append(f"{shown}({qq})")
-            lines.append("- 常出现：" + "、".join(names))
+                lines.append(f"- {label}：{'；'.join(values[:6])}")
         return "\n".join(lines)
 
     def _render_self(self) -> str:
@@ -1059,7 +1133,9 @@ class RelationStore:
         self_text = self._render_self()
         if self_text:
             blocks.append(self_text)
-        group_text = self._render_group(group_id)
+        group_text = self._render_group(
+            group_id, scene_name=_text(getattr(context, "group_name", ""))
+        )
         if group_text:
             blocks.append("## 这个群\n" + group_text)
 

@@ -29,6 +29,7 @@ single_msg``    可以点开                                跨群后失效，�
 from __future__ import annotations
 
 import html
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -40,9 +41,11 @@ __all__ = [
     "RelayContent",
     "RelayPlan",
     "build_node",
+    "has_empty_resid_multimsg",
     "has_nested_forward",
     "has_opaque_nested",
     "is_opaque_multimsg",
+    "multimsg_resid_of",
     "plan_relay",
     "segments_of",
     "titles_of_multimsg",
@@ -58,6 +61,8 @@ _MULTIMSG_MARKERS = (
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
+#: xml 多消息卡里指向子消息的唯一有效入口（``data.resid`` 是 serviceID，不是 id）。
+_RESID_ATTR_RE = re.compile(r"""m_resid\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 
 
 def _raw_of(segment: dict) -> str:
@@ -76,8 +81,9 @@ def _raw_of(segment: dict) -> str:
 def is_opaque_multimsg(segment: Any) -> bool:
     """这个段是不是「拿不到内容的聊天记录」（xml/json 的多消息卡片）。
 
-    这类段只有摘要（``<title>`` 列表），没有可展开的 id，整卡搬到别的会话
-    后 ``m_fileName`` 指向源会话的临时文件，接收方只能看到「[XML消息]」。
+    这类段只有摘要（``<title>`` 列表）；``m_resid`` 为空时连子消息 id 都没有，
+    整卡搬到别的会话后 ``m_fileName`` 指向源会话的临时文件，接收方只能看到
+    「[XML消息]」。能不能展开看 :func:`multimsg_resid_of`。
     """
     if not isinstance(segment, dict):
         return False
@@ -85,6 +91,55 @@ def is_opaque_multimsg(segment: Any) -> bool:
         return False
     raw = _raw_of(segment)
     return any(marker in raw for marker in _MULTIMSG_MARKERS)
+
+
+def _json_of(raw: str) -> dict:
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def multimsg_resid_of(segment: Any) -> str:
+    """多消息卡片里指向子消息的 ``resid``；**空串表示这张卡拿不到内容**。
+
+    两个坑：
+
+    - xml 段只有 ``m_resid`` **属性**算入口。同层的 ``data.resid`` 是
+      ``serviceID``（实测恒为 35），拿去 ``get_forward_msg`` 只会得到
+      ``download forward message payload is empty``；
+    - json 段（``com.tencent.multimsg``）的 resid 在 ``meta.detail.resid`` 里。
+    """
+    if not isinstance(segment, dict):
+        return ""
+    if segment.get("type") == "json":
+        meta = _json_of(_raw_of(segment)).get("meta")
+        if isinstance(meta, str):
+            meta = _json_of(meta)
+        detail = meta.get("detail") if isinstance(meta, dict) else None
+        if isinstance(detail, str):
+            detail = _json_of(detail)
+        if isinstance(detail, dict) and detail.get("resid"):
+            return str(detail["resid"]).strip()
+        return ""
+    match = _RESID_ATTR_RE.search(_raw_of(segment))
+    if not match:
+        return ""
+    return (match.group(1) or match.group(2) or "").strip()
+
+
+def has_empty_resid_multimsg(messages: Any) -> bool:
+    """这批消息里有没有「resid 为空的多消息卡」。
+
+    这种卡在入站时就被压成了 ``<title>`` 摘要，没有任何子消息 id，
+    重建也只能把摘要伪装成一条正常记录，所以按策略**不搬**。
+    """
+    for message in messages or []:
+        for segment in segments_of(message):
+            if is_opaque_multimsg(segment) and not multimsg_resid_of(segment):
+                return True
+    return False
 
 
 def titles_of_multimsg(segment: Any) -> list[str]:
@@ -201,7 +256,9 @@ class RelayPlan:
     ``action``：
 
     - ``single``：``forward_group_single_msg`` 整卡搬，最保真；
-    - ``rebuild``：重建 node 走 ``send_group_forward_msg``。
+    - ``rebuild``：重建 node 走 ``send_group_forward_msg``；
+    - ``skip``：目标卡拿不全内容（内层多消息卡 ``m_resid`` 为空），
+      按策略**不搬**——不整卡搬、也不重建降级。
     """
 
     action: str
@@ -213,6 +270,11 @@ class RelayPlan:
     @property
     def needs_rebuild(self) -> bool:
         return self.action == "rebuild"
+
+    @property
+    def skip(self) -> bool:
+        """按策略不搬（不是失败：主动放弃，不发送也不降级）。"""
+        return self.action == "skip"
 
     @property
     def lossy(self) -> bool:
@@ -238,9 +300,22 @@ def plan_relay(
     if force_rebuild:
         return RelayPlan("rebuild", "调用方要求重建（裁剪 / 追加）", nested, opaque)
 
-    # 内层已经是 xml/json 死卡片：m_fileName 指向**源会话**的临时多消息文件。
-    # 这张卡在目标会话里没有任何可用资源引用，任何后端「整卡重发」都只会再发一次
-    # 打不开的卡（手机端能进、图片加载失败），因此与后端能力无关，一律重建。
+    # resid 为空的多消息卡：入站时就被压成了 <title> 摘要，连子消息 id 都没有。
+    # 任何后端都取不到原内容，重建只能把摘要伪装成一条正常记录（接收方会以为
+    # 看到的就是原内容）。策略：宁可不搬，也不搬半真的东西。
+    if has_empty_resid_multimsg(messages):
+        return RelayPlan(
+            "skip",
+            "内层聊天记录卡的 m_resid 为空，只剩 <title> 摘要、没有可展开的子消息 id，"
+            "搬过去也不完整，按策略不搬",
+            nested,
+            opaque,
+        )
+
+    # 内层已经是 xml/json 死卡片（有 resid 但换会话失效）：m_fileName 指向
+    # **源会话**的临时多消息文件。这张卡在目标会话里没有任何可用资源引用，任何后端
+    # 「整卡重发」都只会再发一次打不开的卡（手机端能进、图片加载失败），
+    # 因此与后端能力无关，一律重建。
     if opaque:
         return RelayPlan(
             "rebuild",
@@ -443,6 +518,9 @@ class ForwardRelay:
 
         这里把摘要取出来重建成一层文本记录：图片会退化成 ``[图片]`` 字样，
         但至少接收方点得开、看得见文字，而不是一张死卡。
+
+        注意：``plan_relay`` 对 **m_resid 为空** 的死卡会先判 ``skip``（整条不搬），
+        能走到这里的通常是「resid 非空但展开失败」。这里是兜底，不是主策略。
         """
         titles = titles_of_multimsg(segment)
         if not titles:

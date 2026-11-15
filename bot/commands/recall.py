@@ -14,9 +14,13 @@ from __future__ import annotations
 import asyncio
 from functools import partial
 
+from core.logging import get_logger
+
 from .export import parse_range
 
 __all__ = ["recall", "run_recall_range", "do_recall", "recall_processor"]
+
+log = get_logger("bot.commands.recall")
 
 
 def _master_qq(handler) -> list[str]:
@@ -36,9 +40,8 @@ def _master_qq(handler) -> list[str]:
 
 async def recall(handler, event) -> bool:
     """批量撤回：recall -b（回复起点）→ recall -e（回复终点），仅限本群聊。"""
-    DEBUG = True
     if event.get("message_type") != "group":
-        DEBUG and print("[批量撤回] 仅限群聊使用")
+        log.warning("[批量撤回] 仅限群聊使用")
         return False
     clean_msg = handler.mp.get_clean_context(event)
     rpy = handler.mp.is_reply(event)
@@ -71,13 +74,12 @@ async def _get_member_role(handler, group_id, user_id) -> str:
         data = res.get("data") or {}
         return str(data.get("role") or "")
     except Exception as exc:
-        print(f"[批量撤回] 获取成员信息失败 user_id={user_id}: {exc!r}")
+        log.warning("[批量撤回] 获取成员信息失败 user_id=%s: %r", user_id, exc)
         return ""
 
 
 async def do_recall(handler, event, start_id, end_id) -> None:
     """权限检查 + 逐条撤回 [start_id, end_id] 区间内的消息。"""
-    DEBUG = True
     group_id = event["group_id"]
     # 发起人必须是群主/管理员或 master
     issuer_role = await _get_member_role(handler, group_id, event["user_id"])
@@ -133,5 +135,8 @@ async def recall_processor(
         stats["ok"] += 1
     except Exception as exc:
         stats["fail"] += 1
-        print(f"[批量撤回] 撤回失败 message_id={event.get('message_id')}: {exc!r}")
+        log.warning(
+            "[批量撤回] 撤回失败 message_id=%s: %r",
+            event.get("message_id"), exc,
+        )
     await asyncio.sleep(0.1)

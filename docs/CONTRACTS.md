@@ -68,7 +68,15 @@ class OneBotAPI:                 # 旧名字：NapCatAPI / NapCatAPIInterface
 
 # transport/listener.py
 async def listen(config: ConnectionSettings, process_message,
-                 *, conn: OneBotConnection | None = None) -> OneBotConnection: ...
+                 *, conn: OneBotConnection | None = None,
+                 max_concurrency: int = 8,
+                 max_pending: int = 256) -> OneBotConnection: ...
+
+# transport/event_dispatcher.py
+class EventDispatcher:
+    def submit(event: dict) -> bool: ...
+    async def join(timeout: float | None = None) -> bool: ...
+    async def close() -> None: ...
 ```
 
 ---
@@ -116,9 +124,17 @@ class MessageProcessor:
     def tokenizer(self, text: str) -> str: ...
 ```
 
-`messaging/models.py` 已存在，字段不要改：
+`messaging/models.py` 已存在，字段只增不改：
 `Sender` / `Segment` / `Quote` / `ChatMessage` / `ChatContext` /
 `parse_event` / `render_*` / `image_sources()`。
+
+新增（都是向后兼容的追加字段）：
+
+- `ChatMessage.reply_to_id` / `reply_to_self`：引用的 message_id，以及「被引用的是不是我自己说的」
+  的兜底布尔（摘要取不到时 `replies_to_me` 仍成立）；
+- `ChatContext.aliases`：Bot 别名，用于「没 @ 但直呼其名」的指向推断；
+- `messaging/dialogue.py`：`resolve_addressees` / `addressee_markers` / `describe_dialogue`，
+  负责行尾「→谁」标记和 `<dialogue>` 摘要。
 
 ---
 
@@ -129,15 +145,27 @@ class MessageProcessor:
 class OCR:
     async def recognize(self, img_url: str, re_ocr: bool = False) -> dict: ...  # {"text": ...}
 
+# media/bili_history.py
+def video_key(url: str) -> str: ...  # BV1xx... / av123 / ""
+class BiliHistory:
+    def __init__(self, path: Path, *, keep: int = 200): ...
+    def get(self, key: str) -> Path | None: ...     # 命中返回路径；文件丢失自动删记录
+    def remember(self, key: str, path: Path, *, title: str = "") -> None: ...
+    def forget(self, key: str) -> None: ...
+
 # media/service.py
+DEFAULT_SEND_TIMEOUT = 600.0
 class MediaService:
-    def __init__(self, api, images, downloads, settings, *, ocr=None): ...
+    def __init__(self, api, images, downloads, settings, *, ocr=None,
+                 capabilities=None): ...
     async def ocr(self, url: str, re_ocr: bool = False) -> dict: ...
     async def ocr_and_send(self, group_id, url): ...
     async def send_bili_video(self, event, url: str) -> bool: ...
+        # 同 BV 号只下载一次（BiliHistory）；失败/超时静默，不回复任何文案
     async def send_bili_card(self, event, ark_data: dict) -> bool: ...
     async def send_music(self, event, keyword: str) -> bool: ...
     async def send_video_file(self, event, path, *, summary="") -> bool: ...
+        # 超时不重试、不换通道；返回 False（「可能已发出」）
     async def hash_remote_images(self, urls: list[str]) -> list[str]: ...
 ```
 
@@ -169,16 +197,41 @@ class QQBotAgent:
 - `self.media`：OCR、B 站、点歌
 - `self.images`：`resolve` / `to_backend`（旧名 `to_napcat`）/ `dress`
 - `self.settings`：`master_qq` / `agent_*` / `prompt` / `reply`
+- `self.api.kernel`：协议内核。后端差异（NapCat 转发只能内联、SnowLuma 要用内层 id
+  再发包）全在 `AbstractionLayer` 的能力表里，转发展开走 `ForwardExpander`——
+  **上层代码不许出现 `if backend == "napcat"`**。
+
+图片来源与转发卡片：
+- `ocr_img(source=...)` 的 source 取值：`current` / `quote` / `history` / `forward`。
+  图片 URL 只留在服务端，模型只传 `source + index`（`history` 另加 `message_id`）；
+  长签名 URL 永远不进提示词。
+- `read_forward(message_id=...)`：展开合并转发 / 聊天记录卡片。不传 message_id 时
+  自动定位本轮上下文里最近的一张卡片（引用 > 当前 > 历史，新的在前）。
+  卡片里的图片登记成 `source="forward"`，随后用
+  `ocr_img(source="forward", index=i)` 读图上的字。
 
 ---
 
 ## bot services
 
 ```python
-# bot/services/forward.py
+# bot/services/forward/（包：job 数据结构 / detect 识别 / service 编排）
 class ForwardService:
-    def __init__(self, *, mp, api, settings, media=None, dedup=None): ...
-    async def auto_forward(self, event, is_recover=False, **kwargs) -> bool: ...
+    def __init__(self, *, mp, api, settings, media=None, dedup=None, image_store=None): ...
+    async def forward(self, event, is_recover=False, **kwargs) -> bool: ...
+    async def auto_forward(self, event, **kwargs) -> bool: ...   # 旧名字，等价 forward
+
+# bot/services/dedup.py 的查询契约（增量）
+ForwardDedupStore.find(text, *, alt_text="", ...)   # alt_text = 清洗前的指纹文本（老行别名）
+ForwardDedupStore.record(text, *, kind, group_ids, ...)
+
+# bot/services/image_dedup.py
+class ForwardImageStore:            # 图片送达库，独立 DB（data/forward_image.db）
+    def delivered(self, identities, chats) -> set[str]: ...
+    def remember(self, identities, chats, now=None) -> None: ...
+    def matched_phash(self, chats, hashes, max_distance=None) -> dict[str, set[int]]: ...
+    # identity 前缀：real_id:/message_id:（消息身份）、image:/image_fileid:（文件名哈希）、
+    #               imgsha:（图片字节哈希）、phash:（aHash+dHash 感知指纹，模糊匹配）
 
 # bot/services/range_task.py
 class RangeTaskService:

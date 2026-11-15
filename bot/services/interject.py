@@ -29,11 +29,14 @@ import random
 import time
 from dataclasses import dataclass
 
+from core.logging import get_logger
 from messaging.attention import Attention, detect_attention_of
 from messaging.interest import read_interests
 
 # nod 用的表情：只在「想表示在场但没内容」时贴一个，不打字
 _NOD_EMOJIS = ("424", "76", "66")
+
+log = get_logger("bot.services.interject")
 
 
 def _num(value, default: float, minimum: float = 0.0) -> float:
@@ -69,6 +72,7 @@ class GroupState:
     last_event: dict | None = None      # 最新一条消息（用来扒历史 + 发送）
     task: asyncio.Task | None = None    # 这个群的倒计时任务
     cooldown_task: asyncio.Task | None = None  # 冷却结束后的补检查任务
+    run_task: asyncio.Task | None = None  # 正在进行的插话判断 / 发送
     pending: bool = False               # 冷却期间有值得补看的新消息
     busy: bool = False                  # 正在判断/生成，别重复触发
     last_trigger_at: float = 0.0        # 上次判断的时间（cooldown 用）
@@ -254,6 +258,10 @@ class InterjectService:
 
     def _cooldown_left(self, state: "GroupState", params: dict) -> float:
         """距离冷却结束还有多少秒；已经结束就是 0。"""
+        if state.last_trigger_at <= 0:
+            # 从没触发过。不能直接拿 monotonic() 和 0 比：刚开机的机器 /
+            # 容器里 monotonic 可能小于 cooldown，会把第一次插话误判成冷却中。
+            return 0.0
         return max(
             0.0,
             self._cooldown(state, params)
@@ -273,11 +281,12 @@ class InterjectService:
         """停掉所有倒计时任务（关机 / 测试收尾用）。"""
         self._closed = True
         for state in self._states.values():
-            for task in (state.task, state.cooldown_task):
+            for task in (state.task, state.cooldown_task, state.run_task):
                 if task and not task.done():
                     task.cancel()
             state.task = None
             state.cooldown_task = None
+            state.run_task = None
             state.pending = False
 
     # ──────────────── 内部状态 ────────────────
@@ -393,7 +402,7 @@ class InterjectService:
         if loop is None:
             state.busy = False
             return
-        loop.create_task(self._run(state, reason, params))
+        state.run_task = loop.create_task(self._run(state, reason, params))
 
     # ──────────────── 真正插话 ────────────────
     async def _run(self, state: GroupState, reason: str, params: dict | None = None) -> None:
@@ -447,11 +456,13 @@ class InterjectService:
                     event, message, result, hot_seconds=params["hot_minutes"] * 60
                 )
             state.triggered += 1
-            print(f"[插话] 群 {state.group_id} 已插话（{reason}，动作 {act}）")
+            log.info("[插话] 群 %s 已插话（%s，动作 %s）", state.group_id, reason, act)
         except Exception as exc:  # 插话失败不能影响主流程
-            print(f"[插话] 群 {state.group_id} 失败: {exc}")
+            log.warning("[插话] 群 %s 失败: %s", state.group_id, exc)
         finally:
             state.busy = False
+            if state.run_task is asyncio.current_task():
+                state.run_task = None
             # 本次判断/生成期间又攒了消息：等冷却结束再补一次
             if state.pending and state.count > 0:
                 self._ensure_cooldown_wake(state)
@@ -469,10 +480,10 @@ class InterjectService:
         try:
             await api.set_msg_emoji_like(message_id, random.choice(_NOD_EMOJIS))
         except Exception as exc:  # noqa: BLE001 - 贴表情失败不能影响主流程
-            print(f"[插话] 群 {state.group_id} 表情回应失败: {exc}")
+            log.warning("[插话] 群 %s 表情回应失败: %s", state.group_id, exc)
             return
         state.nodded += 1
-        print(f"[插话] 群 {state.group_id} 只贴了表情（在场，没说话）")
+        log.info("[插话] 群 %s 只贴了表情（在场，没说话）", state.group_id)
 
     async def _build_context(self, event: dict, params: dict):
         """扒最近 frequent + extra 条消息，组装成 ChatContext。"""
@@ -486,7 +497,7 @@ class InterjectService:
                 aliases=self._aliases(),
             )
         except Exception as exc:
-            print(f"[插话] 群 {event.get('group_id')} 组上下文失败: {exc}")
+            log.warning("[插话] 群 %s 组上下文失败: %s", event.get("group_id"), exc)
             return None
         # 插话要看完整一段对话，比 @ 回复放宽历史预算
         context.max_history_messages = min(count + 2, 20)

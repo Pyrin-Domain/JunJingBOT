@@ -47,7 +47,8 @@ def build_media_tools(agent: Any) -> list:
         参数:
           - index: int, 第几张图片（从 0 开始，默认 0）
           - source: str, 图片来源："current"=当前消息（默认），"quote"=被引用/回复的消息，
-            "history"=历史消息
+            "history"=历史消息，"forward"=合并转发/聊天记录卡片里的图
+            （卡片要先用 read_forward 展开）
           - message_id: str, 仅 source="history" 时使用；不传则取历史上最近一条带图的消息
         """
         media = media_of(agent)
@@ -68,15 +69,31 @@ def build_media_tools(agent: Any) -> list:
             )
             return text
         if not urls:
-            other = "quote" if src == "current" else "current"
-            if sources.get(other):
+            # 只有 current / quote 之间互相回落：历史图和转发图都是**指定的**目标，
+            # 拿当前消息的图冒充它们，只会让模型拿到不相干的文字。
+            other = {"current": "quote", "quote": "current"}.get(src)
+            if other and sources.get(other):
                 logger.warning(
                     f"[工具] ocr_img source={source!r} 没有图片，回退到 {other}"
                 )
                 src = other
                 urls = list(sources[other])
+        if not urls and src == "forward":
+            text = (
+                '[转发卡片还没解析：先调用 read_forward 展开卡片，'
+                '再用 ocr_img(source="forward", index=0) 读卡里的图]'
+            )
+            logger.warning("[工具] ocr_img source=forward 但卡片还没展开")
+            record_tool_call(
+                "ocr_img",
+                {"source": src, "index": index, "message_id": mid},
+                result=text,
+            )
+            return text
         if not urls:
-            logger.warning("[工具] OCR 不可用 - 当前消息、引用消息和历史里都没有图片")
+            logger.warning(
+                "[工具] OCR 不可用 - 当前消息、引用消息、历史和转发卡片里都没有图片"
+            )
             record_tool_call(
                 "ocr_img",
                 {"source": src, "index": index, "message_id": mid},

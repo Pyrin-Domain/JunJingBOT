@@ -42,6 +42,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable, Mapping, Optional
 
+from AbstractionLayer.segments import STICKER, image_kind, sticker_name
+
+from .dialogue import MIN_DIALOGUE_MESSAGES, addressee_markers, describe_dialogue
 from .interest import render_interests
 from .pulse import read_pulse, read_self_position
 
@@ -119,12 +122,17 @@ class Quote:
     """被引用/回复的那条消息，只保留一行摘要，不再递归展开。
 
     images 保留被引用消息的图片 URL（不渲染进文本），供 OCR 等工具按需解析。
+    is_forward 标记被引用的这条是不是「合并转发 / 聊天记录卡片」——
+    工具据此知道该去展开它（否则模型只看到一串 ``[CQ:forward,id=...]``）。
+    forward_count 是卡片自称的条数（拿不到为 0）。
     """
 
     message_id: str = ""
     sender: Sender = field(default_factory=Sender)
     summary: str = ""
     images: list[str] = field(default_factory=list)
+    is_forward: bool = False
+    forward_count: int = 0
 
 
 @dataclass
@@ -136,6 +144,8 @@ class ChatMessage:
     sender: Sender = field(default_factory=Sender)
     segments: list[Segment] = field(default_factory=list)
     quote: Optional[Quote] = None
+    reply_to_id: str = ""       # 引用了哪条（拿不到被引用内容时也留着，别让关系凭空消失）
+    reply_to_self: bool = False  # 被引用的是不是我自己说的（拿不到内容时的兜底判定）
     forward: list["ChatMessage"] = field(default_factory=list)
     forward_total: int = 0      # 转发原始条数（可能大于 forward 里的条数，因为做了截断）
     miniapp: str = ""           # 小程序卡片的标题/描述
@@ -233,22 +243,47 @@ def parse_event(
             time = now
 
     segments: list[Segment] = []
+    #: 上一个表情的 (原始 summary, 名字)。SnowLuma 会在表情后面再发一个同名
+    #: text 段当兜底，需要拿它来去重；收藏表情的 summary 是统称「[动画表情]」，
+    #: 名字是空的，所以两个都要留（见 :func:`_is_sticker_echo`）。
+    pending_sticker: tuple[str, str] | None = None
     for seg in event.get("message") or []:
         seg_type = str(seg.get("type") or "")
         data = seg.get("data") or {}
         if seg_type == "text":
-            segments.append(Segment("text", text=str(data.get("text") or "")))
+            body = str(data.get("text") or "")
+            if pending_sticker and _is_sticker_echo(body, *pending_sticker):
+                pending_sticker = None
+                continue
+            pending_sticker = None
+            segments.append(Segment("text", text=body))
         elif seg_type == "at":
             segments.append(Segment("at", qq=str(data.get("qq") or "")))
         elif seg_type == "image":
-            segments.append(
-                Segment("image", url=str(data.get("url") or ""), text=str(data.get("summary") or ""))
-            )
+            # 协议端把「收藏表情 / 商城表情」也放在 image 段里（SnowLuma 的
+            # sub_type=1/7、NapCat 的 emoji_id/key）。渲染成 [图片] 会让模型
+            # 以为有画面可看，还会去调 ocr_img 读一张表情包 —— 这里就地归类。
+            if image_kind(seg) == STICKER:
+                name = sticker_name(seg)
+                segments.append(
+                    Segment("mface", text=name, url=str(data.get("url") or ""))
+                )
+                pending_sticker = (str(data.get("summary") or ""), name)
+            else:
+                pending_sticker = None
+                segments.append(
+                    Segment("image", url=str(data.get("url") or ""), text=str(data.get("summary") or ""))
+                )
         elif seg_type == "file":
+            pending_sticker = None
             segments.append(Segment("file", text=str(data.get("name") or data.get("file") or "")))
         elif seg_type in ("mface", "marketface"):
-            # 商城表情包：summary 形如「[嘬嘬]」，留下名字，渲染时能显示出来
-            segments.append(Segment("mface", text=str(data.get("summary") or "")))
+            # 真·mface 段：summary 形如「[嘬嘬]」，名字留下，渲染时能显示出来
+            name = sticker_name(seg)
+            segments.append(
+                Segment("mface", text=name, url=str(data.get("url") or ""))
+            )
+            pending_sticker = (str(data.get("summary") or ""), name)
         elif seg_type == "reply":
             continue  # 引用关系单独存进 ChatMessage.quote
         elif seg_type == "forward":
@@ -256,6 +291,7 @@ def parse_event(
         elif seg_type == "json":
             continue  # 小程序/转发卡片由采集层识别
         elif seg_type:
+            pending_sticker = None
             segments.append(Segment(seg_type))
 
     # 拿不到 message 段时（部分历史接口只回 raw_message），退化成纯文本
@@ -269,6 +305,27 @@ def parse_event(
         segments=segments,
         miniapp=miniapp,
     )
+
+
+def _strip_brackets(value: str) -> str:
+    return (value or "").strip().strip("[]【】()（）").strip()
+
+
+def _is_sticker_echo(text: str, raw_summary: str, name: str) -> bool:
+    """这段文本是不是「表情后面那个同名回声」。
+
+    实测 SnowLuma：一个表情会产出两个段 —— ``image`` / ``mface``（``summary``
+    是表情名），紧跟一个 ``text``（就是那个名字本身）。不处理的话上下文里会渲染
+    成 ``[表情:emo][emo]``，名字出现两次，模型还可能把它当正文复述。NapCat 只给
+    图片段，没有这个问题。
+
+    要注意**收藏表情**的 ``summary`` 是统称 ``[动画表情]``（``name`` 为空），
+    所以两个都要比：只比名字会漏掉这一类，输出变成 ``[表情][动画表情]``。
+    """
+    body = _strip_brackets(text)
+    if not body:
+        return False
+    return body == _strip_brackets(raw_summary) or (name and body == name)
 
 
 # ══════════════════════════════════════════════════════════
@@ -299,9 +356,8 @@ def render_body(msg: ChatMessage, names: Optional[Mapping[str, str]] = None) -> 
         elif seg.type == "file":
             out.append(f"[文件 {seg.text}]" if seg.text else "[文件]")
         elif seg.type == "mface":
-            # 别人的表情包带上名字，模型才知道群里常用哪几个
-            name = re.sub(r"^[\[【(（]+|[\]】)）]+$", "", seg.text or "").strip()
-            out.append(f"[表情:{name}]" if name else "[表情]")
+            # 名字在解析时已经规整过（见 build_message 里的 sticker_name）
+            out.append(f"[表情:{seg.text}]" if seg.text else "[表情]")
         elif seg.type == "forward_card":
             out.append("[转发]")
         else:
@@ -335,10 +391,14 @@ def render_message(
     *,
     now: Optional[datetime] = None,
     limit: int = MAX_MESSAGE_CHARS,
+    addressee: str = "",
 ) -> str:
     """渲染一条消息（不含转发子消息展开）。
 
-    行格式：``时间 [message_id] 昵称(QQ,主人) 提及：正文　[回复 ...]``
+    行格式：``时间 [message_id] 昵称(QQ,主人) 提及：正文　[→谁]　[回复 ...]``
+
+    ``addressee`` 是行尾的指向标记（如 ``→张三``），只在正文看不出「这句冲谁说的」
+    时才给；@ 和引用已经写在正文里，不重复标。
     """
     names = names or {}
     head: list[str] = []
@@ -360,10 +420,16 @@ def render_message(
     else:
         line += "："
 
+    if addressee:
+        line += f"　{addressee}"
+
     if msg.quote and (msg.quote.summary or msg.quote.message_id):
         quote_who = msg.quote.sender.label(names)
         prefix = f"[{msg.quote.message_id}] " if msg.quote.message_id else ""
         line += f"　↳{prefix}{quote_who}：{clip(msg.quote.summary, MAX_QUOTE_CHARS)}"
+    elif msg.reply_to_id:
+        # 引用了但那条取不到（太早 / 已撤回 / 接口没回）：关系要留，内容如实说没有
+        line += f"　↳[{msg.reply_to_id}] 原消息已取不到"
     return line
 
 
@@ -405,6 +471,7 @@ class ChatContext:
     attention: str = ""                 # summon / about_me / ambient，由 messaging.attention 判定
     attention_evidence: str = ""        # 凭什么这么判（日志 / 调试用）
     interest_hits: list = field(default_factory=list)  # 命中的兴趣点（由插话服务填充）
+    aliases: tuple[str, ...] = ()       # Bot 的别名（判断「没 @ 但直呼其名」）
     max_history_messages: int = MAX_HISTORY_MESSAGES
     max_history_chars: int = MAX_HISTORY_CHARS
 
@@ -427,6 +494,9 @@ class ChatContext:
     @property
     def replies_to_me(self) -> bool:
         """当前消息是不是在回复/引用我的某条消息。"""
+        if bool(getattr(self.current, "reply_to_self", False)):
+            # 被引用那条的正文没取到，但缓存确认过它是 Bot 发的
+            return True
         quote = self.current.quote
         if not quote or not self.self_id:
             return False
@@ -490,6 +560,21 @@ class ChatContext:
         return "、".join(parts) or "无"
 
     # -------- 分块渲染 --------
+    def _addressee_marks(self, names: Mapping[str, str]) -> dict[str, str]:
+        """``message_id -> 行尾指向标记``；一次算好，历史和当前共用。"""
+        if self.chat_type != "group":
+            # 私聊只有两个人，谁对谁说不言自明，标记纯属噪音
+            return {}
+        try:
+            return addressee_markers(
+                [*self.history, self.current],
+                names,
+                self_id=self.self_id,
+                aliases=self.aliases,
+            )
+        except Exception:  # noqa: BLE001 - 推断失败就退化成不标
+            return {}
+
     def render_scene(self, names: Optional[Mapping[str, str]] = None) -> list[str]:
         names = names if names is not None else self.namebook()
         lines = ["<scene>"]
@@ -517,13 +602,19 @@ class ChatContext:
     def render_history(self, names: Optional[Mapping[str, str]] = None) -> list[str]:
         """按预算从最新往回挑，返回按时间正序的行（调用方自己套 <history> 标签）。"""
         names = names if names is not None else self.namebook()
+        marks = self._addressee_marks(names)
         picked: list[str] = []
         used = 0
         omitted = 0
         total = len(self.history)
         for index in range(total - 1, -1, -1):
             msg = self.history[index]
-            line = render_message(msg, names, now=self.now)
+            line = render_message(
+                msg,
+                names,
+                now=self.now,
+                addressee=marks.get(str(msg.message_id), ""),
+            )
             if picked and (
                 len(picked) >= self.max_history_messages or used + len(line) > self.max_history_chars
             ):
@@ -538,14 +629,50 @@ class ChatContext:
 
     def render_current(self, names: Optional[Mapping[str, str]] = None) -> list[str]:
         names = names if names is not None else self.namebook()
-        lines = [render_message(self.current, names, now=self.now, limit=MAX_CURRENT_CHARS)]
+        marks = self._addressee_marks(names)
+        lines = [
+            render_message(
+                self.current,
+                names,
+                now=self.now,
+                limit=MAX_CURRENT_CHARS,
+                addressee=marks.get(str(self.current.message_id), ""),
+            )
+        ]
         lines.extend(render_forward(self.current, names, now=self.now))
         return lines
 
+    def render_dialogue(self, names: Mapping[str, str] | None = None) -> list[str]:
+        """对话关系摘要：谁在说、最后一句是谁对谁。
+
+        只在这段对话确实有别人说话、且不是「一句对一句」的极短场景时才给，
+        免得每轮都塞两行废话。``<dialogue>`` 只描述关系，不描述内容。
+        """
+        names = names if names is not None else self.namebook()
+        if self.chat_type != "group":
+            return []  # 私聊不存在「你在旁听」这种局面
+        try:
+            view = describe_dialogue(
+                [*self.history, self.current],
+                names,
+                self_id=self.self_id,
+                aliases=self.aliases,
+            )
+        except Exception:  # noqa: BLE001
+            return []
+        if view.others < MIN_DIALOGUE_MESSAGES:
+            return []
+        return view.render()
+
     def render(self) -> str:
-        """完整上下文文本：场景 → 历史 → 当前消息。"""
+        """完整上下文文本：场景 → 对话关系 → 历史 → 当前消息。"""
         names = self.namebook()
         lines = self.render_scene(names)
+        dialogue = self.render_dialogue(names)
+        if dialogue:
+            lines.append("<dialogue>")
+            lines.extend(dialogue)
+            lines.append("</dialogue>")
         history = self.render_history(names)
         if history:
             lines.append("<history>")
@@ -555,6 +682,53 @@ class ChatContext:
         lines.extend(self.render_current(names))
         lines.append("</current>")
         return "\n".join(lines)
+
+    def render_increment(
+        self,
+        names: Optional[Mapping[str, str]] = None,
+        *,
+        since: str = "",
+    ) -> str:
+        """第一轮之后那几轮发的东西：``<at>`` + 补漏 + ``<current>``。
+
+        多轮对话靠前面已经发过的 messages 承接（见 ``agent/thread_turns.py``）。
+        这里**不能**再渲染 ``<scene>`` / ``<history>``：一重复，prompt 前缀每轮
+        都变，服务端缓存永远命中不了；而且同一批历史会在上下文里出现很多遍。
+
+        但群聊里 Bot 没参与的对话也必须补上：``since`` 是上一轮那条消息的 id，
+        比它新的历史放进 ``<since>`` —— 不然模型会「失忆」，看不到别人在它
+        没说话那段时间聊了什么。
+        """
+        names = names if names is not None else self.namebook()
+        lines = [f"<at>{self.now.strftime('%m-%d %H:%M')}</at>"]
+
+        missed = self._history_since(since, names)
+        if missed:
+            lines.append("<since>")
+            lines.extend(missed)
+            lines.append("</since>")
+
+        lines.append("<current>")
+        lines.extend(self.render_current(names))
+        lines.append("</current>")
+        return "\n".join(lines)
+
+    def _history_since(
+        self, since: str, names: Mapping[str, str]
+    ) -> list[str]:
+        """``since`` 之后的历史（多轮模式下补「我没参与的对话」）。"""
+        since = str(since or "").strip()
+        if not since:
+            return []
+        ids = [str(msg.message_id) for msg in self.history]
+        if since not in ids:
+            # 上一轮那条已经滚出窗口：宁可把窗口里现有的都带上，也别丢中间的
+            return [render_message(msg, names, now=self.now) for msg in self.history]
+        start = ids.index(since) + 1
+        return [
+            render_message(msg, names, now=self.now)
+            for msg in self.history[start:]
+        ]
 
     def render_history_only(self) -> str:
         return "\n".join(self.render_history())
@@ -577,13 +751,17 @@ class ChatContext:
 
         messages = [*self.history, self.current]
 
-        self_lines = read_self_position(messages, now=self.now).render()
+        # 先算局面：有没有人提问没人接，决定「我刚说完」这句要不要压制自己
+        pulse = read_pulse(messages, now=self.now, self_id=self.self_id)
+        self_lines = read_self_position(messages, now=self.now).render(
+            has_dangling_question=pulse.has_question
+        )
         if self_lines:
             lines.append("<me>")
             lines.extend(self_lines)
             lines.append("</me>")
 
-        pulse_lines = read_pulse(messages, now=self.now, self_id=self.self_id).render()
+        pulse_lines = pulse.render()
         if pulse_lines:
             lines.append("<pulse>")
             lines.extend(pulse_lines)
@@ -605,6 +783,44 @@ class ChatContext:
         lines.extend(self.render_current(names))
         lines.append("</tail>")
         return "\n".join(lines)
+
+    # -------- 转发卡片 --------
+    def forward_candidates(self) -> list[dict]:
+        """本轮上下文里可能存在的「合并转发 / 聊天记录卡片」。
+
+        顺序：引用 > 当前 > 历史（新的在前）。``read_forward`` 工具据此自动
+        定位要解析的卡片——主人往往隔几分钟才回头问「总结一下那个聊天记录」，
+        那时卡片已经沉到历史里了。
+
+        返回 ``[{"message_id": str, "where": str, "count": int}]``。
+        """
+        out: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(message_id: str, where: str, count: int) -> None:
+            mid = str(message_id or "").strip()
+            if not mid or mid in seen:
+                return
+            seen.add(mid)
+            out.append(
+                {"message_id": mid, "where": where, "count": int(count or 0)}
+            )
+
+        quote = self.current.quote
+        if quote is not None and quote.is_forward:
+            _add(quote.message_id, "quote", quote.forward_count)
+
+        current = self.current
+        current_total = current.forward_total or len(current.forward)
+        if current_total:
+            _add(current.message_id, "current", current_total)
+
+        for msg in reversed(self.history):
+            total = msg.forward_total or len(msg.forward)
+            if total:
+                _add(msg.message_id, "history", total)
+
+        return out
 
     # -------- 媒体 --------
     def image_sources(self) -> dict[str, list[str] | dict[str, list[str]]]:

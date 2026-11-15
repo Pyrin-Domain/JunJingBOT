@@ -18,32 +18,39 @@ from __future__ import annotations
 from datetime import datetime
 
 from core.anchors import anchor_kwargs, anchor_matches, anchor_of
+from core.logging import get_logger
 
 from .models import render_message
 
+log = get_logger("messaging.history")
+
 
 async def get_group_latest_msg(mp, group_id):
-    """取群里最新一条原始事件（断点用）。"""
+    """取后端返回的最新一条原始事件。
+
+    **不要用它判断「断点之后有没有新消息」**：不带游标时 SnowLuma 返回的是它
+    本地观测过的最新一条（``findLatestAuthoritativeSequence``），后端重启且关闭
+    登录历史同步时，那条正好等于断点本身，会把整段积压判成「无需回放」。
+    断点恢复改为从断点自己的游标往后翻，见 ``BotApp.recover_process``。
+    """
     await mp.ensure_connected()
     event = await mp.nc.get_group_msg_history(
         group_id=group_id, count=1, reverse_order=True
     )
     messages = event["data"]["messages"]
     if not messages:
-        print(f"[警告] 群 {group_id} 暂无消息或无法访问")
+        log.warning("[警告] 群 %s 暂无消息或无法访问", group_id)
         return None
     return messages[0]
 
 
 async def get_long_history_backward(mp, group_id, start_id, end_id):
     """从 ``start_id`` 往后翻到 ``end_id``（游标由后端决定）。"""
-    DEBUG = False
     remaining = 20  # 最大搜索 20 次
     part = []
-    DEBUG = True
     cursor = anchor_kwargs(message_seq=start_id, message_id=start_id)
     while remaining > 0:
-        DEBUG and print("reamaining = ", remaining)
+        log.debug("remaining=%s", remaining)
         await mp.ensure_connected()
         icl_history = await mp.nc.get_group_msg_history(
             group_id=group_id, **cursor
@@ -59,7 +66,6 @@ async def get_long_history_backward(mp, group_id, start_id, end_id):
         remaining -= 1
         if any(anchor_matches(item, end_id) for item in messages):
             return part
-    DEBUG and print("NotFind")
     return part
 
 
@@ -70,12 +76,11 @@ async def get_long_history_only_processor(mp, group_id, start_id, end_id, proces
     seq，SnowLuma 用 id，调用方不需要知道当前后端。
     """
     remaining = 200  # 最大搜索 200 次
-    DEBUG = True
 
     cursor = anchor_kwargs(message_seq=start_id, message_id=start_id)
 
     while remaining > 0:
-        print("reamaining = ", remaining)
+        log.debug("remaining=%s", remaining)
         await mp.ensure_connected()
         icl_history = await mp.nc.get_group_msg_history(
             group_id=group_id, **cursor
@@ -90,11 +95,11 @@ async def get_long_history_only_processor(mp, group_id, start_id, end_id, proces
         for item in messages:
             await processor(event=item, **params)
             if anchor_matches(item, end_id):
-                DEBUG and print("FIND")
+                log.debug("target found")
                 return
         if anchor_matches(last_msg, end_id):
             await processor(event=last_msg, **params)
-            DEBUG and print("FIND")
+            log.debug("target found")
             return
     return
 
@@ -108,10 +113,9 @@ async def get_long_history(mp, group_id, message_id, remaining: int):
     if remaining <= 0:
         return []
     part = []
-    DEBUG = True
     cursor = anchor_kwargs(message_seq=message_id, message_id=message_id)
     while remaining > 0:
-        DEBUG and print("reamaining = ", remaining)
+        log.debug("remaining=%s", remaining)
         await mp.ensure_connected()
         icl_history = await mp.nc.get_group_msg_history(
             group_id=group_id, **cursor
@@ -121,8 +125,7 @@ async def get_long_history(mp, group_id, message_id, remaining: int):
             break
         first = messages[0]
         cursor = anchor_of(first).as_kwargs()
-        DEBUG and print(messages)
-        DEBUG and print("cursor", cursor)
+        log.debug("cursor=%s", cursor)
         messages.pop(0)
         part = messages + part
         remaining -= 1
@@ -170,7 +173,7 @@ async def get_history_events(
         else:
             return []
     except Exception as e:
-        print(f"[上下文] 拉历史消息失败: {e}")
+        log.warning("[上下文] 拉历史消息失败: %s", e)
         return []
     return (res.get("data") or {}).get("messages") or []
 
@@ -241,13 +244,10 @@ async def get_history_msg(
 
 async def get_long_history_test(mp, event):
     """调试入口：``get_long_history`` 的薄封装（旧行为：只打印，不返回）。"""
-    DEBUG = False
-    DEBUG and print("enter History Debug")
     res = await get_long_history(
         mp, group_id=event["group_id"], message_id=event["message_id"], remaining=10
     )
-    DEBUG and print(res)
-    DEBUG and print("end")
+    log.debug("history debug result=%r", res)
 
 
 __all__ = [

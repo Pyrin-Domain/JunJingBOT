@@ -21,10 +21,21 @@ frontend/
          ├─ interject.js     # 群聊插话
          ├─ forward.js       # 搬运与去重
          ├─ image_forward.js # 图片批量转发字段
+         ├─ image_filter.js  # 图片过滤门（过滤器卡片 + 详情，内置三种模板）
          ├─ prompts.js       # 提示词与回复
-         ├─ keywords.js      # 关键词 / 命令
+         ├─ keywords.js      # 关键词 / 命令（命令为 key 的卡片 + 详情二级页面）
          └─ advanced.js      # 原始 JSON
 ```
+
+## 二级页面（master-detail）模式
+
+`agent.js` / `keywords.js` / `image_filter.js` 都是「卡片网格 → 点卡片进详情」
+的二级页面：模块级变量记录当前选中的 key（模型 id / 命令下标 / 过滤 id），
+渲染函数据此决定画目录还是画详情，点击后 `rerender(container)` 重画。
+编辑直接就地写回 `state.data`，保存时不需要从 DOM 收集。
+
+新增这类页面照抄 `image_filter.js`：`render(panel)` 建容器 → `renderTabContent()`
+按选中状态分发 → 详情页顶部放「← 返回」按钮。
 
 ## 方式一：由后端托管（推荐）
 
@@ -57,7 +68,8 @@ http://127.0.0.1:8080/?api=http://127.0.0.1:8390
 
 - `api` 参数指定后端地址，会存进 `localStorage`，下次不用再带；
 - 不填 `api` 时默认同源（即假定页面和 API 由同一个后端提供）；
-- 后端已经给 `/api/*` 加了 CORS 与 `OPTIONS` 预检，可以跨源调用。
+- 跨源访问要先在 `web_panel.cors_origins` 里加入
+  `http://127.0.0.1:8080`；白名单之外的前端会被拒绝。
 
 ## token
 
@@ -68,8 +80,9 @@ http://127.0.0.1:8390/?token=你的token
 http://127.0.0.1:8080/?api=http://127.0.0.1:8390&token=你的token
 ```
 
-`api.js` 依次从 `?token=` → `localStorage.panel_token` → `sessionStorage.panel_token`
-读取，并同时发送 `Authorization: Bearer` 与 `X-Panel-Token`（兼容旧后端）。
+`api.js` 从 `?token=` 读取后立刻从地址栏移除，只放进当前标签页的
+`sessionStorage`，不会写进 `localStorage`。请求同时发送
+`Authorization: Bearer` 与 `X-Panel-Token`（兼容旧后端）。
 
 ## 修改前端
 

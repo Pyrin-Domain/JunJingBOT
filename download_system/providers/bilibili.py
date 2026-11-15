@@ -1,6 +1,20 @@
 """B 站视频解析与下载。
 
-搬运自旧 ``Minitor/bili_info_processor.py``，行为保持：
+两条下载路径，按优先级：
+
+1. **新引擎** —— :class:`Extension.bilibilidownloadtool.BiliClient`，
+   即上游 ``NANblogink/bilibilidownloadtool`` 的无界面裁剪版。它负责
+   DASH 多码流解析、画质选择、分片并发 / 断点续传、多 CDN 回退、
+   音视频合流。这是默认路径。
+2. **旧引擎** —— 本文件下半部分的 ``_download_legacy``，来自旧
+   ``Minitor/bili_info_processor.py``。只在 Extension 加载失败（例如
+   依赖缺失）时兜底，行为与旧版一致，保证「至少能下个能播的」。
+
+链接提取、短链解析、标题 / 封面这些**轻量**能力仍然留在本文件（旧实现），
+因为它们被 ``messaging`` / ``media`` 在每条消息的卡片渲染里调用，不该为
+它们拉起 50 万字符的解析器。
+
+旧引擎的行为约束（保持不变）：
 
 - 支持普通视频页链接、``b23.tv`` 短链，识别 BV / av 号；
 - ``durl`` 优先（每个分段的 URL 依次拼接）；没有 ``durl`` 时取 dash 中
@@ -23,6 +37,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -45,9 +60,19 @@ DOWNLOAD_CHUNK_SIZE = 8192
 DEFAULT_TIMEOUT = 10
 STREAM_TIMEOUT = 30
 
+#: 指定登录 Cookie 的环境变量（优先级高于 ``data/bilibili/cookie.txt``）
+COOKIE_ENV = "JJ_BILI_COOKIE_FILE"
+
 
 class BilibiliProvider(BaseProvider):
     kind = "bilibili"
+
+    #: 机器人默认画质上限：1080P。再往上（4K / 8K）单文件几十上百 MB，
+    #: 群文件和服务端带宽都吃不消；需要时用 ``task.options["max_qn"]`` 放开。
+    DEFAULT_MAX_QN = 80
+
+    #: 默认编码偏好：H.264 在手机上兼容性最好，而且能直接 copy 不转码。
+    DEFAULT_CODEC = "h264"
 
     BILI_VIDEO_RE = re.compile(
         r"https?://(?:[A-Za-z0-9.-]+\.)?bilibili\.com/video/(?:BV[0-9A-Za-z]{10}|av\d+)"
@@ -597,6 +622,12 @@ class BilibiliProvider(BaseProvider):
         return str(local_path)
 
     # ── DownloadPool 入口 ────────────────────────────────────────
+    def __init__(self, *, client_factory=None) -> None:
+        self._client = None
+        self._client_error: str | None = None
+        self._client_lock = threading.Lock()
+        self._client_factory = client_factory
+
     async def download(
         self, task: DownloadTask, storage: DownloadStorage
     ) -> DownloadResult:
@@ -615,6 +646,43 @@ class BilibiliProvider(BaseProvider):
             except OSError:
                 pass
 
+    # ── 新引擎（Extension/bilibilidownloadtool） ──────────────────
+    @staticmethod
+    def _config_dir(storage: DownloadStorage) -> Path:
+        """上游配置 / Cookie 的存放目录：``<temp_dir 的父目录>/bilibili``。"""
+        return Path(storage.temp_dir).parent / "bilibili"
+
+    def _cookie_file(self, storage: DownloadStorage) -> Path | None:
+        """登录 Cookie：环境变量优先，其次 ``data/bilibili/cookie.txt``。"""
+        override = str(os.environ.get(COOKIE_ENV, "") or "").strip()
+        if override:
+            return Path(override).expanduser()
+        candidate = self._config_dir(storage) / "cookie.txt"
+        return candidate if candidate.is_file() else None
+
+    def _client_for(self, storage: DownloadStorage):
+        """惰性构造 BiliClient；失败原因只记一次，避免每条消息重试。"""
+        with self._client_lock:
+            if self._client is not None:
+                return self._client
+            if self._client_error:
+                raise RuntimeError(self._client_error)
+            try:
+                if self._client_factory is not None:
+                    client = self._client_factory(storage)
+                else:
+                    from Extension.bilibilidownloadtool import BiliClient
+
+                    client = BiliClient(
+                        config_dir=self._config_dir(storage),
+                        cookie_file=self._cookie_file(storage),
+                    )
+            except Exception as exc:  # noqa: BLE001 - 任何失败都退回旧引擎
+                self._client_error = f"{type(exc).__name__}: {exc}"
+                raise RuntimeError(self._client_error) from exc
+            self._client = client
+            return client
+
     def _download_sync(
         self, task: DownloadTask, storage: DownloadStorage
     ) -> DownloadResult:
@@ -627,6 +695,130 @@ class BilibiliProvider(BaseProvider):
         self._clear_dir(task_dir)
 
         resolved = self.resolve_video_url(source)
+
+        try:
+            client = self._client_for(storage)
+        except Exception as exc:  # noqa: BLE001 - 引擎不可用是「能力缺失」，不是「这片子下不了」
+            print(f"[B站下载] 新引擎不可用，回退旧引擎：{exc}")
+            return self._download_legacy(task, storage, resolved)
+
+        try:
+            return self._download_with_engine(
+                client, task, storage, source, resolved, task_dir
+            )
+        finally:
+            self._clear_dir(task_dir)
+
+    def _download_with_engine(
+        self,
+        client,
+        task: DownloadTask,
+        storage: DownloadStorage,
+        source: str,
+        resolved: str,
+        task_dir: Path,
+    ) -> DownloadResult:
+        options = task.options or {}
+        page = options.get("page") or options.get("p")
+        quality = options.get("quality", options.get("qn", "auto"))
+        prefer_codec = options.get("prefer_codec", self.DEFAULT_CODEC)
+        max_qn = options.get("max_qn", self.DEFAULT_MAX_QN)
+        if not max_qn:
+            max_qn = None  # 0 / "" / None 都表示不封顶
+
+        info = client.parse(resolved, page=page)
+        name = self._filename_for(task, info)
+        destination = self._destination(storage, task, name)
+
+        outcome = client.download(
+            resolved,
+            destination,
+            quality=quality,
+            page=page,
+            prefer_codec=prefer_codec,
+            max_qn=max_qn,
+            info=info,
+        )
+
+        for warning in outcome.warnings:
+            print(f"[B站下载] {outcome.title or resolved}：{warning}")
+
+        meta = {
+            "bvid": outcome.bvid,
+            "title": outcome.title,
+            "cover_url": outcome.cover,
+            "source_url": source,
+            "url": resolved,
+            "quality": outcome.quality,
+            "qn": outcome.qn,
+            "codecid": outcome.codecid,
+            "duration": outcome.duration,
+            "page": page,
+            "episodes": info.episode_count,
+            "is_vip": info.is_vip,
+            "has_audio": outcome.has_audio,
+            "engine": "bilibilidownloadtool",
+            "warnings": list(outcome.warnings),
+        }
+        return DownloadResult(
+            path=outcome.path,
+            size=outcome.size,
+            mime="video/mp4",
+            url=resolved,
+            meta=meta,
+        )
+
+    # ── 文件名 / 目标路径 ────────────────────────────────────────
+    @staticmethod
+    def sanitize_filename(name: str, *, limit: int = 80) -> str:
+        """把视频标题变成安全的文件名（Windows 非法字符 + 长度 + 折叠空白）。"""
+        text = str(name or "")
+        text = re.sub(r"[\x00-\x1f\x7f<>:\"/\\|?*]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" .")
+        if len(text) > limit:
+            text = text[:limit].rstrip(" .")
+        return text
+
+    def _filename_for(self, task: DownloadTask, info) -> str:
+        explicit = str((task.options or {}).get("filename") or "").strip()
+        if explicit:
+            name = explicit if Path(explicit).suffix else f"{explicit}.mp4"
+            return name
+        title = self.sanitize_filename(getattr(info, "title", "") or "")
+        if not title:
+            return f"bili_{int(time.time())}.mp4"
+        return f"{title}.mp4"
+
+    @staticmethod
+    def _unique_path(path: Path) -> Path:
+        """同名文件已存在时追加 ``_2`` / ``_3``，不覆盖上一次的下载。"""
+        if not path.exists():
+            return path
+        stem, suffix = path.stem, path.suffix
+        index = 2
+        while True:
+            candidate = path.with_name(f"{stem}_{index}{suffix}")
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    def _destination(
+        self, storage: DownloadStorage, task: DownloadTask, name: str
+    ) -> Path:
+        output_dir = (task.options or {}).get("output_dir")
+        if output_dir:
+            base = Path(str(output_dir)).expanduser() / Path(name).name
+        else:
+            base = storage.output_file(task, name)
+        return self._unique_path(base)
+
+    # ── 旧引擎（Extension 不可用时的兜底） ───────────────────────
+    def _download_legacy(
+        self, task: DownloadTask, storage: DownloadStorage, resolved: str
+    ) -> DownloadResult:
+        source = str(task.source or "").strip()
+        task_dir = storage.task_dir(task)
+        self._clear_dir(task_dir)
 
         video_info: dict[str, Any] = {}
         try:
@@ -651,7 +843,7 @@ class BilibiliProvider(BaseProvider):
         if not Path(name).suffix:
             name += suffix
 
-        output_dir = task.options.get("output_dir")
+        output_dir = (task.options or {}).get("output_dir")
         if output_dir:
             destination = Path(str(output_dir)).expanduser() / Path(name).name
         else:
@@ -676,6 +868,7 @@ class BilibiliProvider(BaseProvider):
                 "audio_url": audio_urls[0] if audio_urls else "",
                 "segments": len(video_urls),
                 "has_audio": bool(has_audio),
+                "engine": "legacy",
             }
             return DownloadResult(
                 path=destination,
@@ -690,5 +883,6 @@ class BilibiliProvider(BaseProvider):
 
 # 旧名字：``Minitor.bili_info_processor.BiliInfoProcessor`` 的迁移版本
 BiliInfoProcessor = BilibiliProvider
+
 
 __all__ = ["BilibiliProvider", "BiliInfoProcessor"]

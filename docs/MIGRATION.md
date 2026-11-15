@@ -21,7 +21,7 @@
 | `Minitor/NapCatTools.py` | `messaging/processor.py`、`history.py`、`forward.py`、`context_builder.py`、`media/` | 按职责拆 |
 | `Minitor/BOTMain.py` | `bot/app.py` + `bot/pipeline.py` + `bot/keyword.py` | 编排与业务分开 |
 | `Minitor/Commands.py` | `bot/commands/*` | 一个命令一个文件 |
-| `Minitor/ForwardService.py` | `bot/services/forward.py` + `media/service.py` | 搬运与媒体分离 |
+| `Minitor/ForwardService.py` | `bot/services/forward/` + `media/service.py` | 搬运与媒体分离 |
 | `Minitor/forward_dedup.py` | `bot/services/dedup.py` | **算法与 schema 不变** |
 | `Minitor/forward_dedup_rebuild.py` | `bot/services/dedup_rebuild.py` | |
 | `Minitor/RangeTaskService.py` | `bot/services/range_task.py` | |

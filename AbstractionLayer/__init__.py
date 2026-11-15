@@ -34,6 +34,13 @@
 from __future__ import annotations
 
 from .cursor import MessageCursor, as_int, same_value
+from .face import (
+    CustomFace,
+    CustomFaceLibrary,
+    CustomFaceService,
+    fetch_custom_faces,
+    normalize_face_key,
+)
 from .forward import (
     ForwardEntry,
     ForwardExpander,
@@ -41,7 +48,7 @@ from .forward import (
     extract_forward_id,
     forward_count_from_card,
 )
-from .history import HistoryPage, HistoryPager, WalkResult
+from .history import HistoryPage, HistoryPager, ReplayResult, WalkResult
 from .kernal import (
     BACKEND_PRESETS,
     DEFAULT_ENDPOINTS,
@@ -57,14 +64,27 @@ from .kernal import (
     capabilities_for,
     default_token,
 )
+from .segments import (
+    OTHER,
+    PHOTO,
+    STICKER,
+    has_photo,
+    image_kind,
+    is_photo,
+    iter_photos,
+    photo_urls,
+    sticker_name,
+)
 from .relay import (
     ForwardRelay,
     RelayContent,
     RelayPlan,
     build_node,
+    has_empty_resid_multimsg,
     has_nested_forward,
     has_opaque_nested,
     is_opaque_multimsg,
+    multimsg_resid_of,
     plan_relay,
     segments_of,
     titles_of_multimsg,
@@ -75,6 +95,9 @@ __all__ = [
     "BACKEND_PRESETS",
     "BackendCapabilities",
     "CallableTransport",
+    "CustomFace",
+    "CustomFaceLibrary",
+    "CustomFaceService",
     "DEFAULT_ENDPOINTS",
     "ForwardEntry",
     "ForwardExpander",
@@ -86,10 +109,14 @@ __all__ = [
     "HttpTransport",
     "MessageCursor",
     "NAPCAT",
+    "OTHER",
     "OneBotKernel",
+    "PHOTO",
     "RelayContent",
     "RelayPlan",
+    "ReplayResult",
     "SNOWLUMA",
+    "STICKER",
     "Transport",
     "WalkResult",
     "as_int",
@@ -97,10 +124,20 @@ __all__ = [
     "capabilities_for",
     "default_token",
     "extract_forward_id",
+    "fetch_custom_faces",
     "forward_count_from_card",
+    "has_empty_resid_multimsg",
     "has_nested_forward",
     "has_opaque_nested",
+    "has_photo",
+    "image_kind",
     "is_opaque_multimsg",
+    "multimsg_resid_of",
+    "is_photo",
+    "iter_photos",
+    "normalize_face_key",
+    "photo_urls",
+    "sticker_name",
     "plan_relay",
     "titles_of_multimsg",
     "same_value",

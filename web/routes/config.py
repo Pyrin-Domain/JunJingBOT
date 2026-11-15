@@ -25,8 +25,11 @@ from . import extract_data, json_response, read_body, server_of
 APPLIED_SECTIONS: tuple[str, ...] = (
     "keyword_actions",
     "auto_forward",
+    "forward_image_dedup",
     "image_forward",
+    "export",
     "jm",
+    "psychology",
     "prompts",
     "replies",
     "master_qq",
@@ -34,6 +37,7 @@ APPLIED_SECTIONS: tuple[str, ...] = (
     "message.extraconfig",
     "agent",
     "interject",
+    "thread_memory",
 )
 
 

@@ -37,6 +37,26 @@ from .models import (
 from .thread_history import merge_history
 
 
+def _forward_meta(event) -> tuple[bool, int]:
+    """这条原始事件是不是「合并转发 / 聊天记录卡片」；是的话返回 (True, 条数)。
+
+    卡片消息的正文被 :func:`parse_event` 丢掉了（转发段直接跳过），渲染出来
+    只是一串 ``[CQ:forward,id=...]``——模型看不出那是一张能展开的卡片。这里
+    补一个显式标记，``read_forward`` 工具和摘要渲染都靠它。
+    """
+    try:
+        if check_is_old_forward(event) or check_is_multimsg_forward(event):
+            return True, _forward_count_from_card(event)
+    except Exception:  # noqa: BLE001 - 认不出卡片就当普通消息
+        pass
+    return False, 0
+
+
+def _forward_summary(count: int) -> str:
+    """卡片消息的摘要；渲染得跟当前消息里的写法一致，模型才认得出。"""
+    return f"【转发聊天记录 {count} 条】" if count else "【转发聊天记录】"
+
+
 async def collect_message(
     mp,
     event,
@@ -82,6 +102,10 @@ async def collect_message(
 
     reply_id = mp.is_reply(event)
     if reply_id and expand_quote:
+        # 引用了哪条先记下来：取不到内容时渲染成占位，也不至于让「在回谁」凭空消失。
+        # 转发里的子消息（expand_quote=False）是快照，不给占位，免得满屏「已取不到」。
+        msg.reply_to_id = str(reply_id)
+    if reply_id and expand_quote:
         getter = getattr(mp, "_get_message_event", None)
         quoted = (
             await getter(reply_id, cache)
@@ -92,11 +116,18 @@ async def collect_message(
             quoted_msg = parse_event(
                 quoted, self_id=resolved_self_id, master_ids=master_ids, now=now
             )
+            is_forward, forward_count = _forward_meta(quoted)
             msg.quote = Quote(
                 message_id=str(reply_id),
                 sender=quoted_msg.sender,
-                summary=message_summary(quoted_msg),
+                summary=(
+                    _forward_summary(forward_count)
+                    if is_forward
+                    else message_summary(quoted_msg)
+                ),
                 images=quoted_msg.images,
+                is_forward=is_forward,
+                forward_count=forward_count,
             )
 
     if depth == 0:
@@ -187,18 +218,30 @@ async def build_chat_context(
     current = await collect_message(mp, event, master_ids=master_ids, now=now)
     store = mp.thread_history_store() if history is None else None
     thread_id = mp.thread_id_of(event)
-    if store is not None and current.quote is None:
-        # 历史接口取不到被引用的那条（或已过期）→ 用缓存补上摘要，
-        # 这样「对方是不是在回我」在 Agent 侧还能判出来
+    if store is not None:
         reply_id = mp.is_reply(event)
-        quoted = store.find(thread_id, reply_id) if reply_id else None
-        if quoted is not None:
-            current.quote = Quote(
-                message_id=str(reply_id),
-                sender=quoted.sender,
-                summary=message_summary(quoted),
-                images=quoted.images,
-            )
+        if current.quote is None and reply_id:
+            # 历史接口取不到被引用的那条（或已过期）→ 用缓存补上摘要，
+            # 这样「对方是不是在回我」在 Agent 侧还能判出来
+            quoted = store.find(thread_id, reply_id)
+            if quoted is not None:
+                cached_total = quoted.forward_total or len(quoted.forward)
+                current.quote = Quote(
+                    message_id=str(reply_id),
+                    sender=quoted.sender,
+                    summary=(
+                        _forward_summary(cached_total)
+                        if cached_total
+                        else message_summary(quoted)
+                    ),
+                    images=quoted.images,
+                    is_forward=bool(cached_total),
+                    forward_count=cached_total,
+                )
+        if reply_id and current.quote is None and store.is_bot_message(thread_id, reply_id):
+            # 缓存确认那条是 Bot 发的，但内容已经取不到：留个布尔兜底，
+            # 「引用我」这个结论不能因为摘要缺失就丢掉。
+            current.reply_to_self = True
     context = ChatContext(
         chat_type=str(event.get("message_type") or "group"),
         group_id=str(event.get("group_id") or ""),
@@ -209,6 +252,7 @@ async def build_chat_context(
         history=historical,
         current=current,
         note=note_text,
+        aliases=tuple(str(x) for x in (aliases or ()) if str(x)),
     )
 
     # 注意力等级在这里定一次：pipeline 用它决定进不进 AI，插话器用它决定让不让开。

@@ -26,7 +26,8 @@ export function renderPanelConfigCard() {
       renderField({ path: 'web_panel.enable', label: '启用参数面板', type: 'bool' }),
       renderField({ path: 'web_panel.host', label: '监听地址', type: 'text', hint: '默认 127.0.0.1，只允许本机访问' }),
       renderField({ path: 'web_panel.port', label: '监听端口', type: 'number' }),
-      renderField({ path: 'web_panel.token', label: '访问 token', type: 'text', hint: '留空表示不需要；监听非本机地址时强烈建议设置' }),
+      renderField({ path: 'web_panel.token', label: '访问 token', type: 'text', hint: '监听非本机地址时必填；本机访问可留空' }),
+      renderField({ path: 'web_panel.cors_origins', label: '允许跨源的页面地址', type: 'strlist', full: true, hint: '通常留空。只有前端单独部署时才填，例如 https://panel.example.com；不要填 *，除非明确要允许任意网站调用 API' }),
     ]),
     el('div', { class: 'hint', text: wp.token ? '当前已设置 token，浏览器需通过 ?token=xxx 打开面板' : '当前未设置 token' }),
   ]);

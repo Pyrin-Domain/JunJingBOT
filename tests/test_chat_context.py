@@ -49,7 +49,13 @@ def _at(qq):
 
 
 def _image(url="https://multimedia.nt.qq.com.cn/download?fileid=very-long-signature"):
-    return {"type": "image", "data": {"url": url, "summary": "[动画表情]"}}
+    # 真实普通图片：sub_type=0、summary="[图片]"（SnowLuma / 新版 NapCat）
+    return {"type": "image", "data": {"url": url, "summary": "[图片]", "sub_type": 0}}
+
+
+def _sticker(name="[呜呜]", url="https://multimedia.nt.qq.com.cn/download?fileid=sticker"):
+    """SnowLuma 的商城表情：image 段 + sub_type=7 + summary 是表情名。"""
+    return {"type": "image", "data": {"url": url, "summary": name, "sub_type": 7}}
 
 
 def _msg(mid, qq, name, text, ts=NOW, is_self=False, is_master=False, quote=None, forward_total=0):
@@ -120,6 +126,115 @@ def test_image_is_placeholder_not_url():
     line = render_message(msg, now=NOW)
     assert line.endswith("：[图片]")
     assert "multimedia" not in line  # URL 长且只有 OCR 用得上，不能塞进正文
+
+
+# ── 表情 ≠ 图片（模型要看得出「这是表情包，不是照片」）──────────
+def test_animated_sticker_is_not_rendered_as_image():
+    """收藏表情：sub_type=1、summary 是统称「[动画表情]」，没有可用的名字。"""
+    msg = parse_event(
+        _event(7, MASTER_ID, "Pyrin", [{"type": "image", "data": {
+            "url": "https://x/s.gif", "summary": "[动画表情]", "sub_type": 1,
+        }}]),
+        self_id=SELF_ID,
+        master_ids=[MASTER_ID],
+        now=NOW,
+    )
+    assert render_body(msg) == "[表情]"
+    # 表情的 URL 不该进 OCR 的图片池：它没有可读的文字
+    assert msg.images == []
+
+
+def test_market_sticker_keeps_its_name():
+    msg = parse_event(
+        _event(8, MASTER_ID, "Pyrin", [_sticker("[呜呜]")]),
+        self_id=SELF_ID,
+        master_ids=[MASTER_ID],
+        now=NOW,
+    )
+    assert render_body(msg) == "[表情:呜呜]"
+    assert msg.images == []
+
+
+def test_napcat_sticker_without_sub_type_is_still_a_sticker():
+    """NapCat 的商城表情没有 sub_type，只有 emoji_id / key。"""
+    msg = parse_event(
+        _event(9, MASTER_ID, "Pyrin", [{"type": "image", "data": {
+            "url": "https://x/s.gif",
+            "summary": "[唤马]",
+            "emoji_id": "d22af9",
+            "key": "k",
+        }}]),
+        self_id=SELF_ID,
+        master_ids=[MASTER_ID],
+        now=NOW,
+    )
+    assert render_body(msg) == "[表情:唤马]"
+    assert msg.images == []
+
+
+def test_sticker_echo_text_is_dropped():
+    """SnowLuma 的商城表情会额外附一个同名 text 段（NapCat 不会）。
+
+    不处理的话上下文里是 ``[表情:emo][emo]``：名字出现两次，模型还可能复述它。
+    """
+    msg = parse_event(
+        _event(11, MASTER_ID, "Pyrin", [
+            {"type": "image", "data": {
+                "url": "https://x/s.gif", "summary": "[emo]",
+                "sub_type": 0, "emoji_id": "x",
+            }},
+            _text("[emo]"),
+        ]),
+        self_id=SELF_ID,
+        master_ids=[MASTER_ID],
+        now=NOW,
+    )
+    assert render_body(msg) == "[表情:emo]"
+
+
+def test_custom_face_echo_is_dropped_even_without_a_name():
+    """收藏表情的 summary 是统称「[动画表情]」，名字为空。
+
+    只比名字会漏掉这一类，输出变成 ``[表情][动画表情]``（名字以纯文本再出现一次）。
+    """
+    msg = parse_event(
+        _event(13, MASTER_ID, "Pyrin", [
+            {"type": "image", "data": {
+                "url": "https://x/s.gif", "summary": "[动画表情]", "sub_type": 1,
+            }},
+            _text("[动画表情]"),
+        ]),
+        self_id=SELF_ID,
+        master_ids=[MASTER_ID],
+        now=NOW,
+    )
+    assert render_body(msg) == "[表情]"
+
+
+def test_text_after_sticker_that_is_not_the_name_is_kept():
+    msg = parse_event(
+        _event(12, MASTER_ID, "Pyrin", [_sticker("[嘬嘬]"), _text("笑死")]),
+        self_id=SELF_ID,
+        master_ids=[MASTER_ID],
+        now=NOW,
+    )
+    assert render_body(msg) == "[表情:嘬嘬]笑死"
+
+
+def test_photo_and_sticker_mixed_keep_order_and_differ():
+    msg = parse_event(
+        _event(10, MASTER_ID, "Pyrin", [
+            _text("看这个"),
+            _image("https://x/photo.png"),
+            _sticker("[嘬嘬]"),
+            _text("笑死"),
+        ]),
+        self_id=SELF_ID,
+        master_ids=[MASTER_ID],
+        now=NOW,
+    )
+    assert render_body(msg) == "看这个[图片][表情:嘬嘬]笑死"
+    assert msg.images == ["https://x/photo.png"]
 
 
 def test_quote_is_one_line_summary():

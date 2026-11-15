@@ -11,7 +11,11 @@ from __future__ import annotations
 import asyncio
 import re
 
+from core.logging import get_logger
+
 __all__ = ["get_music", "GetMusic"]
+
+log = get_logger("bot.commands.music")
 
 
 async def _send_record(handler, event, url: str) -> None:
@@ -29,10 +33,10 @@ async def _fallback_music(handler, event, query: str) -> None:
 
         res = await asyncio.to_thread(search_and_resolve_first_song, query)
     except Exception as exc:
-        print(f"[GetMusic] 解析失败: {exc}")
+        log.warning("解析 %r 失败: %s", query, exc)
         return
     url = str((res or {}).get("music_url") or "")
-    print(f"[GetMusic] query={query}, url={url}")
+    log.info("query=%r, url=%s", query, url)
     if not url:
         return
     await _send_record(handler, event, url)

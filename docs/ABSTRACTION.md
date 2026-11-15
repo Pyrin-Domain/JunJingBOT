@@ -154,6 +154,17 @@ SnowLuma 必须靠内层 id 再发包。同一个转发两边叶子数相同（3
 > SnowLuma 的 forward id 是长 base64 串（含 `+ / =`，76 字符），
 > 截断或二次编码会得到 `download forward message payload is empty`。
 
+#### `get_msg` 只认外层消息 id
+
+`get_msg`（取单条消息）**只认外层**——就是群里那条消息自己的 id。聊天记录里的
+**内层**消息 id（`get_forward_msg` 展开出来的那 6 条）拿去 `get_msg`，两端都是
+`retcode=100`「message not found」；拿去 `get_forward_msg` 也取不到（SnowLuma 报
+"download forward message payload is empty"，NapCat 报「消息已过期或者为内层消息」）。
+
+所以凡是要「回头找到原来那条消息」的逻辑（审计群复搬靠标签文本里的 id 反查原消息），
+**存的必须是外层 id**。SnowLuma 的 message_id 还可能是负数（int64 回绕，实测出过
+`-2133034063`），解析正则必须允许负号。
+
 ### 1.8 搬运：「聊天记录套聊天记录」跨群时会坏
 
 把一张「外层 5 条、其中第 1 条本身又是一张聊天记录」的卡片搬到**另一个群**，
@@ -192,9 +203,26 @@ NTQQ 也只能渲染成 `[XML消息]`。
 结论：
 
 - 内层是 `forward` 段 → 整卡搬即可（两个后端都会按目标会话重建 resid）；
-- 内层是 `xml/json` 死卡 → 一律重建，把 `<title>` 摘要内联成嵌套 node，
-  自包含、不引用源会话临时文件。`RelayContent.lossy` 会标出这次有损；
-- 想**保住图**，只能在源会话缓存还没失效时就搬（那时能 `get_forward_msg` 到真内容）。
+- 内层是 `xml/json` 死卡，按 `m_resid` 分两种：
+
+| `m_resid` | 能不能拿到内容 | 做法 |
+|---|---|---|
+| **为空** | 不能。只剩 `<title>` 摘要，连子消息 id 都没有 | **不搬**（`RelayPlan.action == "skip"`）。重建只能把摘要伪装成一条正常记录，接收方会以为看到的就是原内容 |
+| **非空** | 不能直接读，但有 id 可追 | 重建：把 `<title>` 摘要内联成嵌套 node，自包含、不引用源会话临时文件。`RelayContent.lossy` 标出这次有损 |
+
+`m_resid` 的取法有坑：**xml 段只有 `m_resid` 属性算入口**，同层 `data.resid` 是
+`serviceID`（实测恒为 `35`），拿去 `get_forward_msg` 只会得到
+`download forward message payload is empty`。json 段（`com.tencent.multimsg`）的
+resid 在 `meta.detail.resid`。判定函数：`AbstractionLayer.relay.multimsg_resid_of()`。
+
+反过来说，想**保住图**只有一条路：趁源会话缓存还没失效时就搬（那时
+`get_forward_msg` 还能拿到真内容）。缓存一失效，剩下的就只有摘要。
+
+跳过的日志长这样（`bot/services/forward/service.py`）：
+
+```
+[INFO] 不搬这张卡片：内层聊天记录卡的 m_resid 为空，只剩 <title> 摘要、没有可展开的子消息 id，搬过去也不完整，按策略不搬（目标 1054955587）
+```
 
 #### 为什么 NTQQ 自己的转发就能做到
 
@@ -224,6 +252,22 @@ NTQQ 客户端从来不做「把这张卡再发一遍」这件事，它做的是
 > 'D:\Code\snowluna\A20F5ABF….jpg'` —— 说明 OneBot 的 `file` 字段是**本地路径**语义，
 > 重建时 `url` 必须保留，由发送端下载后重新上传。
 
+### 1.9 断点恢复：两个后端必须走相反方向
+
+| | NapCat | SnowLuma |
+|---|---|---|
+| 无游标取「最新一条」 | 服务端真·最新 | 可能是**本地观测过**的最新（关闭登录历史同步时） |
+| `message_id` 跨重启 | **会变**（每次重启重新分配） | 稳定（`SHA1(sequence:group:event)` 的 int32） |
+| 恢复方向 | 先取最新，再**往回**翻到断点 | 从断点**往后**翻 |
+| 依据 | `history_latest_is_authoritative=True` | `history_latest_is_authoritative=False` |
+
+这两个条件正好互补：NapCat 的「最新」可信但断点里的 id 不可信，所以必须用
+现取的 id 当游标；SnowLuma 的 id 可信但「最新」不可信，所以必须用断点当游标。
+
+方向判断和翻页循环都在 `HistoryPager.replay()` 里：**给不给 `latest` 就是方向**
+（给了 → 从最新往回翻；没给 → 从断点往后翻）。`bot/app.py` 只做剩下两件业务上的
+事——按「新 → 旧」回放（遇到 Bot 自己的消息就停）和推进断点，不再自己写循环。
+
 ---
 
 ## 2. 抽象层怎么用
@@ -235,10 +279,16 @@ kernel = OneBotKernel.http("http://127.0.0.1:3210", token, backend="snowluma")
 await kernel.detect(group_id=20010)      # 运行时实测，不靠猜版本
 
 pager = HistoryPager(kernel)
+
+# 断点回放：方向由「给不给 latest」决定，业务层不用判断后端
+result = await pager.replay(group_id, checkpoint=checkpoint_event)          # 从断点往后翻
+result = await pager.replay(group_id, checkpoint=checkpoint_event, latest=latest_event)  # 从最新往回翻
+# result.messages  断点之后的消息，升序，直接回放（不含断点本身）
+# result.found     是否真的找到断点（往回翻时才有意义）
+# result.reason    提前收尾的原因：游标没前进 / 字段不对 / 接口报错
+
+# 只想翻一段、自己控制循环时用 walk
 walk = await pager.walk(group_id, stop_at=checkpoint_event, count=20)
-# walk.messages  断点之后的消息，升序，直接回放
-# walk.found     是否真的找到断点
-# walk.reached_start  是否翻到历史起点（SnowLuma 入群前的历史不存在时会出现）
 
 expander = ForwardExpander(kernel)
 expansion = await expander.expand(forward_id)
@@ -248,6 +298,7 @@ relay = ForwardRelay(kernel)
 plan = plan_relay(kernel.capabilities, messages)
 content = await relay.collect(forward_id)      # 或 collect(messages=已拉好的)
 # plan.needs_rebuild  这次该不该整卡搬
+# plan.skip           按策略不搬（内层多消息卡 m_resid 为空，内容拿不全）
 # content.nodes       可直接交给 send_group_forward_msg
 # content.lossy       内层有没有只能降级成摘要的卡片
 ```
@@ -270,7 +321,11 @@ kernel = OneBotKernel(CallableTransport(bot.api._call_api), capabilities=NAPCAT)
 4. 单页条数自动夹到后端上限；
 5. `is_reserve` 只在后端真支持时才发（两个后端都不支持）；
 6. 游标字段不对时**直接拒发**并报错，而不是改发另一个字段；
-7. 后端忽略了游标（返回方向不对）时**报错**，不静默继续翻。
+7. 后端忽略了游标（返回方向不对）时**报错**，不静默继续翻；
+8. 游标连续 `stall_limit`（默认 2）页不前进就收尾，不硬翻满 `max_pages`。
+
+`HistoryPager.replay` 额外保证：断点**本身不出现**在结果里，且结果已按身份去重
+（跨页重复不会回放两遍）。
 
 `ForwardExpander` 保证：内联优先、没内联才发包、`max_depth` / `max_items` /
 `visited` 三重防递归、既没内联也发不了包时留占位而不是崩。
@@ -280,8 +335,9 @@ kernel = OneBotKernel(CallableTransport(bot.api._call_api), capabilities=NAPCAT)
 ```python
 cursor = MessageCursor.from_message(message)
 cursor.real_seq       # 全局序号（NapCat 取 real_seq，SnowLuma 取 message_seq）
+cursor.real_id        # NapCat 的服务端消息 id：重启后仍指向同一条，断点靠它认
 cursor.message_id     # 后端本地哈希，跨后端不可比
-cursor.matches(other) # 优先比 real_seq，其次 message_id
+cursor.matches(other) # 优先比 real_seq，其次 real_id，再次 message_id
 ```
 
 实测：同一批消息两边 `message_id` 0/8 一致、`message_seq` 0/8 一致，
@@ -309,12 +365,106 @@ api.history_anchor              # 实发值：实测优先，测不出来才回�
 1. 进循环前 `await api.verify_history_cursor(group_id)`（探测失败只警告，不阻塞恢复）；
 2. 锚点改为**按身份剔除**，新游标取本页最旧那条，并加「游标不前进就停」保护。
 
+往回翻时 `replay` 会剔除起翻用的 `latest`（锚点永远 exclusive），但`latest`
+**本身可能也是断点之后才到的消息**。`recover_process` 会把它补回来：
+
+```python
+# latest 不等于断点、也不在已收集的结果里 -> 追加到最末尾（它是最新的）
+# 例外：latest 是 Bot 自己发的 -> 不回放，也不推进断点（可能已经处理过）
+```
+
+不补的话有个静默丢消息的坑：找到断点后断点会被推进到 `latest`，于是这条再也
+不会被回放（旧实现就是这样）。
+
 端到端实测（故意把两边配置写反）：
 
 ```text
 napcat:   配置=message_id    实测=message_seq   -> 实发游标字段=['message_seq']
 snowluma: 配置=message_seq   实测=message_id    -> 实发游标字段=['message_id']
 ```
+
+### 2.4 媒体发送：回退顺序也是能力
+
+群文件上传失败时该改发什么，两个后端不一样，所以顺序不写在业务代码里：
+
+```python
+# AbstractionLayer/kernal.py
+media_send_order    = ("file", "video")   # "file"=群文件, "video"=视频消息（NTV2）
+media_retry_times   = 1                   # 同一通道先重试几次
+media_retry_delay   = 1.0                 # 每次重试前等几秒
+video_max_bytes     = 100 * 1024 * 1024   # 超过就不试 video 通道，直接报错走链接兜底
+
+# 普通文件（PDF / ZIP）没有 video 段可退，失败后改走闪传：
+file_send_order     = ("file", "flash")   # "flash"=create_flash_task + send_flash_msg
+flash_fileset_path  = "fileset_id"        # 从响应 data 里取 fileset id 的点分路径
+```
+
+`media/service.py:send_video_file` 按这张表循环，业务层只表达“要发一个视频”：
+
+```python
+await media.send_video_file(event, path)   # 内部：按 caps.media_send_order 逐个通道试
+```
+
+`bot/commands/jm.py` 对普通文件同理，按 `caps.file_send_order` 循环：文件通道带头退避重试，
+失败再走闪传（QQ 的独立文件集服务，与群文件配额互不影响）。闪传的返回结构两个后端不一样：
+SnowLuma 是 `data.fileset_id`，NapCat 透传内核结构 `data.createFlashTransferResult.fileSetId`，
+所以取哪个字段由 `flash_fileset_path` 决定；未知后端（`GENERIC`）保守地只走 `("file",)`。
+
+实测依据（2026-11-01，同一个 30.2 MB PDF、同一个测试群）：
+
+```text
+{"type":"file","data":{"file": pdf}}                 -> retcode=100, code=-134，0.6s
+{"type":"file","data":{"file": pdf,"name":"a.pdf"}}  -> retcode=0，1.2s
+```
+
+`-134` 在 QQ 的 `UploadGroupFileRequest` 阶段就返回，字节根本没开始传，所以
+不是网络 / 大小 / 风控问题，而是 **file 段缺 `name`**。SnowLuma 只凭 `file`
+构造请求；NapCat 本来就把 `name` 当可选显示名。补名字统一放在抽象层：
+
+```python
+# AbstractionLayer/segments.py
+normalize_outgoing(message)   # 给 file 段补 name（从本地路径 / URL 推断）
+# transport/api.py:_call_api
+# send_group_msg / send_private_msg 的 message 自动过一遍 normalize_outgoing
+```
+
+因此业务层照旧只写 `{"type":"file","data":{"file": path}}`，两个后端都兼容。
+补完 `name` 后，JM 的群文件一次成功，重试和闪传只是真正的兜底。
+
+新增后端时如果它还有第三种通道，在 `MediaService._send_segment` 里加一个分支 +
+一个 `media_send_order` 取值即可，不用改调用方。
+
+### 2.5 失败可见性：`strict_actions`
+
+OneBot 的响应可能是 `{"status":"ok","retcode":-134}` —— 这个形状**必须**当失败：
+
+```python
+# AbstractionLayer/kernal.py
+MUTATING_ACTIONS = frozenset({
+    "send_group_msg", "send_private_msg",
+    "send_group_forward_msg", "send_private_forward_msg",
+    "forward_group_single_msg", "forward_friend_single_msg",
+    "create_flash_task", "send_flash_msg",  # 闪传：上传 + 发卡片
+    "group_poke", "friend_poke",          # 戳一戳按会话分成两个 action
+    "delete_msg", "set_group_ban", "set_msg_emoji_like",
+})
+```
+
+`OneBotAPI._call_api` 是唯一的收口：动作在这张表里就 `ensure_ok`，否则原样返回。
+
+```python
+await api.send_group_message(...)        # retcode != 0 -> OneBotAPIError
+await api.get_group_list()               # retcode != 0 -> 原样返回，不抛
+```
+
+为什么不一刀切：`get_*` 的失败是**正常业务**（消息撤回了、查不到陌生人），
+抛异常会让上层到处 try/except；而 `send_*` / `forward_*` 失败不会自己重来，
+也没人补发，静默就是丢消息。
+
+改动前实际踩过：SnowLuma 群文件上传返回 `retcode=-134`，旧代码当成功，于是
+既不重试，也不会退化成「发下载链接」——用户什么也收不到。
+
+**新增有副作用的动作时，把它加进 `MUTATING_ACTIONS`。** 否则失败仍然是静默的。
 
 ---
 
@@ -329,11 +479,77 @@ python -m AbstractionLayer.cli history --backend napcat --count 10
 python -m AbstractionLayer.cli recover --backend snowluma --from seq:220 --count 5
 python -m AbstractionLayer.cli forward --backend napcat --id 7700868210009142942
 python -m AbstractionLayer.cli forward --backend snowluma --message 1753375808
+python -m AbstractionLayer.cli face    --backend snowluma              # 列出收藏表情
+python -m AbstractionLayer.cli face    --backend napcat --send 不够色情 --group 20010
 python -m AbstractionLayer.cli call    --backend napcat --action get_login_info
 ```
 
 游标写法：`seq:184`（全局序号，只能用于比对）、`id:501493501`、
 `raw:184`（原始 `message_seq`）、裸数字（= 全局序号）。
+
+---
+
+## 3.1 收藏表情（账号自定义表情）
+
+实测于 2026-11-01，NapCat `:3000` / SnowLuma `:3210`，同一个测试群 `1132313813`。
+
+### 两个后端给的数据不一样
+
+`fetch_custom_face_detail` 的返回：
+
+| 字段 | SnowLuma | NapCat |
+|---|---|---|
+| `emoji_id` | ✅（= `resId`） | ❌ **没有这个字段** |
+| `resId` | ✅ | ✅ |
+| `url` / `md5` | ✅ | ✅ |
+| `desc`（用户备注） | ✅ | ✅ |
+| `uin` / `emoId` | ❌ | ✅（账号内序号） |
+| `emoPath` / `thumbPath` | ❌ | ✅（本地路径，可能不存在） |
+
+**主键用 `desc`（用户自己写的备注）**，因为它跨账号稳定：同一个表情在两个账号上
+`md5` 与 `desc` 完全一致，但 `emoji_id` / `resId` 带的是**各自的 uin 前缀**
+（`3122793026_0_0_0_<MD5>_0_0` vs `3521775163_0_0_0_<MD5>_0_0`）。
+`desc` 为空（用户没起名）时退回 `md5`——同样是内容哈希，一样跨账号稳定。
+
+### 发送：一条专用动作 + 一条兜底路
+
+| 后端 | 走的路 | 实测 |
+|---|---|---|
+| SnowLuma | 专用动作 `send_custom_face(emoji_id, group_id\|user_id)` | ✅ `emoji_id` 可传完整 ID，也可传 32 位 MD5 |
+| NapCat | 兜底 `send_group_msg` + image 段 | ✅ 没有这个动作（`retcode=200`），但 image 段一样能保住外观 |
+
+兜底段的关键是 `sub_type`：
+
+```json
+{"type": "image", "data": {"file": "<表情URL>", "sub_type": 1, "summary": "[动画表情]"}}
+```
+
+同一个表情 URL，**带** `sub_type=1` 回读是 `sub_type=1 / summary="[动画表情]"`（收藏表情），
+**不带**就是 `sub_type=0 / summary="[图片]"`（普通图片）。SnowLuma 的
+`send_custom_face` 内部发的也就是这个段，所以兜底路在两个后端上都成立。
+
+### 怎么用
+
+```python
+from AbstractionLayer.face import CustomFaceService
+
+service = CustomFaceService(kernel)
+library = await service.refresh()          # 抓收藏表情
+face = library.find("不够色情")             # 按备注名找
+await service.send("不够色情", group_id=20001)   # 按备注名发
+```
+
+### 已经接进 bot 的哪几处
+
+- `transport/api.py`：`fetch_custom_faces()` / `send_custom_face(key, …)`；
+- `bot/app.py` `start()`：启动时抓一次，并进表情包库（`_sync_custom_faces`）；
+- `messaging/meme.py`：新增 `customs` 类型，并入后模型就能像用静态表情包一样
+  写 `<meme>备注名</meme>`——CQ 码里带 `sub_type=1`，转消息段时不能丢。
+
+抓取时机有个坑：Agent 是在后台线程里建提示词的，而提示词里的表情目录必须在
+建 Agent 之前就位（模型得知道能写哪些名字）。所以 `BotApp` 用一个
+`threading.Event` 把两件事串起来：`_sync_custom_faces()` 合并完才置位，
+Agent 线程等这个信号（最多等 15 秒，超时就按现有表情包照常加载）。
 
 ---
 
@@ -345,7 +561,12 @@ python -m AbstractionLayer.cli call    --backend napcat --action get_login_info
 3. 如果和现有两种形状都不同，在 `kernal.py` 加一个
    `BackendCapabilities` 常量并在 `_classify` 里加判据；
 4. 在 `tests/test_abstraction_layer.py` 的 `FakeBackend` 里复刻它的怪癖，
-   再补一条 `walk` 断言。
+   再补一条 `walk` 断言；
+5. 实测一遍媒体通道（群文件 / 视频消息），把结果写进 `media_send_order` ——
+   顺序写错只是多失败一次，但会拖慢每次发文件；
+6. 实测一遍收藏表情：`face --backend 新端 --send <备注名>`，看发出去的是不是
+   收藏表情（回读 `sub_type=1`）而不是普通图片；有专用动作就填
+   `custom_face_send_action`，没有就留空走 image 段兜底。
 
 **不要**在上层写 `if backend == "napcat"`。差异只允许出现在
 `BackendCapabilities` 的数据里。

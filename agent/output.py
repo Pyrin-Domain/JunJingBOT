@@ -41,9 +41,12 @@ _STICKER_RE = re.compile(r"<sticker>\s*(.*?)\s*</sticker>", re.S | re.I)
 _VOICE_RE = re.compile(r"<voice\b[^>]*>(.*?)</voice>", re.S | re.I)
 _MEME_RE = re.compile(r"<meme\b[^>]*>(.*?)</meme\s*>", re.S | re.I)
 _QUOTE_ATTR_RE = re.compile(r"""quote\s*=\s*["']?([^"'\s>]+)["']?""", re.I)
+# 「这段对话留不留」的裁决（Method 2）。它**不在 <output> 里**，模型经常写在
+# 外面；不先摘掉的话会留在 output_block 里被当成一条消息发进群。
+_THREAD_RE = re.compile(r"<thread\b[^>]*>(.*?)</thread\s*>", re.S | re.I)
 # 模型偶尔会漏写闭合标签 / 多写一层，这些残留标签不能被当成消息发出去
 _STRAY_TAG_RE = re.compile(
-    r"</?\s*(?:status|think|output|message|at|sticker|voice|action|meme)\b[^>]*>", re.I
+    r"</?\s*(?:status|think|output|message|at|sticker|voice|action|meme|thread)\b[^>]*>", re.I
 )
 
 # ── 续说（<next>继续/结束</next>）─────────────────────────────
@@ -81,6 +84,20 @@ def _render_meme(name: str) -> str:
     return code
 
 
+def _is_custom_face(text: str) -> bool:
+    """这条消息里是不是已经有收藏表情了。
+
+    收藏表情渲染出来是带 ``sub_type`` 的 ``[CQ:image,…]``，
+    和普通贴纸的 ``[CQ:image,file=…]`` 不是一回事，得单独认。
+    """
+    try:
+        from messaging.meme import is_custom_face_cq
+
+        return is_custom_face_cq(text)
+    except Exception:  # noqa: BLE001 - 表情包坏了不能影响回复
+        return False
+
+
 def render_message_body(body: str) -> str:
     """把 <at> / <sticker> / <meme> / <voice> 段转成 NapCat 能识别的 CQ 码。"""
     body = _AT_RE.sub(lambda m: f"[CQ:at,qq={m.group(1)}]", body or "")
@@ -102,24 +119,68 @@ def normalize_next(value: Optional[str]) -> str:
 
 _normalize_next = normalize_next
 
+# ── 对话留存裁决（<thread>）────────────────────────────────────
+# 语义：**本轮结束后生效** —— 模型说 new，本轮照样带着旧的对话（它可能是接完
+# 上一句才切的话题），下一轮才清空。认不出来时返回 ""，由代码算默认值，绝不
+# 在这里默认 keep（否则新话题会一直拖着旧上下文）。
+_THREAD_KEEP_VALUES = {
+    "keep", "same", "continue", "保留", "继续", "接着", "留着", "留", "1", "true", "yes", "是",
+}
+_THREAD_NEW_VALUES = {
+    "new", "drop", "reset", "新", "新话题", "换话题", "清空", "丢弃", "0", "false", "no", "否", "不",
+}
+#: 「换个话题 / 换一个话题 / 换新话题」这类带量词的说法，逐字比对抓不到。
+_THREAD_NEW_HINT_RE = re.compile(r"新话题|换.{0,2}话题|清空|丢弃")
+
+
+def normalize_thread(value: Optional[str]) -> str:
+    """把 ``<thread>`` 的写法归一成 ``keep`` / ``new`` / ``""``（没写或认不出）。"""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw in _THREAD_KEEP_VALUES:
+        return "keep"
+    if raw in _THREAD_NEW_VALUES:
+        return "new"
+    # 小模型常写成「保留这段」「换个话题」「换新话题」这种带修饰的句子，按关键字兜一层。
+    if _THREAD_NEW_HINT_RE.search(raw):
+        return "new"
+    if any(word in raw for word in ("保留", "继续", "接着", "留着")):
+        return "keep"
+    return ""
+
+
+_normalize_thread = normalize_thread
+
 
 def parse_agent_output(text: str) -> dict:
-    """把模型输出解析成 {"status", "think", "next", "messages", "raw"}。
+    """把模型输出解析成 ``{"status", "think", "next", "messages", "thread", "raw"}``。
 
     - status / think 只用于日志，不会发送；
-    - messages 是真正要发出去的 QQ 消息（已转成 CQ 码，空串代表这条不发）。
+    - messages 是真正要发出去的 QQ 消息（已转成 CQ 码，空串代表这条不发）；
+    - thread 是「这段对话留不留」的裁决（keep / new），空串表示没写。
 
     模型漏写 <output> 时会退化成「把 status/think 之外的正文当作一条回复」。
     """
+    raw_text = text or ""
     parsed: dict[str, Any] = {
         "status": "",
         "think": "",
         "next": "end",
         "messages": [],
-        "raw": text or "",
+        "thread": "",
+        "raw": raw_text,
     }
     if not text:
         return parsed
+
+    # <thread> 必须先摘掉再走后面的解析：它通常写在 <output> 外面，
+    # 留着会被当成正文发到群里。
+    thread_match = _THREAD_RE.search(raw_text)
+    parsed["thread"] = normalize_thread(
+        thread_match.group(1) if thread_match else ""
+    )
+    text = _THREAD_RE.sub("", raw_text)
 
     blocks: dict[str, str] = {}
     for name, content in _BLOCK_RE.findall(text):
@@ -156,7 +217,8 @@ def parse_agent_output(text: str) -> dict:
     # 保证「表情包已经生成了」就真的能发出去。
     stray_memes = _MEME_RE.findall(_MESSAGE_RE.sub("", output_block))
     already_has_meme = any(
-        "[CQ:mface" in message or "[CQ:face" in message for message in messages
+        "[CQ:mface" in message or "[CQ:face" in message or _is_custom_face(message)
+        for message in messages
     )
     if stray_memes and not already_has_meme:
         extra = _render_meme(stray_memes[0])
@@ -357,7 +419,36 @@ _parse_interject_judge = parse_interject_judge
 # ── 插话：动作判断（silent / nod / join / answer / revive）──────────
 INTERJECT_ACTS = ("silent", "nod", "join", "answer", "revive")
 
-_ACT_RE = re.compile(r"<act>\s*([a-z_]{3,12})\s*</act>", re.I)
+# 小模型不总是照抄格式。判出来「明明想答却变成沉默」多数不是模型想沉默，
+# 是动作没被认出来、掉进了 silent 兜底。所以这里宁可宽松一点：
+#   <act>answer</act>                 标准
+#   <act>answer（因为他在提问）</act>   标签里混了话
+#   <verdict>…</verdict><act>answer</act>  前面还抄了一段模板
+#   <act>回答</act>                     偷懒写中文
+#   我觉得应该 answer                    干脆没写标签
+# 只有一样都认不出来时才沉默。
+_ACT_BLOCK_RE = re.compile(r"<act>(.*?)</act>", re.I | re.S)
+# 不用 \b：中文和英文紧挨着时（"应该answer"）Python 的 \b 不成立
+_ACT_WORD_RE = re.compile(r"(?<![a-z_])(silent|nod|join|answer|revive)(?![a-z_])", re.I)
+# 中文动作别名，按长度倒序检查（长的先命中，避免 "不答" 被 "答" 抢走）
+_ACT_ALIASES = tuple(
+    sorted(
+        {
+            "不回答": "silent", "不答": "silent", "别答": "silent",
+            "回答": "answer", "答案": "answer", "答": "answer",
+            "接话": "join", "接一句": "join", "插一句": "join",
+            "加入": "join", "参与": "join",
+            "沉默": "silent", "不说话": "silent", "不插": "silent",
+            "别插": "silent", "闭嘴": "silent",
+            "点头": "nod", "表情": "nod", "冒泡": "nod",
+            "复活": "revive", "开话题": "revive", "新话题": "revive",
+        }.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+# 自由文本里出现动作词时，避开否定说法（"not answer" / "不answer"）
+_NEGATION_BEFORE = re.compile(r"(?:not|n't|no|never|不|别|没)\s*$", re.I)
 _WHY_RE = re.compile(r"<why>(.*?)</why>", re.I | re.S)
 _REPLY_TO_RE = re.compile(r"<reply_to>\s*(\d{1,20})\s*</reply_to>", re.I)
 
@@ -382,6 +473,56 @@ def _clean_why(text: str) -> str:
     if not value or value in _PLACEHOLDER_WHY:
         return ""
     return value[:80]
+
+
+def _act_from_text(text: str) -> str:
+    """从一小段文字里认动作词；认不出来返回空串。"""
+    body = (text or "").strip()
+    if not body:
+        return ""
+    matched = _ACT_WORD_RE.search(body)
+    if matched:
+        return matched.group(1).lower()
+    for alias, act in _ACT_ALIASES:
+        if alias in body:
+            return act
+    return ""
+
+
+def _act_from_blocks(raw: str) -> str:
+    """按 ``<act>`` 标签认动作：第一个能认出来的标签说了算。
+
+    模型有时会先抄一段提示词里的格式模板再给自己的判断，
+    所以「第一个标签」不一定是真的那个——认不出来的标签直接跳过。
+    """
+    for block in _ACT_BLOCK_RE.findall(raw or ""):
+        act = _act_from_text(block)
+        if act in INTERJECT_ACTS:
+            return act
+    return ""
+
+
+def _act_from_loose_text(raw: str) -> str:
+    """没写 ``<act>`` 标签时的兜底：从正文里找动作词。
+
+    只看 ``<why>`` 之外的部分——理由是模型自己解释的，里面常出现
+    "我可以回答" 这种字眼，拿它当动作会误判。
+    """
+    body = _WHY_RE.sub(" ", raw or "")
+    candidates: list[tuple[int, str]] = []
+    for matched in _ACT_WORD_RE.finditer(body):
+        candidates.append((matched.start(), matched.group(1).lower()))
+    for alias, act in _ACT_ALIASES:
+        index = body.find(alias)
+        if index >= 0:
+            candidates.append((index, act))
+    candidates.sort(key=lambda item: item[0])
+    for position, act in candidates:
+        prefix = body[max(0, position - 8):position]
+        if _NEGATION_BEFORE.search(prefix):
+            continue
+        return act
+    return ""
 
 
 @dataclass
@@ -409,26 +550,30 @@ class InterjectPlan:
 def parse_interject_verdict(text: str) -> InterjectPlan:
     """解析插话判断结果。
 
-    优先认 ``<act>``；模型退回旧格式（``<judge>yes</judge>`` / 只写 yes/no）时
-    降级成 join / silent。认不出来一律 silent —— 插话宁可少一句，不要乱说一句。
+    认动作的顺序：``<act>`` 标签（容忍标签里混话、多个标签、中文别名）
+    → 正文里的动作词 → 旧格式 ``<judge>yes</judge>``。全认不出来才 silent。
+
+    为什么不再「认不出来一律 silent」：judge 是小模型，格式一歪
+    （``<act>answer，因为他在提问</act>``）动作就丢了，结果一次
+    明明该答的提问被白白咽回去——比说错一句更亏。
     """
     raw = (text or "").strip()
     if not raw:
         return InterjectPlan()
 
-    act = ""
-    matched = _ACT_RE.search(raw)
-    if matched:
-        candidate = matched.group(1).strip().lower()
-        if candidate in INTERJECT_ACTS:
-            act = candidate
+    act = _act_from_blocks(raw)
+    if not act:
+        act = _act_from_loose_text(raw)
     if not act:
         act = "join" if parse_interject_judge(raw) else "silent"
 
     why = ""
-    reason = _WHY_RE.search(raw)
-    if reason:
-        why = _clean_why(reason.group(1))
+    # 模型可能先抄一段格式模板再给真理由——占位理由要跳过，取第一条像样的
+    for block in _WHY_RE.findall(raw):
+        candidate = _clean_why(block)
+        if candidate:
+            why = candidate
+            break
 
     reply_to = ""
     target = _REPLY_TO_RE.search(raw)
@@ -461,6 +606,7 @@ __all__ = [
     "looks_like_repeat",
     "normalize_next",
     "normalize_text",
+    "normalize_thread",
     "parse_agent_output",
     "parse_interject_judge",
     "parse_interject_verdict",

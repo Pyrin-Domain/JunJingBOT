@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 from ..services.range_task import RangeTaskService
+from . import audit_release as audit_release_cmd
 from . import export as export_cmd
 from . import fabric as fabric_cmd
 from . import image_forward as image_forward_cmd
 from . import jm as jm_cmd
 from . import music as music_cmd
 from . import recall as recall_cmd
+from . import sex_filter_test as sex_filter_test_cmd
 from .export import parse_range
 
 # 旧名字：`from Minitor.Commands import _parse_range` 的迁移版本
@@ -84,6 +86,10 @@ class CommandHandlers:
         """img_fd -a 时使用的默认目标群列表（来自配置）"""
         return image_forward_cmd.auto_targets(self)
 
+    def export_auto_targets(self) -> list:
+        """export -a 时使用的默认目标群列表（来自配置）"""
+        return export_cmd.auto_targets(self)
+
     # ════════════════════ 命令 / 功能 ════════════════════
     async def export(self, event):
         return await export_cmd.export(self, event)
@@ -106,6 +112,14 @@ class CommandHandlers:
     async def jm(self, event):
         """``/jm <id>``：占位命令，只在私聊响应，不抓取、不发群。"""
         return await jm_cmd.jm(self, event)
+
+    async def sex_filter_test(self, event):
+        """``junjingtest_sex_filter``：对回复的聊天记录全量跑图片过滤并回报告。"""
+        return await sex_filter_test_cmd.sex_filter_test(self, event)
+
+    async def audit_release(self, event):
+        """审计群「复搬」：回复【过滤标签】发「复搬」，放行并重新搬运。"""
+        return await audit_release_cmd.audit_release(self, event)
 
     # ════════════════════ 区间任务回调 ════════════════════
     async def _run_export_range(self, event, data):

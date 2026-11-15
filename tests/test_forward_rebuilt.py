@@ -243,3 +243,35 @@ def test_auto_forward_falls_back_when_content_unavailable():
     )
     assert ok is True
     assert api.calls == [("card_forward", 20003, 64035048)]
+
+
+def test_auto_forward_skips_sender_filtered_in_source_group():
+    svc, api = _service(messages=[_msg("A")])
+    ok = asyncio.run(
+        svc.auto_forward(
+            event=FORWARD_EVENT,
+            groupid_list=[20002],
+            target_groupid=[20003],
+            forward_filter=[{"group_id": 20002, "user_id": [10003]}],
+        )
+    )
+    # 命中过滤 = 已处理，不再搬运，也不交给后面的 AI
+    assert ok is True
+    assert api.calls == []
+
+
+def test_auto_forward_filter_does_not_match_other_group_or_sender():
+    svc, api = _service(messages=[_msg("A")])
+    ok = asyncio.run(
+        svc.auto_forward(
+            event=FORWARD_EVENT,
+            groupid_list=[20002],
+            target_groupid=[20003],
+            forward_filter=[
+                {"group_id": 20003, "user_id": [10003]},
+                {"group_id": 20002, "user_id": [10004]},
+            ],
+        )
+    )
+    assert ok is True
+    assert api.calls == [("card_forward", 20003, 64035048)]

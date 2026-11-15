@@ -26,6 +26,8 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Extension/ 是原样内嵌的上游仓库，不参与本项目的格式化与 lint
+extend-exclude = ["Extension"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
