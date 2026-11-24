@@ -198,6 +198,17 @@ class OneBotAPI:
             return ensure_ok(action, result)
         return result
 
+    async def call_api(
+        self, action: str, params: dict | None = None, **kwargs
+    ) -> dict:
+        """通用动作出口。
+
+        给 media / 工具层调「后端专有能力」用（例如图文卡 ``send_tuwen_ark``）：
+        这些动作名来自 :class:`BackendCapabilities`，上层不该硬编码后端判断，
+        但确实需要绕过 ``send_group_message`` 这类固定动作。
+        """
+        return await self._call_api(action=action, params=params, **kwargs)
+
     @property
     def strict_actions(self) -> frozenset[str]:
         """必须 ``retcode == 0`` 的动作集合（来自后端能力表）。

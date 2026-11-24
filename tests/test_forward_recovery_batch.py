@@ -1,5 +1,6 @@
 """断点恢复两阶段批次：先统一入库，再统一发送（每份内容只发一次）。"""
 
+import asyncio
 from types import SimpleNamespace
 
 from bot.services.forward import ForwardService, GateOutcome, RecoveryBatch, StagedForward
@@ -34,7 +35,7 @@ def _service():
     svc.forwarded_targets = []
     svc.recorded = []
 
-    async def fake_forward(event, target_groupid=None, task_userid=None):
+    async def fake_forward(event, target_groupid=None, task_userid=None, **kwargs):
         svc.forwarded.append(event.get("message_id"))
         svc.forwarded_targets.append(list(target_groupid or []))
         return len(target_groupid or [])
@@ -44,7 +45,7 @@ def _service():
         svc.forwarded_targets.append(list(target_groupid or []))
         return len(target_groupid or [])
 
-    async def fake_record(fingerprint, event, target_groupid=None):
+    async def fake_record(fingerprint, event, target_groupid=None, **kwargs):
         svc.recorded.append((event.get("message_id"), list(target_groupid or [])))
 
     svc.batch_forward_single_msg = fake_forward
@@ -141,12 +142,101 @@ def test_batch_dedupe_and_send_once():
     svc.forwarded.clear()
     svc.forwarded_targets.clear()
 
-    import asyncio
-
     asyncio.run(svc._send_staged(item))
     # 只发一次（合并后一份内容）
     assert svc.forwarded == [101]
     assert svc.forwarded_targets == [[20003]]
+
+
+def test_merged_sources_are_not_sent_back():
+    """合并后的目标 = 目标1∪目标2 − 来源1∪来源2（来源群不再收一次）。"""
+    svc, mp = _service()
+    batch = svc.begin_recovery_batch()
+    job_a = SimpleNamespace(
+        event=_event(100, 201),
+        target_groups=[101, 20003],
+        target_users=[],
+        strip_tail_ads=None,
+        blocked=False,
+    )
+    job_b = SimpleNamespace(
+        event=_event(101, 202),
+        target_groups=[100, 20003],
+        target_users=[],
+        strip_tail_ads=None,
+        blocked=False,
+    )
+    batch.add(
+        StagedForward(
+            job=job_a,
+            outcome=GateOutcome(
+                targets=[101, 20003], fingerprint={"text": "x|y", "kind": "old_forward"}
+            ),
+            identities=("leaf:888",),
+            target_groups=(101, 20003),
+            target_users=(),
+            source_groups=("100",),
+        )
+    )
+    batch.add(
+        StagedForward(
+            job=job_b,
+            outcome=GateOutcome(
+                targets=[100, 20003], fingerprint={"text": "x|y", "kind": "old_forward"}
+            ),
+            identities=("leaf:888",),
+            target_groups=(100, 20003),
+            target_users=(),
+            source_groups=("101",),
+        )
+    )
+    assert len(batch) == 1
+    item = batch.drain()[0]
+    assert item.source_groups == ("100", "101")
+    assert set(item.target_groups) == {100, 101, 20003}
+
+    captured: dict = {}
+
+    async def fake_record(fingerprint, event, target_groupid=None, **kwargs):
+        captured["targets"] = list(target_groupid or [])
+        captured.update(kwargs)
+
+    svc.forward_dedup_record = fake_record
+    svc.forwarded.clear()
+    svc.forwarded_targets.clear()
+
+    asyncio.run(svc._send_staged(item))
+
+    # 目标并集 {100,101,20003} − 来源并集 {100,101} = {20003}
+    assert svc.forwarded_targets == [[20003]]
+    assert captured["source_groups"] == ["100", "101"]
+
+
+def test_recovery_gate_does_not_reserve_main_db():
+    """recover 期间闸门不往主库认领（reserve=False），认领交给 RecoveryBatch。"""
+    svc, mp = _service()
+    svc.begin_recovery_batch()
+    captured: dict = {}
+
+    async def fake_gate(event, **kwargs):
+        captured.update(kwargs)
+        return GateOutcome(targets=[20003], fingerprint=None)
+
+    svc.forward_dedup_gate = fake_gate
+    job = SimpleNamespace(
+        event=_event(100, 301),
+        dedup=True,
+        miniapp_info={},
+        target_groups=[20003],
+        target_users=[],
+        self_group_is_target=False,
+        is_recover=True,
+        strip_tail_ads=None,
+        blocked=False,
+    )
+    asyncio.run(svc._forward_record(job))
+
+    assert captured["reserve"] is False
 
 
 def test_batch_empty_when_no_items():

@@ -184,6 +184,16 @@ class BackendCapabilities:
     custom_face_send_action: str | None = None
     #: 专用动作里承载「表情标识」的参数名。
     custom_face_send_id_param: str = "emoji_id"
+    # ── 卡片 ──
+    #: 发送「图文卡」（``com.tencent.tuwen.lua``）的**专用动作名**；None 表示后端没有。
+    #:
+    #: 实测（2026-11-15）：个人号手拼 lightApp json（``com.tencent.structmsg`` /
+    #: 手搓 ``tuwen.lua`` / 官方 ark 23-24-37 模板）发出去一律被 QQ **降级成
+    #: 纯文本**「发送者版本过低，无法展示内容」，两个后端完全一致 —— 说明卡的
+    #: ``config.token`` 必须由服务器签，本地造不出来。所以图文卡只能走后端
+    #: 封装好的动作：SnowLuma 有 ``send_tuwen_ark``（内部走 NTQQ 原生接口），
+    #: NapCat 没有。小程序卡同理，必须走 ``get_mini_app_ark`` 现签。
+    tuwen_ark_action: str | None = None
     #: ``fetch_custom_face_detail`` 里承载「账号内表情标识」的字段名。
     #:
     #: SnowLuma 给的是 ``emoji_id``（等于 resId）；NapCat **没有** ``emoji_id``，
@@ -236,6 +246,7 @@ class BackendCapabilities:
             "file_send_order": list(self.file_send_order),
             "flash_fileset_path": self.flash_fileset_path,
             "custom_face_send_action": self.custom_face_send_action,
+            "tuwen_ark_action": self.tuwen_ark_action,
             "custom_face_send_id_param": self.custom_face_send_id_param,
             "custom_face_id_field": self.custom_face_id_field,
             "custom_face_sub_type": self.custom_face_sub_type,
@@ -270,6 +281,8 @@ NAPCAT = BackendCapabilities(
     # NapCat 没有 send_custom_face：实测调用返回 retcode=200
     # 「不支持的Api send_custom_face」。走 image 段兜底即可保住收藏表情外观。
     custom_face_send_action=None,
+    # NapCat 没有 send_tuwen_ark；手拼 structmsg 会被降级成「发送者版本过低」。
+    tuwen_ark_action=None,
     # NapCat 的 fetch_custom_face_detail 里没有 emoji_id，只有 resId。
     custom_face_id_field="resId",
     notes=(
@@ -311,6 +324,9 @@ SNOWLUMA = BackendCapabilities(
     # {file: 表情URL, sub_type: 1, summary: "[动画表情]"}。
     custom_face_send_action="send_custom_face",
     custom_face_send_id_param="emoji_id",
+    # send_tuwen_ark 内部走 NTQQ 的 sendTuwenArk，卡片的 token 由服务器签，
+    # 所以只有它能出能渲染的图文卡（手拼 json 会被降级成文本）。
+    tuwen_ark_action="send_tuwen_ark",
     custom_face_id_field="emoji_id",
     notes=(
         "message_seq 是全局序号（int），与 NapCat 的 real_seq 完全一致。",
@@ -341,6 +357,7 @@ GENERIC = BackendCapabilities(
     file_send_order=("file",),
     # 未知后端不假设有专用动作：image 段兜底在两个已知后端上都验证过能用。
     custom_face_send_action=None,
+    tuwen_ark_action=None,
     notes=(
         "未探测到后端特征，按最保守参数工作。",
         "收藏表情走 image 段兜底（file=表情URL + sub_type=1）。",

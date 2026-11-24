@@ -18,7 +18,7 @@ import asyncio
 
 import pytest
 
-from bot.services.forward import ForwardService
+from bot.services.forward import BatchForwardResult, ForwardService, SendOutcome
 from bot.services.image_dedup import ForwardImageStore
 
 
@@ -390,14 +390,56 @@ def test_batch_forward_waits_and_counts_actual_successes(monkeypatch):
         )
     )
 
-    assert count == 2
+    assert count.succeed_id == [20002, 10001]
+    assert count.failed_id == [20003]
+    assert count.succeeded == 2
     assert completed == ["group:20002", "group:20003", "private:10001"]
 
 
-def test_partial_image_delivery_is_not_memorized(monkeypatch):
+def test_batch_forward_reports_retcode_and_db_idx(monkeypatch):
+    """返回值要带逐目标 retcode 和库内主键（限流重试按 idx 回写）。"""
+    service = ForwardService(
+        mp=_FakeMP(),
+        api=None,
+        settings=None,
+        image_store=ForwardImageStore(db_path=":memory:"),
+    )
+
+    async def fake_forward(event, message_type=None, group_id=None, user_id=None):
+        if group_id == 20003:
+            return SendOutcome(ok=False, retcode=100)
+        return SendOutcome(ok=True)
+
+    monkeypatch.setattr(service, "forward_single_msg", fake_forward)
+    event = _image_event(message_type="group", user_id=BOT_ID, group_id=949950852)
+
+    result = asyncio.run(
+        service.batch_forward_single_msg(
+            event, target_groupid=[20002, 20003], db_idx=42
+        )
+    )
+
+    assert result.succeed_id == [20002]
+    assert result.failed_id == [20003]
+    assert result.retcodes["20003"] == 100
+    assert result.rate_limited == [20003]
+    assert result.db_idx == 42
+
+
+def test_partial_image_delivery_remembers_successes(monkeypatch):
+    """部分成功：成功的目标立刻入库，失败的（非限流）不登记，下次只补失败项。
+
+    旧行为是「有一个失败就整批不登记」，导致已成功的群下次重复收到。
+    """
     service, _sent = _service(monkeypatch)
     calls: list[list[str]] = []
-    outcomes = iter([(1, [20002, 20004]), (2, [20002, 20004]), None])
+    outcomes = iter(
+        [
+            BatchForwardResult(succeed_id=[20002], failed_id=[20004], attempted=2),
+            BatchForwardResult(succeed_id=[20004], failed_id=[], attempted=1),
+            None,
+        ]
+    )
     event = _image_event(message_type="group", user_id=BOT_ID, group_id=949950852)
     event["message_id"] = 444
 
@@ -405,9 +447,8 @@ def test_partial_image_delivery_is_not_memorized(monkeypatch):
         outcome = next(outcomes)
         if outcome is None:
             raise AssertionError("全部成功后不应再次发送")
-        count, targets = outcome
-        calls.append(targets)
-        return count
+        calls.append(list(target_groupid or []))
+        return outcome
 
     monkeypatch.setattr(service, "batch_forward_single_msg", fake_batch)
 
@@ -423,6 +464,68 @@ def test_partial_image_delivery_is_not_memorized(monkeypatch):
         )
 
     assert forward_to([20002, 20004]) is True
+    # 20002 已登记；20004 失败未登记 → 第二次只补 20004
     assert forward_to([20002, 20004]) is True
+    # 两个都登记了 → 第三次一个都不发
     assert forward_to([20002, 20004]) is True
-    assert calls == [[20002, 20004], [20002, 20004]]
+    assert calls == [[20002, 20004], [20004]]
+
+
+def test_rate_limited_image_is_retried_and_recorded(monkeypatch):
+    """retcode=100 的目标入队；re_send 成功后补登记送达。"""
+    service = ForwardService(
+        mp=_FakeMP(),
+        api=None,
+        settings=None,
+        image_store=ForwardImageStore(db_path=":memory:"),
+    )
+    event = _image_event(message_type="group", user_id=BOT_ID, group_id=949950852)
+    event["message_id"] = 555
+    store = service._get_image_store()
+    sent: list = []
+    failed_once: set = set()
+
+    async def fake_forward(event, message_type=None, group_id=None, user_id=None):
+        target = group_id if message_type == "group" else user_id
+        sent.append(target)
+        if target == 20004 and target not in failed_once:
+            # 20004 第一次限流；20002 正常成功
+            failed_once.add(target)
+            return SendOutcome(ok=False, retcode=100)
+        return SendOutcome(ok=True)
+
+    async def fake_batch(event, target_groupid=None, task_userid=None):
+        result = BatchForwardResult(attempted=2)
+        for group_id in target_groupid or []:
+            outcome = await fake_forward(event, "group", group_id=group_id)
+            if outcome.ok:
+                result.succeed_id.append(group_id)
+            else:
+                result.failed_id.append(group_id)
+                result.retcodes[str(group_id)] = outcome.retcode
+        return result
+
+    monkeypatch.setattr(service, "batch_forward_single_msg", fake_batch)
+    monkeypatch.setattr(service, "forward_single_msg", fake_forward)
+    # 实时路径默认会起后台重试任务；这里手动调 re_send，先关掉后台任务
+    monkeypatch.setattr(service, "_schedule_retry", lambda: None)
+
+    asyncio.run(
+        service.forward(
+            event=event,
+            groupid_list=[949950852],
+            target_groupid=[20002, 20004],
+            task_userid=[],
+            auto_img_forward_from_bot=WHITELIST,
+        )
+    )
+    # 20002 已登记；20004 限流在队列里
+    assert store.delivered(["message_id:949950852:555"], ["g:20002"]) == {"g:20002"}
+    assert len(service._retry_queue) == 1
+
+    asyncio.run(service.re_send(interval=0, max_rounds=2))
+
+    assert service._retry_queue == []
+    assert store.delivered(
+        ["message_id:949950852:555"], ["g:20002", "g:20004"]
+    ) == {"g:20002", "g:20004"}

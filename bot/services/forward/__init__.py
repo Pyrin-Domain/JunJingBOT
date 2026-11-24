@@ -13,9 +13,13 @@ from .job import (
     KIND_IMAGE,
     KIND_MINIAPP,
     KIND_RECORD,
+    RATE_LIMIT_RETCODE,
+    BatchForwardResult,
     ForwardJob,
     GateOutcome,
     RecoveryBatch,
+    RetryTarget,
+    SendOutcome,
     StagedForward,
 )
 from .service import ForwardService
@@ -26,8 +30,12 @@ __all__ = [
     "GateOutcome",
     "RecoveryBatch",
     "StagedForward",
+    "SendOutcome",
+    "BatchForwardResult",
+    "RetryTarget",
     "KIND_RECORD",
     "KIND_MINIAPP",
     "KIND_IMAGE",
     "FORWARD_KINDS",
+    "RATE_LIMIT_RETCODE",
 ]

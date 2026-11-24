@@ -75,8 +75,8 @@ class ImageProbe:
     source: str = ""  # single_image / chat_record
     event: dict = field(default_factory=dict)  # 外层事件（聊天记录 = 卡片那条消息）
     message: dict = field(default_factory=dict)  # 图片所在的那条消息（聊天记录 = 内层）
-    group_id: str = ""
-    sender_id: str = ""
+    group_id: str = ""  # 图片所在消息的群（聊天记录 = 内层群，回落外层群）
+    sender_id: str = ""  # 图片作者（聊天记录 = 内层作者）；外层发送者在 event 里
     sender_name: str = ""
     message_id: str = ""  # 图片所在消息的 id（聊天记录 = **内层** id，取不回原消息）
     text: str = ""

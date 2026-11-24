@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -297,21 +298,91 @@ class MediaService:
             return False
 
     async def send_bili_card(self, event, ark_data: dict) -> bool:
-        """发送 B 站小程序卡片。"""
+        """发送 B 站**小程序**卡片。
+
+        ``ark_data`` 必须是 ``get_bili_ark`` 返回的**卡片本体**（``{"ver":...}``），
+        不是 OneBot 的整封响应。而且**一个字都不能改**：``config.token`` 是服务端
+        对该卡内容的签名，改了 prompt / desc / preview 任意一个，QQ 会**静默丢弃**
+        （SnowLuma 表现为 ``retcode=100 未收到回执``，历史里查不到），
+        详见 ``docs/ABSTRACTION.md``。
+        """
         if not ark_data:
             return False
+        payload = ark_data if isinstance(ark_data, str) else json.dumps(
+            ark_data, ensure_ascii=False
+        )
         try:
             return await self._send_message(
-                event, [{"type": "json", "data": ark_data}]
+                event, [{"type": "json", "data": {"data": payload}}]
             )
         except Exception as exc:
             print(f"[B站卡片] 卡片发送失败: {exc}")
             return False
 
+    async def send_bili_news_card(
+        self,
+        event,
+        *,
+        title: str,
+        jump_url: str,
+        desc: str = "",
+        preview: str = "",
+        summary: str = "[分享]",
+    ) -> bool:
+        """发送 B 站**图文卡**（``com.tencent.tuwen.lua``，可点击的图文卡）。
+
+        为什么必须走后端动作、不能手拼 JSON：实测（2026-11-15）个人号发送手写的
+        ``com.tencent.structmsg`` / 手搓 ``tuwen.lua`` / 官方 ark 23-24-37 模板，
+        QQ 一律把它**降级成纯文本**「发送者版本过低，无法展示内容」——卡的
+        ``config.token`` 得由服务器签，本地造不出来（SnowLuma 与 NapCat 表现一致）。
+        所以这里调 :attr:`BackendCapabilities.tuwen_ark_action` 指定的动作：
+        SnowLuma 的 ``send_tuwen_ark`` 内部走 NTQQ 原生接口，能出真卡；NapCat
+        没有这个动作，直接返回 False，让调用方回退到别的形态。
+
+        与**小程序卡**的分工：小程序卡（:meth:`get_bili_ark` + :meth:`send_bili_card`）
+        样式是 B 站原生卡、点开进 b 站页面；图文卡样式朴素但一定能渲染出来。
+        """
+        if not title or not jump_url:
+            return False
+        action = getattr(self.capabilities, "tuwen_ark_action", None)
+        if not action:
+            print("[B站卡片] 当前后端没有图文卡动作（tuwen_ark_action 为空），跳过")
+            return False
+        if event.get("message_type") != "group":
+            # 这个动作只认 group_id，私聊没有对应参数。
+            return False
+        params = {
+            "group_id": event.get("group_id"),
+            "title": title,
+            "desc": desc or "B站视频",
+            "summary": summary,
+            "jump_url": jump_url,
+        }
+        if preview:
+            # 不传就用后端默认图；传空串会把默认图也顶掉。
+            params["preview_url"] = preview
+        try:
+            await self.api.call_api(action=action, params=params)
+            return True
+        except Exception as exc:
+            print(f"[B站卡片] 图文卡发送失败: {exc}")
+            return False
+
     async def get_bili_ark(
-        self, tittle: str, desc: str, picUrl: str, jumpUrl: str
+        self, tittle: str, desc: str, picUrl: str, jumpUrl: str, **extra
     ) -> dict:
-        """获取 B 站 ark 卡片数据（保留旧参数名）。"""
+        """获取 B 站小程序 ark 卡片**本体**（保留旧参数名）。
+
+        ``jumpUrl`` 的语义在 QQ 那边是「小程序页面路径」，不是网页地址：
+        发视频要传 ``/pages/video/video?bvid=BV...``。传成 https 链接的话，
+        卡片能发出去、点开却落在 b 站首页（``url`` 短链里没记住页面）。
+
+        ``extra`` 透传 SnowLuma 扩展参数（``version_id`` / ``web_url`` / ``scene``），
+        NapCat 侧不认这些键，传了也会被忽略，不影响主流程。
+
+        返回值已经从 OneBot 响应信封（``{"status":..,"data":{"data":..}}``）里剥出来；
+        ``_call_api`` 不剥 ``data``，旧代码直接把整封信封当卡片发，是个死链。
+        """
         params = {
             "type": "bili",
             "title": tittle,
@@ -319,8 +390,13 @@ class MediaService:
             "picUrl": picUrl,
             "jumpUrl": jumpUrl,
         }
+        params.update(extra)
         print(f"[B站卡片] 生成卡片: {params}")
-        return await self.api.get_mini_app_ark(params=params)
+        result = await self.api.get_mini_app_ark(params=params) or {}
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            return data["data"]
+        return data if isinstance(data, dict) else {}
 
     async def get_bili_ark_from_text(self, text: str):
         """从文本中提取第一个 B 站视频并生成卡片数据。"""

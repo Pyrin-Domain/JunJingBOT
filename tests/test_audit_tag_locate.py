@@ -24,9 +24,15 @@ from messaging.image_filter import FilterHit, ImageProbe, probes_from_messages
 
 
 # 外层 = 群里那条聊天记录卡片本身；内层 = 记录里的某一条消息
+# 这是一张**跨群**转发的卡：卡片发在 1105841698，内容来自 284840486
 OUTER_GROUP = "1105841698"
 OUTER_MID = "-2133034063"
+OUTER_NAME = "蓝色大肥鱼"
+OUTER_UID = "319666906"
+INNER_GROUP = "284840486"
 INNER_MID = "1793527070"
+INNER_NAME = "雨のち雨"
+INNER_UID = "1094950020"
 
 
 def _outer_event() -> dict:
@@ -34,27 +40,30 @@ def _outer_event() -> dict:
     return {
         "message_type": "group",
         "group_id": int(OUTER_GROUP),
-        "user_id": 319666906,
+        "user_id": int(OUTER_UID),
+        "sender": {"user_id": int(OUTER_UID), "nickname": OUTER_NAME, "card": ""},
         "message_id": int(OUTER_MID),
         "message": [{"type": "forward", "data": {"id": "hs7oiPPNhtqMFWX5IZzU5dWcsJp27apKxdWOJf6CU0"}}],
     }
 
 
 def _inner_messages() -> list[dict]:
-    """记录里的两条消息：第二条带图（内层 id ≠ 外层 id）。"""
+    """记录里的两条消息：第二条带图（内层 id ≠ 外层 id，群也不同）。"""
     return [
         {
-            "user_id": 1094950020,
+            "user_id": int(INNER_UID),
+            "group_id": int(INNER_GROUP),
             "time": 1792736000,
             "message_id": 1,
-            "sender": {"user_id": 1094950020, "nickname": "QQ用户"},
+            "sender": {"user_id": int(INNER_UID), "nickname": INNER_NAME},
             "message": [{"type": "text", "data": {"text": "看图"}}],
         },
         {
-            "user_id": 1094950020,
+            "user_id": int(INNER_UID),
+            "group_id": int(INNER_GROUP),
             "time": 1792736001,
             "message_id": int(INNER_MID),
-            "sender": {"user_id": 1094950020, "nickname": "QQ用户"},
+            "sender": {"user_id": int(INNER_UID), "nickname": INNER_NAME},
             "message": [
                 {"type": "image", "data": {"file": "a.png", "url": "https://cdn/a.png"}}
             ],
@@ -94,6 +103,22 @@ def test_tag_text_uses_outer_message_id_for_chat_record():
     assert parse_tag(text) == (OUTER_GROUP, OUTER_MID)
 
 
+def test_tag_text_sender_is_outer_sender():
+    """「发送者」要和「消息」指的是同一条消息——不然按标签回溯对不上人。"""
+    text = _format_tag_text([_hit(_record_probe())])
+    assert f"发送者：{OUTER_NAME}（{OUTER_UID}）" in text
+    assert f"发送者：{INNER_NAME}" not in text, "发送者不能是记录里发图的内层作者"
+
+
+def test_tag_text_shows_inner_source_on_its_own_line():
+    """内层作者 / 内层群不丢，但单独一行，且不能混进「来源群：」。"""
+    text = _format_tag_text([_hit(_record_probe())])
+    assert f"内层来源：群 {INNER_GROUP} · {INNER_NAME}（{INNER_UID}）" in text
+    # 关键：内层群不能被 parse_tag 当成外层群
+    assert parse_tag(text) == (OUTER_GROUP, OUTER_MID)
+    assert f"来源群：{INNER_GROUP}" not in text
+
+
 def test_tag_text_keeps_inner_id_in_details_for_troubleshooting():
     text = _format_tag_text([_hit(_record_probe())])
     assert f"[内层 {INNER_MID}]" in text
@@ -101,11 +126,12 @@ def test_tag_text_keeps_inner_id_in_details_for_troubleshooting():
 
 
 def test_tag_text_single_image_unchanged():
-    """单图：event == message，定位信息就是那条消息本身。"""
+    """单图：event == message，定位信息和发送者都是那条消息本身。"""
     event = {
         "message_type": "group",
         "group_id": 740726382,
         "user_id": 3792417235,
+        "sender": {"user_id": 3792417235, "nickname": "菲比大人", "card": ""},
         "message_id": 1652911697,
         "message": [{"type": "image", "data": {"url": "https://cdn/a.png"}}],
     }
@@ -115,11 +141,14 @@ def test_tag_text_single_image_unchanged():
         message=event,
         group_id="740726382",
         sender_id="3792417235",
+        sender_name="菲比大人",
         message_id="1652911697",
     )
     text = _format_tag_text([_hit(probe)])
     assert parse_tag(text) == ("740726382", "1652911697")
+    assert "发送者：菲比大人（3792417235）" in text
     assert "[内层" not in text, "单图没有内外层之分，不用补内层标记"
+    assert "内层来源" not in text
 
 
 # ══════════════════ 端到端：标签 → 复搬 → 取回外层卡片 → 重搬 ══════════════════

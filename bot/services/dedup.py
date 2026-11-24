@@ -2486,21 +2486,46 @@ class ForwardDedupStore:
         videos: list[dict] | None = None,
         at: int | None = None,
         identities: list[str] | None = None,
+        db_idx: int | None = None,
     ) -> int:
-        """登记一次搬运（同一份内容只留一行、群并进原记录，见 _upsert_locked）。"""
+        """登记一次搬运（同一份内容只留一行、群并进原记录，见 _upsert_locked）。
+
+        ``db_idx`` 非空时按主键回写（限流重试成功后的补登记）：不再按 content_hash
+        重新查找，避免文本/清洗规则变化导致重试记录写到另一行上。
+        """
+        groups = clean_group_ids(group_ids)
+        now = int(at or time.time())
+        if db_idx:
+            with self._thread_lock:
+                conn = self._ensure_conn()
+                try:
+                    for one in groups:
+                        self._mark_group_locked(conn, int(db_idx), one)
+                    conn.execute(
+                        "UPDATE forward_fingerprint SET last_seen = ? WHERE id = ?",
+                        (now, int(db_idx)),
+                    )
+                    conn.commit()
+                except sqlite3.Error as exc:
+                    log.warning("[转发去重] 按主键回写失败（id=%s）: %s", db_idx, exc)
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    return 0
+                return int(db_idx)
         tokens = tokenize(text)
         if not tokens:
             # 没有正文的指纹没有检索价值，不入库
             return 0
         fp = fingerprint_of(tokens)
-        now = int(at or time.time())
         with self._thread_lock:
             conn = self._ensure_conn()
             fp_id = self._upsert_locked(
                 conn,
                 fp,
                 kind=kind,
-                groups=group_ids,
+                groups=groups,
                 preview=preview,
                 text=text,
                 weak=weak,
@@ -2622,6 +2647,7 @@ class ForwardDedupStore:
         videos: list[dict] | None = None,
         at: int | None = None,
         identities: list[str] | None = None,
+        db_idx: int | None = None,
     ) -> int:
         """登记一次搬运。
 
@@ -2629,6 +2655,7 @@ class ForwardDedupStore:
         :param identities: 内容身份（见 :func:`content_identities`），与 find 保持一致
         :param at: 这次搬运/这条消息发生的时间（时间戳）。默认取当前时间；
             历史入库要传消息自己的时间，否则整库的 first_seen 全是「刚导入」
+        :param db_idx: 非空时按主键回写（限流重试补登记），不再按 content_hash 查
         """
         async with self._async_lock:
             return await asyncio.to_thread(
@@ -2642,6 +2669,7 @@ class ForwardDedupStore:
                 videos=videos,
                 at=at,
                 identities=identities,
+                db_idx=db_idx,
             )
 
     async def stats(self) -> dict:

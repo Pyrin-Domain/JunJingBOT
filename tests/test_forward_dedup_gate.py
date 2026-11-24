@@ -66,7 +66,11 @@ def _service(*, targets=None, extra_reply=None, matched=None, mface=True):
     svc.gate_calls = 0
 
     async def fake_gate(
-        event, miniapp_info=None, target_groupid=None, cur_group_is_target=False
+        event,
+        miniapp_info=None,
+        target_groupid=None,
+        cur_group_is_target=False,
+        **kwargs,
     ):
         svc.gate_calls += 1
         rest = list(target_groupid or []) if targets is None else list(targets)
@@ -78,12 +82,12 @@ def _service(*, targets=None, extra_reply=None, matched=None, mface=True):
             matched=dict(matched or {}),
         )
 
-    async def fake_forward(event, target_groupid=None, task_userid=None):
+    async def fake_forward(event, target_groupid=None, task_userid=None, **kwargs):
         svc.forwarded.append(event.get("message_id"))
         svc.forwarded_targets.append(list(target_groupid or []))
         return len(target_groupid or [])
 
-    async def fake_record(fingerprint, event, target_groupid=None):
+    async def fake_record(fingerprint, event, target_groupid=None, **kwargs):
         svc.recorded.append(event.get("message_id"))
 
     svc.forward_dedup_gate = fake_gate

@@ -60,7 +60,16 @@ from ..image_dedup import (
 )
 from .detect import detect_job
 from .image_gate import ImageAuditGate
-from .job import ForwardJob, GateOutcome, RecoveryBatch, StagedForward
+from .job import (
+    RATE_LIMIT_RETCODE,
+    BatchForwardResult,
+    ForwardJob,
+    GateOutcome,
+    RecoveryBatch,
+    RetryTarget,
+    SendOutcome,
+    StagedForward,
+)
 
 __all__ = ["ForwardService"]
 
@@ -68,6 +77,13 @@ log = get_logger("bot.services.forward")
 
 # 重建的聊天记录动辄几十张图，NapCat 要逐张上传，默认 30 秒回执来不及
 REBUILT_FORWARD_TIMEOUT = 180.0
+
+#: 限流重试的节奏。QQ 限制「本群每分钟 10 条」，一条一条间隔 6 秒最稳妥；
+#: 重试轮数用完还失败就放弃（下次同一内容再出现时会自然补发）。
+RETRY_INTERVAL_SECONDS = 6.0
+RETRY_MAX_ROUNDS = 10
+#: 重试队列上限，防止长时间限流把内存撑爆
+RETRY_QUEUE_MAX = 200
 
 #: 算图片指纹时单张图的下载超时（秒）。图片过滤门已经下过的话直接命中它的
 #: 字节缓存，不会真的走网络；过滤门关着时才是一次额外下载。
@@ -224,6 +240,9 @@ class ForwardService:
         self.config = self.settings
         #: 断点恢复的当前批次（见 :meth:`begin_recovery_batch`）；None = 实时路径
         self._recovery_batch: RecoveryBatch | None = None
+        #: 限流失败的重试队列（retcode=100）；recover 收尾 / 实时发送后统一重发
+        self._retry_queue: list[RetryTarget] = []
+        self._retry_task = None
 
     # ════════════════ 配置读取（BotSettings / dict 都认） ════════════════
     def _get(self, key: str, default=None):
@@ -338,8 +357,13 @@ class ForwardService:
         if job is None:
             return False
         if job.is_image:
-            return await self._forward_image(job)
-        return await self._forward_record(job)
+            handled = await self._forward_image(job)
+        else:
+            handled = await self._forward_record(job)
+        # 实时路径的限流重试在后台跑（recover 期间由批次收尾统一跑）。
+        if self._recovery_batch is None or self._recovery_batch.sealed:
+            self._schedule_retry()
+        return handled
 
     # 旧名字：编排层 / 老测试都还在用，内部直接转给 forward()
     async def auto_forward(self, event, **kwargs) -> bool:
@@ -353,14 +377,22 @@ class ForwardService:
             return True
 
         outcome = GateOutcome(verdict="miss", targets=list(job.target_groups))
+        batch = self._recovery_batch
+        # flush 已经封口但还没清掉批次引用时，新来的实时消息要走实时发送，
+        # 不能塞进已经 drain 过的批次里（那样既不会发也不会入库）。
+        recovering = batch is not None and not batch.sealed
         if job.dedup:
             outcome = await self.forward_dedup_gate(
                 event,
                 miniapp_info=job.miniapp_info,
                 target_groupid=job.target_groups,
                 cur_group_is_target=job.self_group_is_target,
+                # recover 期间**不往主库认领**：这一批的认领统一记在 RecoveryBatch
+                # （内存临时表）里，发送时才真正入库。否则「预留的目标群」会被
+                # 后续事件当成「已经送达」，把目标全减光（见 _send_staged）。
+                reserve=not recovering,
             )
-        if self._recovery_batch is not None:
+        if recovering:
             return self._stage_recovery_record(job, outcome)
 
         # 回放不提示：那是补历史，不是群里有人重复发
@@ -379,24 +411,40 @@ class ForwardService:
         if forwarded is None:
             # 没启用 / 没内容可裁也没追加 → 还是原来的整卡转发
             forwarded = await self.batch_forward_single_msg(
-                event, target_groupid=outcome.targets, task_userid=job.target_users
+                event,
+                target_groupid=outcome.targets,
+                task_userid=job.target_users,
+                db_idx=outcome.matched.get("id") if outcome.matched else None,
             )
+        sent_groups, sent_users = self._sent_targets(
+            forwarded, outcome.targets, job.target_users
+        )
         # 真的发出去了才登记指纹，避免“匹配但无处可转”的消息污染指纹库
-        if outcome.fingerprint is not None and forwarded:
+        if outcome.fingerprint is not None and (sent_groups or sent_users):
             await self.forward_dedup_record(
-                outcome.fingerprint, event, target_groupid=outcome.targets
+                outcome.fingerprint, event, target_groupid=sent_groups
             )
+        self._enqueue_rate_limited(
+            forwarded,
+            event,
+            groups=outcome.targets,
+            users=job.target_users,
+            kind="record",
+            fingerprint=outcome.fingerprint,
+            db_idx=outcome.matched.get("id") if outcome.matched else None,
+        )
         return True
 
     def _stage_recovery_record(
         self, job: ForwardJob, outcome: GateOutcome
     ) -> bool:
-        """恢复第一阶段：只入库（闸门里已认领），把结论挂进批次，暂不发送。
+        """恢复第一阶段：不写主库，只把结论挂进批次（RecoveryBatch 就是临时记录表）。
 
         断点恢复是「多个群并发回放同一段时间」：A 群和 B 群可能同时拿到同一份
-        聊天记录。如果各自「入库完立刻发」，两条都会在对方的认领落库之前就判定
-        「没搬过」，于是目标群各收一遍。这里先只收料，等所有群都入库完，
-        由 :meth:`flush_recovery_batch` 统一算目标、统一发。
+        聊天记录。闸门在 recover 期间 ``reserve=False``，不会把目标群认领进主库；
+        同一份内容靠批次按身份 / 指纹文本合并。等所有群都收完，由
+        :meth:`_flush_recovery_batch` 统一算目标（目标并集 − 来源并集 − recover
+        前已送达）、统一发送，**发送成功后才真正入库**。
         """
         batch = self._recovery_batch
         assert batch is not None
@@ -404,12 +452,21 @@ class ForwardService:
         identities = tuple(
             fingerprint.get("identities") or content_identities(job.event) or []
         )
+        source_groups: tuple = ()
+        source_users: tuple = ()
+        if job.event.get("group_id") is not None:
+            source_groups = (str(job.event.get("group_id")),)
+        if job.event.get("user_id") is not None:
+            source_users = (str(job.event.get("user_id")),)
         staged = StagedForward(
             job=job,
             outcome=outcome,
             identities=identities,
             target_groups=tuple(job.target_groups),
             target_users=tuple(job.target_users),
+            source_groups=source_groups,
+            source_users=source_users,
+            # 只把**主库命中**的群当「已送达」；本批认领的目标群不进这里。
             recorded_groups=tuple((outcome.matched or {}).get("group_ids") or []),
             strip_tail_ads=job.strip_tail_ads,
         )
@@ -470,54 +527,94 @@ class ForwardService:
         # 先封口再取料：flush 期间新开一轮恢复会新建批次，不会往这次里塞东西。
         batch.finalize()
         items = batch.drain()
-        if not items:
-            return
-        log.info("[断点恢复] 入库完成，开始统一发送（%s 份内容）", len(items))
-        for item in items:
-            try:
-                await self._send_staged(item)
-            except Exception as exc:  # noqa: BLE001 - 单条失败不能拖垮整批
-                log.warning(
-                    "断点恢复发送失败（message_id=%s）: %s",
-                    (item.event or {}).get("message_id"),
-                    exc,
-                )
+        if items:
+            log.info("[断点恢复] 入库完成，开始统一发送（%s 份内容）", len(items))
+            for item in items:
+                try:
+                    await self._send_staged(item)
+                except Exception as exc:  # noqa: BLE001 - 单条失败不能拖垮整批
+                    log.warning(
+                        "断点恢复发送失败（message_id=%s）: %s",
+                        (item.event or {}).get("message_id"),
+                        exc,
+                    )
+        # 限流失败的目标等窗口过去后重发；这是「入库→发送」之后最后一件事，
+        # 失败项重发成功后再补登记，避免部分成功被整批丢弃。
+        try:
+            await self.re_send()
+        except Exception as exc:  # noqa: BLE001 - 重试失败不能拖垮收尾
+            log.warning("断点恢复限流重试异常: %s", exc)
 
     async def _send_staged(self, item: StagedForward) -> None:
-        """第二阶段：按「本批合并后的目标群 − 已入库标记过的群」发送这一份内容。
+        """第二阶段：按 ``目标并集 − 来源并集 − recover 前已送达`` 发送这一份内容。
 
         为什么在发送前才做减法：同一份内容可能被 A、B 两个来源群各收一次料，
-        第二阶段合并成一份；其中某个目标群如果**本来就是来源群**（配置里两边常常
-        是同一批群），它在第一阶段就已被标记为「见过这份内容」，不该再收一次卡片。
+        第二阶段合并成一份。两条合并后的正确结果就是::
+
+            来源 = 来源1 ∪ 来源2
+            目标 = 目标1 ∪ 目标2 − 来源
+
+        来源群本来就有这份内容，不能再发回去；而本批认领时预留的目标群**不是**
+        来源，不能拿来减（否则目标会被减光，整份内容一个群都发不出去）。
         """
         job = item.job
         event = job.event
         recorded = {str(g) for g in item.recorded_groups}
+        sources = {str(g) for g in item.source_groups}
         targets = [
-            g for g in dict.fromkeys(item.target_groups) if str(g) not in recorded
+            g
+            for g in dict.fromkeys(item.target_groups)
+            if str(g) not in recorded and str(g) not in sources
         ]
+        source_users = {str(u) for u in item.source_users}
         users = [
-            u for u in dict.fromkeys(item.target_users) if str(u) != str(event.get("user_id"))
+            u
+            for u in dict.fromkeys(item.target_users)
+            if str(u) not in source_users and str(u) != str(event.get("user_id"))
         ]
-        if not targets and not users:
+
+        sent_groups: list = []
+        sent_users: list = []
+        if targets or users:
+            forwarded = await self.forward_rebuilt(
+                event,
+                opts=normalize_filter_settings(item.strip_tail_ads),
+                target_groupid=targets,
+                task_userid=users,
+            )
+            if forwarded is None:
+                forwarded = await self.batch_forward_single_msg(
+                    event,
+                    target_groupid=targets,
+                    task_userid=users,
+                    db_idx=item.outcome.matched.get("id")
+                    if item.outcome.matched
+                    else None,
+                )
+            sent_groups, sent_users = self._sent_targets(forwarded, targets, users)
+            self._enqueue_rate_limited(
+                forwarded,
+                event,
+                groups=targets,
+                users=users,
+                kind="record",
+                fingerprint=item.outcome.fingerprint,
+                db_idx=item.outcome.matched.get("id") if item.outcome.matched else None,
+            )
+        else:
             log.info(
-                "断点恢复：内容 %s 的目标群已全部覆盖，跳过发送",
+                "断点恢复：内容 %s 的目标群已全部覆盖，只登记来源群",
                 event.get("message_id"),
             )
-            return
-        forwarded = await self.forward_rebuilt(
-            event,
-            opts=normalize_filter_settings(item.strip_tail_ads),
-            target_groupid=targets,
-            task_userid=users,
-        )
-        if forwarded is None:
-            forwarded = await self.batch_forward_single_msg(
-                event, target_groupid=targets, task_userid=users
-            )
-        if item.outcome.fingerprint is not None and forwarded:
+
+        if item.outcome.fingerprint is not None:
+            # 发送成功的目标 + 来源群 + recover 前已送达的群一起入库；来源群即使
+            # 一个都没发也要登记，否则下次回放又会把同一份内容当成新的。
             await self.forward_dedup_record(
-                item.outcome.fingerprint, event, target_groupid=targets
+                item.outcome.fingerprint,
+                event,
+                target_groupid=list(sent_groups) + list(item.recorded_groups),
+                source_groups=list(item.source_groups) or None,
             )
 
     async def _send_extra_reply(self, event, summary: str) -> None:
@@ -776,21 +873,43 @@ class ForwardService:
             event, target_groupid=groups, task_userid=users
         )
         attempted = len(groups) + len(users)
-        # 没有身份就无法判重（宁可可能重复，也不能凭错误身份误杀）。
-        # 有目标失败时也不登记，宁可下一次重复成功项，不能漏掉失败项。
-        if identities and attempted and scheduled == attempted:
+        sent_groups, sent_users = self._sent_targets(scheduled, groups, users)
+        # 成功的目标立刻入库（不再因为另一个目标失败而整批不记）；
+        # 失败的目标不登记，等下次重复 / 限流重试成功时再补。
+        if identities and (sent_groups or sent_users):
             await store.remember_async(
                 identities,
-                [chat_key(group_id=g) for g in groups]
-                + [chat_key(user_id=u) for u in users],
+                [chat_key(group_id=g) for g in sent_groups]
+                + [chat_key(user_id=u) for u in sent_users],
             )
-        elif identities and scheduled:
-            log.warning(
-                "机器人图片 %s 仅送达 %s/%s 个目标，暂不登记送达记录",
-                event.get("message_id"),
-                scheduled,
-                attempted,
-            )
+        self._enqueue_rate_limited(
+            scheduled,
+            event,
+            groups=groups,
+            users=users,
+            kind="image",
+            identities=tuple(identities),
+        )
+        if isinstance(scheduled, BatchForwardResult) and scheduled.failed_id:
+            rate_limited = len(scheduled.rate_limited)
+            other = len(scheduled.failed_id) - rate_limited
+            if rate_limited:
+                log.warning(
+                    "机器人图片 %s 有 %s/%s 个目标被限流，已入队等待重发"
+                    "（成功 %s 个已登记）",
+                    event.get("message_id"),
+                    rate_limited,
+                    attempted,
+                    len(sent_groups) + len(sent_users),
+                )
+            if other:
+                log.warning(
+                    "机器人图片 %s 有 %s/%s 个目标发送失败（非限流），暂不登记，"
+                    "下次重复时补发",
+                    event.get("message_id"),
+                    other,
+                    attempted,
+                )
         return True
 
     def _get_image_store(self) -> ForwardImageStore:
@@ -1069,7 +1188,7 @@ class ForwardService:
 
     async def forward_single_msg(
         self, event, message_type=None, group_id=None, user_id=None
-    ) -> bool:
+    ) -> SendOutcome:
         DEBUG = False
         if message_type == "group" and group_id is not None:
             await self.mp.ensure_connected()
@@ -1078,32 +1197,39 @@ class ForwardService:
             # 这种情况改走重建；内层 m_resid 为空（内容压根拿不到）则直接不搬。
             # RELAY_SENT / RELAY_SKIP 都算处理完，只有 RELAY_FALLBACK 继续整卡搬。
             if await self._relay_nested_forward(event, group_id=group_id):
-                return True
+                return SendOutcome(ok=True)
             try:
                 await self.api.forward_group_single_msg(
                     group_id=group_id, message_id=event["message_id"]
                 )
+            except OneBotAPIError as exc:
+                # retcode=100 = 本群每分钟只能发 N 条：确定没发出去，可以重试
+                log.warning("群 %s 单条转发失败: %s", group_id, exc)
+                return SendOutcome(ok=False, retcode=exc.retcode, detail=str(exc))
             except Exception as exc:  # noqa: BLE001 - 单条转发失败不该中断搬运流程
                 log.warning("群 %s 单条转发失败: %s", group_id, exc)
-                return False
+                return SendOutcome(ok=False, retcode=None, detail=str(exc))
             refresher = getattr(self.mp, "check_point_active_get", None)
             if callable(refresher):
                 await refresher(group_id)
-            return True
+            return SendOutcome(ok=True)
         elif message_type == "private" and user_id is not None:
             await self.mp.ensure_connected()
             # 同上：RELAY_SENT / RELAY_SKIP 都不再走整卡搬运。
             if await self._relay_nested_forward(event, user_id=user_id):
-                return True
+                return SendOutcome(ok=True)
             try:
                 await self.api.forward_friend_single_msg(
                     user_id=user_id, message_id=event["message_id"]
                 )
+            except OneBotAPIError as exc:
+                log.warning("好友 %s 单条转发失败: %s", user_id, exc)
+                return SendOutcome(ok=False, retcode=exc.retcode, detail=str(exc))
             except Exception as exc:  # noqa: BLE001 - 同上
                 log.warning("好友 %s 单条转发失败: %s", user_id, exc)
-                return False
-            return True
-        return False
+                return SendOutcome(ok=False, retcode=None, detail=str(exc))
+            return SendOutcome(ok=True)
+        return SendOutcome(ok=False, retcode=None, detail="invalid_target")
 
     async def _relay_nested_forward(self, event, *, group_id=None, user_id=None) -> str:
         """跨会话搬卡片时，只在**必要**时改走「重建」，否则交回整卡搬运。
@@ -1186,11 +1312,20 @@ class ForwardService:
         event,
         target_groupid=None,
         task_userid=None,
-    ) -> int:
+        db_idx: int | None = None,
+    ) -> BatchForwardResult:
+        """并发把一条消息转发到多个目标，返回**逐目标**结果。
+
+        :param db_idx: 库内主键（聊天记录指纹行 id）。限流重试成功后按它回写，
+            不用重新查库；图片送达库的主键是 (identity, chat)，这里不传。
+        :return: :class:`BatchForwardResult`；``succeed_id`` / ``failed_id`` 是
+            本次实际成功 / 失败的目标，``retcodes`` 里 100 表示限流可重试。
+        """
         target_groupid = target_groupid or []
         task_userid = task_userid or []
         sends = []
         labels = []
+        targets = []
         for group_id in target_groupid:
             # 比字符串：面板存的是 "1054955587"，事件里是 1054955587，
             # 直接用 == 会把「来源群本身也是目标群」漏掉，结果往消息自己所在的群再发一份。
@@ -1202,6 +1337,7 @@ class ForwardService:
                 )
             )
             labels.append(f"群 {group_id}")
+            targets.append(("group", group_id))
         for user_id in task_userid:
             if str(user_id) == str(event.get("user_id")):
                 continue
@@ -1211,16 +1347,208 @@ class ForwardService:
                 )
             )
             labels.append(f"好友 {user_id}")
+            targets.append(("private", user_id))
+        result = BatchForwardResult(attempted=len(sends), db_idx=db_idx)
         if not sends:
-            return 0
+            return result
         results = await asyncio.gather(*sends, return_exceptions=True)
-        succeeded = 0
-        for label, result in zip(labels, results, strict=False):
-            if isinstance(result, BaseException):
-                log.warning("%s 搬运异常: %s", label, result)
-            elif result:
-                succeeded += 1
-        return succeeded
+        for (message_type, target_id), label, outcome in zip(
+            targets, labels, results, strict=False
+        ):
+            if isinstance(outcome, BaseException):
+                log.warning("%s 搬运异常: %s", label, outcome)
+                result.failed_id.append(target_id)
+                result.retcodes[str(target_id)] = None
+                continue
+            # 兼容旧调用方 / 测试：bool / None / SendOutcome 都认
+            if isinstance(outcome, SendOutcome):
+                ok, retcode = outcome.ok, outcome.retcode
+            else:
+                ok, retcode = bool(outcome), None
+            if ok:
+                result.succeed_id.append(target_id)
+            else:
+                result.failed_id.append(target_id)
+                result.retcodes[str(target_id)] = retcode
+        return result
+
+    # ════════════════════ 限流重试队列（retcode=100） ════════════════════
+    @staticmethod
+    def _sent_targets(forwarded, groups, users) -> tuple[list, list]:
+        """从 ``BatchForwardResult`` / 旧的 int 返回值里取出「真正发成功的目标」。
+
+        - ``BatchForwardResult``：按 ``succeed_id`` 过滤；
+        - int（``forward_rebuilt`` 的旧返回）：>0 当作全部目标成功，0/None 当作全失败
+          （重建那条链路拿不到逐目标结果，只能这样保守处理）。
+        """
+        if isinstance(forwarded, BatchForwardResult):
+            ok = {str(x) for x in forwarded.succeed_id}
+            return (
+                [g for g in groups if str(g) in ok],
+                [u for u in users if str(u) in ok],
+            )
+        if forwarded:
+            return list(groups), list(users)
+        return [], []
+
+    def _enqueue_rate_limited(
+        self,
+        forwarded,
+        event,
+        *,
+        groups=(),
+        users=(),
+        kind: str,
+        identities: tuple = (),
+        fingerprint: dict | None = None,
+        db_idx: int | None = None,
+    ) -> None:
+        """把 retcode=100 的失败目标放进重试队列（其他失败不重试）。"""
+        if not isinstance(forwarded, BatchForwardResult):
+            return
+        if db_idx is None:
+            db_idx = forwarded.db_idx
+        group_set = {str(g) for g in groups}
+        user_set = {str(u) for u in users}
+        for target_id in forwarded.rate_limited:
+            key = str(target_id)
+            message_type = "group" if key in group_set else "private"
+            if message_type == "private" and key not in user_set:
+                message_type = "group"
+            self._enqueue_retry(
+                RetryTarget(
+                    event=event,
+                    message_type=message_type,
+                    target_id=target_id,
+                    kind=kind,
+                    identities=tuple(identities),
+                    fingerprint=fingerprint,
+                    db_idx=db_idx,
+                    retcode=RATE_LIMIT_RETCODE,
+                )
+            )
+
+    def _enqueue_retry(self, item: RetryTarget) -> None:
+        """入队（同一条消息 + 同一目标只留一份；满了丢最旧的）。"""
+        for existing in self._retry_queue:
+            if (
+                existing.kind == item.kind
+                and str(existing.target_id) == str(item.target_id)
+                and existing.event.get("message_id") == item.event.get("message_id")
+                and existing.event.get("group_id") == item.event.get("group_id")
+            ):
+                existing.retcode = item.retcode
+                return
+        if len(self._retry_queue) >= RETRY_QUEUE_MAX:
+            log.warning("限流重试队列已满（%s），丢弃最旧的一条", RETRY_QUEUE_MAX)
+            self._retry_queue.pop(0)
+        self._retry_queue.append(item)
+
+    def _schedule_retry(self) -> None:
+        """实时路径：有重试项就起一个后台任务，不阻塞当前消息处理。"""
+        if not self._retry_queue:
+            return
+        if self._retry_task is not None and not self._retry_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 没有事件循环（同步测试）就等下一次
+            return
+        self._retry_task = loop.create_task(self.re_send(), name="forward-retry")
+
+    async def re_send(
+        self, *, interval: float | None = None, max_rounds: int | None = None
+    ) -> int:
+        """把限流队列里的目标重发一遍，成功一个就回写一个。
+
+        限流是「每分钟 10 条」，所以每条之间默认间隔 ``RETRY_INTERVAL_SECONDS``
+        秒；一轮发完还有失败的就再等一轮，最多 ``RETRY_MAX_ROUNDS`` 轮。
+
+        :return: 本次重发成功的条数
+        """
+        interval = RETRY_INTERVAL_SECONDS if interval is None else float(interval)
+        max_rounds = RETRY_MAX_ROUNDS if max_rounds is None else int(max_rounds)
+        if not self._retry_queue:
+            return 0
+        sent = 0
+        for round_no in range(max(1, max_rounds)):
+            pending = list(self._retry_queue)
+            self._retry_queue.clear()
+            if not pending:
+                break
+            requeue: list[RetryTarget] = []
+            for index, item in enumerate(pending):
+                item.attempts += 1
+                outcome = await self._retry_one(item)
+                if outcome.ok:
+                    sent += 1
+                    try:
+                        await self._remember_retry(item)
+                    except Exception as exc:  # noqa: BLE001 - 回写失败不能打挂队列
+                        log.warning(
+                            "限流重试成功但回写失败（%s %s）: %s",
+                            item.message_type,
+                            item.target_id,
+                            exc,
+                        )
+                elif (
+                    outcome.retcode == RATE_LIMIT_RETCODE
+                    and item.attempts < max_rounds
+                ):
+                    requeue.append(item)
+                else:
+                    log.warning(
+                        "限流重试放弃（%s %s，第 %s 次）: %s",
+                        item.message_type,
+                        item.target_id,
+                        item.attempts,
+                        outcome.detail or outcome.retcode,
+                    )
+                # 只有「后面还有要发的」才需要等限流窗口；最后一条成功就不用再睡
+                if interval and (requeue or index + 1 < len(pending)):
+                    await asyncio.sleep(interval)
+            self._retry_queue.extend(requeue)
+            if not self._retry_queue:
+                break
+            log.info(
+                "限流重试第 %s 轮结束，仍有 %s 个目标待重发",
+                round_no + 1,
+                len(self._retry_queue),
+            )
+        return sent
+
+    async def _retry_one(self, item: RetryTarget) -> SendOutcome:
+        try:
+            return await self.forward_single_msg(
+                event=item.event,
+                message_type=item.message_type,
+                group_id=item.target_id if item.message_type == "group" else None,
+                user_id=item.target_id if item.message_type == "private" else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - 重试失败不能打挂队列
+            return SendOutcome(ok=False, retcode=None, detail=str(exc))
+
+    async def _remember_retry(self, item: RetryTarget) -> None:
+        """重试成功后补登记：图片按 (身份, 会话)，聊天记录按指纹 + 群。"""
+        if item.kind == "image":
+            if not item.identities:
+                return
+            chat = (
+                chat_key(group_id=item.target_id)
+                if item.message_type == "group"
+                else chat_key(user_id=item.target_id)
+            )
+            if chat:
+                await self._get_image_store().remember_async(item.identities, [chat])
+            return
+        if item.kind == "record" and item.fingerprint is not None:
+            groups = [item.target_id] if item.message_type == "group" else []
+            await self.forward_dedup_record(
+                item.fingerprint,
+                item.event,
+                target_groupid=groups,
+                db_idx=item.db_idx,
+            )
 
     # ════════════════════ 去重库 ════════════════════
     def _get_dedup_store(self) -> ForwardDedupStore:
@@ -1667,6 +1995,7 @@ class ForwardService:
         miniapp_info: dict | None = None,
         target_groupid=None,
         cur_group_is_target: bool = False,
+        reserve: bool = True,
     ) -> GateOutcome:
         """内容指纹闸门：返回「还要发给谁」+「要不要回一句」，而不是简单的放行/拦截。
 
@@ -1684,6 +2013,9 @@ class ForwardService:
 
         :param target_groupid: 本次准备搬进的目标群（调用方已剔除事件所在群）
         :param cur_group_is_target: 事件所在群是否在配置的目标群里（决定要不要提示）
+        :param reserve: 是否在判定「要搬」时立刻把目标群认领进主库。正常路径为
+            True（并发去重）；recover 路径传 False —— 认领交给 RecoveryBatch 的
+            临时记录，发送成功后才真正入库，避免预留目标被当成已送达。
         :return: :class:`GateOutcome`；``fingerprint`` 为 ``None`` 表示内容不足无法检验
         """
         kind = self._forward_kind(event, miniapp_info)
@@ -1867,7 +2199,8 @@ class ForwardService:
                 cur_group=cur_group,
                 # 关键：判定和认领在库里合成一次原子操作。否则同一份内容从 a 群、
                 # b 群几乎同时进来时，两条都会查到"没搬过"，目标群里各发一遍。
-                reserve=True,
+                # recover 期间由 RecoveryBatch 统一认领，这里不写主库。
+                reserve=reserve,
                 kind=kind,
                 preview=fingerprint.get("preview", ""),
                 image_required=image_required,
@@ -1971,20 +2304,37 @@ class ForwardService:
         return GateOutcome(targets=targets, fingerprint=fingerprint)
 
     async def forward_dedup_record(
-        self, fingerprint: dict, event, target_groupid=None
+        self,
+        fingerprint: dict,
+        event,
+        target_groupid=None,
+        source_groups=None,
+        db_idx: int | None = None,
     ) -> None:
         """登记本次搬运：库里只存 8 字节 SimHash + 8 字节内容哈希，不存原文。
 
         同一份内容（content_hash 一致）只有一行，重复登记时把群并进原记录，
-        所以「这条聊天记录被标记的群聊」是一直累积的。标记的群 = 目标群 + 事件所在群。
+        所以「这条聊天记录被标记的群聊」是一直累积的。
 
-        注：真正管用的是闸门里的原子认领（forward_dedup_gate 调 find(reserve=True)），
-        那一步已经把这些群写进库了；这里再登记一次是幂等的兜底，
-        保证"真发出去了"这个事实最终一定落到库里。
+        :param target_groupid: 这次真正送达的目标群
+        :param source_groups: 内容来源群（默认取 event.group_id）。recover 合并后
+            一份内容可能有多个来源群，必须全部带上，否则下次从另一个来源群回放时
+            会认不出来。
+        :param db_idx: 库内主键（聊天记录指纹行 id）。限流重试成功后直接用这个 id
+            回写，不用重新按指纹查库。
+
+        注：正常路径真正管用的是闸门里的原子认领（forward_dedup_gate 调
+        find(reserve=True)）；recover 路径改为发送后才入库（见 ``_send_staged``）。
+        这里再登记一次是幂等的兜底，保证"真发出去了"这个事实最终一定落到库里。
         """
         images = fingerprint.get("images") or []
         videos = fingerprint.get("videos") or []
-        marked_groups = self._dedup_marked_groups(target_groupid, event)
+        if source_groups is None:
+            source_groups = [event.get("group_id")]
+        marked_groups = clean_group_ids(
+            list(clean_group_ids(target_groupid))
+            + list(clean_group_ids(source_groups))
+        )
         cur_group = self._dedup_cur_group(event)
         try:
             fp_id = await self._get_dedup_store().record(
@@ -1996,6 +2346,7 @@ class ForwardService:
                 images=images,
                 videos=videos,
                 identities=fingerprint.get("identities") or [],
+                db_idx=db_idx,
             )
             dedup_log(
                 "record",

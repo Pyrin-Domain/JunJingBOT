@@ -47,9 +47,9 @@ def _as_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _sender_label(probe: ImageProbe) -> str:
-    name = _as_text(probe.sender_name)
-    user_id = _as_text(probe.sender_id)
+def _sender_label(name: str, user_id: str) -> str:
+    name = _as_text(name)
+    user_id = _as_text(user_id)
     if name and user_id:
         return f"{name}（{user_id}）"
     return name or user_id or "未知"
@@ -75,12 +75,58 @@ def _locate_info(probe: ImageProbe) -> tuple[str, str]:
     return group_id, message_id
 
 
+def _outer_sender(probe: ImageProbe) -> tuple[str, str]:
+    """外层消息的发送者：(名字, QQ 号)。
+
+    标签里的「发送者」要和「来源群 / 消息」指的是**同一条消息**——不然审计员
+    按标签回溯时对不上人（线上踩过：标签写的是记录里发图的内层作者，而卡片
+    其实是另一个人发的）。内层作者另起一行「内层来源」，信息不丢。
+    """
+    event = probe.event or {}
+    sender = event.get("sender") or {}
+    user_id = _as_text(event.get("user_id")) or _as_text(sender.get("user_id"))
+    name = _as_text(sender.get("card")) or _as_text(sender.get("nickname"))
+    return name, user_id
+
+
+def _inner_source_line(probe: ImageProbe) -> str:
+    """内层那条消息的来源（群 + 发送者）——跟外层不是同一条时才给。
+
+    注意这行**不能**出现「来源群：」三个字：``audit_release.parse_tag`` 的
+    正则靠它定位外层群，内层群混进去会被当成外层群解析出来。
+    """
+    message = probe.message or {}
+    if not message:
+        return ""
+    event = probe.event or {}
+    inner_mid = _as_text(message.get("message_id"))
+    if not inner_mid or inner_mid == _as_text(event.get("message_id")):
+        return ""  # 单图：内层就是外层那条，不用重复
+    inner_sender = message.get("sender") or {}
+    bits: list[str] = []
+    inner_group = _as_text(message.get("group_id"))
+    if inner_group:
+        bits.append(f"群 {inner_group}")
+    inner_name = _as_text(inner_sender.get("card")) or _as_text(
+        inner_sender.get("nickname")
+    )
+    inner_user = _as_text(message.get("user_id")) or _as_text(
+        inner_sender.get("user_id")
+    )
+    if inner_name or inner_user:
+        bits.append(_sender_label(inner_name, inner_user))
+    if not bits:
+        return ""
+    return f"内层来源：{' · '.join(bits)}"
+
+
 def _format_tag_text(hits: list[FilterHit]) -> str:
     """标签正文：第一行必须是命中类型，后面才是定位信息。
 
-    定位信息（``来源群：`` / ``消息：``）写的是**外层**消息——见
-    :func:`_locate_info`。内层 id 放在详情行里（``[内层 xxxx]``），人工排查
-    具体是哪条记录被拦时看它。
+    定位信息（``来源群：`` / ``发送者：`` / ``消息：``）指的是**同一条外层
+    消息**（聊天记录卡片本身那条）——见 :func:`_locate_info`、
+    :func:`_outer_sender`。内层那条（记录里真正发图的人）在「内层来源」一行，
+    内层 id 在详情行里（``[内层 xxxx]``），人工排查用。
     """
     labels: list[str] = []
     for hit in hits:
@@ -88,13 +134,17 @@ def _format_tag_text(hits: list[FilterHit]) -> str:
             labels.append(hit.label)
     first = hits[0].probe if hits else ImageProbe()
     group_id, message_id = _locate_info(first)
+    name, user_id = _outer_sender(first)
     lines = [f"【过滤标签】{' / '.join(labels) or '未知类型'}"]
     if group_id:
         lines.append(f"来源群：{group_id}")
-    if first.sender_id or first.sender_name:
-        lines.append(f"发送者：{_sender_label(first)}")
+    if name or user_id:
+        lines.append(f"发送者：{_sender_label(name, user_id)}")
     if message_id:
         lines.append(f"消息：{message_id}")
+    inner_line = _inner_source_line(first)
+    if inner_line:
+        lines.append(inner_line)
     lines.append("详情：")
     for index, hit in enumerate(hits, 1):
         probe = hit.probe

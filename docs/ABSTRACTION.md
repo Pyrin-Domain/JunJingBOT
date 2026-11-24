@@ -270,6 +270,96 @@ NTQQ 客户端从来不做「把这张卡再发一遍」这件事，它做的是
 
 ---
 
+### 1.10 小程序卡片：`jumpUrl` 是页面路径，卡片不能改字
+
+实测 2026-11-15，测试群 `1128873261`，SnowLuma 与 NapCat 两端都验过。
+
+**生成**（`get_mini_app_ark`，真去问服务器，不是本地拼串）：
+
+- QQ 侧命令是 `LightAppSvc.mini_app_share.AdaptShareInfo`，返回的卡带
+  `config.token`（**内容签名**）和 `meta.detail_1.url`（`m.q.qq.com/a/s/<hash>`）。
+- **`jumpUrl` 的语义是「小程序页面路径」，不是网址**：视频用
+  `/pages/video/video?bvid=BV…`，番剧用 `/pages/pgcvideo/pgcvideo?epid=ep…`。
+  传 b23 链接不报错，但点开只到 B 站**首页**。
+- **`webURL` 才是 `qqdocurl` 的来源**。`qqdocurl` 是卡片里的网页兜底链接。
+  NapCat 有 `webUrl` 参数但默认不传；SnowLuma 原版根本没发这个字段（它的
+  protobuf 只写 6 个字段），所以两边出的卡都没有 `qqdocurl`，表现为
+  「能进小程序、定位不到视频」。
+
+**发送**（`{"type":"json","data":{"data":<卡片 json 字符串>}}`）：
+
+- **返回的卡一个字都不能改**。`prompt` / `desc` / `preview` 任改一项，QQ
+  **静默丢弃**：SnowLuma 报 `retcode=100 group message delivery was not
+  confirmed`，日志 `result=0 sequence=null responseBytes=18`，历史里查不到。
+- **`qqdocurl` 同样在签名覆盖范围内**（2026-11-15 补测）：拿一张能正常渲染的
+  真卡，只把 `meta.detail_1.qqdocurl` 换成别的链接（b23 短链 / 全站 URL 都试过），
+  发送立刻 `retcode=100` 被丢；同一时间窗内把同一张卡**原样**重发则成功
+  （`message_id 952866865` / `986375953`，历史里是 `json` 段）。所以「转发壳 +
+  自定义落点」这条路是死的——**真卡只能逐字节转发**。
+- 顶层加未知字段（如 `needShareCallBack`）**不破坏签名**；重复发同一张也不拦。
+- 想改文案/落点只能改**生成请求的参数**，不能事后改返回值。
+
+**请求体字段编号**：1 extInfo / 2 appid / 3 title / 4 desc / 5 time(uint64) /
+6 scene / 7 templateType / 8 businessType / 9 picUrl / 10 vidUrl / 11 jumpUrl /
+12 iconUrl / 13 verType / 14 shareType / 15 versionId / 16 withShareTicket /
+17 webURL / 18 appidRich / 19 template / 20 field20。`scene` 服务端不认（传 1 或
+1036 都回显 0）——真卡的 1036 来自 B 站 App 的分享链路，机器人侧无法设置。
+
+### 1.11 点开能不能播，取决于**对方的播放环境**，不是卡片
+
+同一张卡：平板 / 部分机型正常出画；手机 QQ（内置 webview）里——
+
+- 小程序卡：播放器壳在、时长也读到了（`00:00/01:05`），画面黑、点播放没反应；
+- 图文卡：**有声音、没画面**。
+
+后者是典型的「视频轨解码失败、音轨正常」：B 站按浏览器能力探测结果递
+HEVC/AV1 流，QQ 的 webview 硬解合成起不来，解码线程静默退出。
+判据是电脑端截图里能同时看到 B 站自绘进度条和浏览器原生 `<video controls>`
+**两套控件**——说明跑的是 H5，不是原生小程序。
+
+结论：**「点开能播」不是发卡方能保证的**。要保证能看只有两条路——
+发视频文件（`media.send_bili_video`，按 BV 去重 + 失败静默），
+或者卡片只当入口、让用户自己用浏览器打开。
+
+**最终对照（2026-11-15 22:59，把卡片因素彻底排除）**：手机上
+
+| 入口 | 结果 |
+|---|---|
+| 真卡（B 站 App 分享，`qqdocurl` 带 `bbid/ts`） | 黑屏/播不动 |
+| 机器人签的卡（`jumpUrl` = BV 路径） | 同上 |
+| 机器人签的卡 + `webURL` → `qqdocurl` | 同上 |
+| 图文卡（`send_tuwen_ark`） | 有声音、无画面 |
+| `?platform=html5`（强制 H.264 渐进流） | 同上，没用 |
+| **把 b23 链接直接粘在聊天里点开（不经卡片、不经小程序）** | **同样播不了** |
+| 同一台设备换成平板 / 换别的机型 | 正常出画 |
+
+最后一行是关键判据：**连"直链"都不行**，说明和卡片、小程序、跳转方式全都无关，
+纯粹是「这台手机上 QQ 内置 webview 播不了 B 站视频」。发卡方无解。
+
+### 1.12 手拼卡片 JSON 一律被降级成文本
+
+实测 2026-11-15，同一份 json 分别从 SnowLuma 与 NapCat 发到群里，结果一致：
+
+| 发的什么 | 群里看到 |
+|---|---|
+| `com.tencent.miniapp_01`（`get_mini_app_ark` 现签） | 正常卡片 |
+| `com.tencent.tuwen.lua`（`send_tuwen_ark` 现签） | 正常卡片 |
+| 手拼 `com.tencent.structmsg` view=news | 纯文本「发送者版本过低，无法展示内容」 |
+| 手拼 `tuwen.lua`（字段照抄真卡） | 同上 |
+| 官方 ark 模板 23 / 24 / 37（`com.tencent.channel.robot` 等） | 直接丢包（`retcode=100`） |
+| 任何删掉 `config.token` 的卡 | 文本「发送者版本过低」 |
+| `config.token` 在、但 `prompt`/`desc`/`preview` 改过 | 直接丢包（`retcode=100`） |
+
+结论：**`config.token` 必须由服务器签**，本地拼不出来；改字、删 token 都会被降级或丢弃。
+想自定义内容只能改**生成请求的参数**。
+
+因此图文卡只能走后端封装的动作：`BackendCapabilities.tuwen_ark_action`
+（SnowLuma = `send_tuwen_ark`，NapCat = `None`）。`media.send_bili_news_card`
+已按能力表实现，NapCat 上会直接返回 False，调用方需要自己回退。
+
+官方 ark（模板 23/24/37）另有两条硬门槛：**要向平台运营申请权限**，
+**链接要提前在「消息 URL 配置」报备**——即便换官方机器人也换不来「B 站小程序卡」。
+
 ## 2. 抽象层怎么用
 
 ```python

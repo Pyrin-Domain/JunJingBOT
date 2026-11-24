@@ -21,10 +21,14 @@ __all__ = [
     "KIND_MINIAPP",
     "KIND_IMAGE",
     "FORWARD_KINDS",
+    "RATE_LIMIT_RETCODE",
     "ForwardJob",
     "GateOutcome",
     "StagedForward",
     "RecoveryBatch",
+    "SendOutcome",
+    "BatchForwardResult",
+    "RetryTarget",
 ]
 
 #: 老式 / 合并聊天记录：走聊天记录指纹库
@@ -35,6 +39,84 @@ KIND_MINIAPP = "miniapp"
 KIND_IMAGE = "image"
 
 FORWARD_KINDS = (KIND_RECORD, KIND_MINIAPP, KIND_IMAGE)
+
+#: 协议端「本群每分钟只能发 N 条消息」的 retcode。这类失败是确定没发出去的，
+#: 等限流窗口过去后可以安全重发；其他失败（超时 / 连接异常）发没发出去不确定，
+#: 不能盲目重试。
+RATE_LIMIT_RETCODE = 100
+
+
+@dataclass
+class SendOutcome:
+    """一次单目标发送的结果。
+
+    ``ok=False`` 时 ``retcode`` 说明是哪种失败：100 = 限流（可安全重试），
+    ``None`` = 超时 / 连接异常（不确定发没发出去，不重试）。
+    """
+
+    ok: bool
+    retcode: int | None = None
+    detail: str = ""
+
+
+@dataclass
+class BatchForwardResult:
+    """``batch_forward_single_msg`` 的逐目标结果。
+
+    以前只返回「成功几个」，调用方无法知道哪几个成功，于是部分失败时只能整批
+    不登记（见 ``_forward_image``）。现在把目标 id 分开放：
+
+    * ``succeed_id`` / ``failed_id``：本次实际成功 / 失败的目标（群号或 QQ 号）；
+    * ``retcodes``：失败目标 -> retcode（100 = 限流，可重试）；
+    * ``db_idx``：调用方传进来的库内主键（聊天记录指纹行 id），重试成功后
+      直接按它回写，不用重新查库。
+    """
+
+    succeed_id: list = field(default_factory=list)
+    failed_id: list = field(default_factory=list)
+    retcodes: dict = field(default_factory=dict)
+    attempted: int = 0
+    db_idx: int | None = None
+
+    @property
+    def succeeded(self) -> int:
+        return len(self.succeed_id)
+
+    @property
+    def rate_limited(self) -> list:
+        """失败目标里 retcode == 100 的那些（可以等限流窗口后重发）。"""
+        return [
+            target
+            for target in self.failed_id
+            if self.retcodes.get(str(target)) == RATE_LIMIT_RETCODE
+        ]
+
+    def __bool__(self) -> bool:
+        # 兼容旧调用方：``if forwarded:`` 表示「至少发出去一个」
+        return bool(self.succeed_id)
+
+    def __int__(self) -> int:
+        return len(self.succeed_id)
+
+    def __len__(self) -> int:
+        return len(self.succeed_id)
+
+
+@dataclass
+class RetryTarget:
+    """限流重试队列里的一条：等限流窗口过去后重发，成功后回写库。"""
+
+    event: dict
+    message_type: str  # "group" / "private"
+    target_id: object
+    kind: str  # "image" / "record"
+    identities: tuple = ()
+    fingerprint: dict | None = None
+    #: 库内主键（聊天记录指纹行 id）；图片送达库的主键是 (identity, chat)，
+    #: 这里留空，重试成功后按 identities + chat 回写。
+    db_idx: int | None = None
+    attempts: int = 0
+    retcode: int | None = None
 
 
 @dataclass
@@ -119,8 +201,13 @@ class StagedForward:
     target_groups: tuple = ()
     #: 各事件报上来的私聊目标（已剔除发送者）
     target_users: tuple = ()
-    #: 第一阶段（入库）时，这份内容已经标记过的群（含本批来源群）。
-    #: 第二阶段拿它做减法：已经送过的目标群不再发。
+    #: 这份内容的**来源**（内容本来就在这些会话里）。第二阶段做减法用：
+    #: ``目标并集 − 来源并集`` 才是真正要发的地方。recover 期间不能把「认领预留
+    #: 的目标群」也当成来源，否则会把所有目标都减光（见 ``_send_staged``）。
+    source_groups: tuple = ()
+    source_users: tuple = ()
+    #: 第一阶段（入库）时，这份内容在 **recover 之前**就已经真实送达过的群。
+    #: 只来自主库命中（``matched.group_ids``），不包含本批认领的预留目标。
     recorded_groups: tuple = ()
     #: 发送前要用的裁剪 / 追加配置
     strip_tail_ads: dict | None = None
@@ -137,37 +224,69 @@ class RecoveryBatch:
     只负责记账，不做 IO：收料（``add``）→ 定稿（``finalize``）→ 逐条取（``drain``）。
     """
 
-    #: key = 内容身份（没有身份时退回指纹文本），value = StagedForward
+    #: key = 内容身份（没有身份时退回指纹文本 / 事件 id），value = StagedForward
     staged: dict = field(default_factory=dict)
-    #: 已经入库（认领）完成、可以进入发送阶段
+    #: 已经收齐所有群的内容，可以进入发送阶段
     sealed: bool = False
     #: 还在跑的回收任务数：归零才允许 flush（断点恢复的各个群是并发跑的）
     pending: int = 0
 
     def add(self, item: StagedForward) -> StagedForward:
-        """收一条待发内容；同一份内容只留一份（目标群合并）。"""
-        key = "|".join(item.identities) or (
-            (item.outcome.fingerprint or {}).get("text") or ""
-        )
-        existing = self.staged.get(key)
+        """收一条待发内容；同一份内容只留一份（目标 / 来源分别取并集）。
+
+        判「同一份」优先看内容身份（叶子消息 id / 媒体哈希），其次看指纹文本。
+        任一项有交集就合并 —— 不能只用一个键：回放时有的群展开成功（有 leaf），
+        有的群只有媒体哈希，单键会漏合并、各发一遍。
+        """
+        existing = self._find_match(item)
         if existing is None:
             item.target_groups = tuple(dict.fromkeys(item.target_groups))
             item.target_users = tuple(dict.fromkeys(item.target_users))
-            self.staged[key] = item
+            item.source_groups = tuple(dict.fromkeys(item.source_groups))
+            item.source_users = tuple(dict.fromkeys(item.source_users))
+            self.staged[self._key(item)] = item
             return item
-        merged_groups = tuple(
+        existing.target_groups = tuple(
             dict.fromkeys(list(existing.target_groups) + list(item.target_groups))
         )
-        merged_users = tuple(
+        existing.target_users = tuple(
             dict.fromkeys(list(existing.target_users) + list(item.target_users))
         )
-        merged_recorded = tuple(
+        existing.source_groups = tuple(
+            dict.fromkeys(list(existing.source_groups) + list(item.source_groups))
+        )
+        existing.source_users = tuple(
+            dict.fromkeys(list(existing.source_users) + list(item.source_users))
+        )
+        existing.recorded_groups = tuple(
             dict.fromkeys(list(existing.recorded_groups) + list(item.recorded_groups))
         )
-        existing.target_groups = merged_groups
-        existing.target_users = merged_users
-        existing.recorded_groups = merged_recorded
         return existing
+
+    @staticmethod
+    def _fingerprint_text(item: StagedForward) -> str:
+        return str(((item.outcome.fingerprint or {}).get("text")) or "")
+
+    @classmethod
+    def _key(cls, item: StagedForward) -> str:
+        ids = "|".join(str(x) for x in item.identities)
+        return ids or cls._fingerprint_text(item) or f"event:{id(item.event)}"
+
+    def _find_match(self, item: StagedForward) -> StagedForward | None:
+        ids = {str(x) for x in item.identities if str(x)}
+        text = self._fingerprint_text(item)
+        for candidate in self.staged.values():
+            cand_ids = {str(x) for x in candidate.identities if str(x)}
+            if ids and cand_ids:
+                # 两边都有身份：只认身份交集。弱指纹的文本可能都是
+                # 「user: [图片]」，不同图片会撞文本，不能拿文本合并。
+                if ids & cand_ids:
+                    return candidate
+                continue
+            cand_text = self._fingerprint_text(candidate)
+            if text and cand_text and text == cand_text:
+                return candidate
+        return None
 
     def finalize(self) -> None:
         self.sealed = True
